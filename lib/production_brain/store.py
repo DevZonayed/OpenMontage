@@ -322,8 +322,14 @@ class ProductionBrainStore:
         concurrent starts, only the WINNER ever calls ``provision`` (creating
         exactly one external job); the loser blocks on the lock, then sees the
         active run and returns ``already_active`` WITHOUT provisioning — no orphan
-        external job. ``provision(run_id) -> (session_id, job_id, brain_extra, msg)``
-        may raise to fail closed (then no run is opened)."""
+        external job.
+
+        ``provision(run_id) -> (session_id, job_id, brain_extra, msg, compensate)``
+        may raise to fail closed (then no run is opened). If provisioning
+        SUCCEEDS but the local durable ``run_started`` write then FAILS, the
+        returned ``compensate`` callable is invoked exactly once to cancel the
+        now-orphaned external job, and a sanitized combined failure is raised — no
+        local run is opened and no orphan is silently claimed."""
         # Duration validation is pure — do it before taking the lock.
         if requested_duration_seconds is not None:
             from lib import duration as _dur
@@ -341,24 +347,42 @@ class ProductionBrainStore:
             rid = run_id or self._gen_id()
             # WINNER-ONLY: reached only when no active run exists, so the external
             # job is created exactly once.
-            session_id, job_id, brain_extra, provisioned_msg = provision(rid)
+            session_id, job_id, brain_extra, provisioned_msg, compensate = provision(rid)
             merged_brain = {**(brain or {}), **(brain_extra or {})}
             data: dict = {"brain": merged_brain}
             if requested_duration_seconds is not None:
                 data["requested_duration_seconds"] = int(requested_duration_seconds)
-            self._append_locked(
-                {
-                    "type": "run_started",
-                    "run_id": rid,
-                    "project_id": self.project_dir.name,
-                    "agent_id": merged_brain.get("agent_id"),
-                    "session_id": session_id or merged_brain.get("session_id"),
-                    "job_id": job_id or merged_brain.get("job_id"),
-                    "message": message or provisioned_msg or "Production run started.",
-                    "data": data,
-                },
-                strict=True,
-            )
+            try:
+                self._append_locked(
+                    {
+                        "type": "run_started",
+                        "run_id": rid,
+                        "project_id": self.project_dir.name,
+                        "agent_id": merged_brain.get("agent_id"),
+                        "session_id": session_id or merged_brain.get("session_id"),
+                        "job_id": job_id or merged_brain.get("job_id"),
+                        "message": message or provisioned_msg or "Production run started.",
+                        "data": data,
+                    },
+                    strict=True,
+                )
+            except Exception as append_err:
+                # The external job was created but we could NOT durably record the
+                # run — compensate exactly once so no orphan is left behind.
+                comp_failed = False
+                if compensate is not None:
+                    try:
+                        compensate()
+                    except Exception:
+                        comp_failed = True
+                detail = ("Could not durably record the production run after the "
+                          "orchestrator created a job")
+                if comp_failed:
+                    detail += "; the orphaned external job could NOT be cancelled and may require manual cleanup"
+                else:
+                    detail += "; the orphaned external job was cancelled"
+                detail += f" ({append_err.__class__.__name__})."
+                raise BrainStoreError(detail, status=500) from append_err
         return self.read_state()
 
     # ---- generic event helpers (used by the adapter/brain) -----------------
@@ -563,10 +587,25 @@ class ProductionBrainStore:
         return self.read_state()
 
     def cancel(self, run_id: str, *, message: Optional[str] = None) -> dict:
-        """Cancel the EXACT active run. Project-scoped; touches nothing else."""
+        """Confirm-cancel the EXACT active run (terminal). Use ONLY once the
+        external orchestrator has acknowledged, or when there is no external job."""
         self._guarded_append({
             "type": "run_cancelled", "run_id": run_id, "project_id": self.project_dir.name,
             "message": message or "Production run cancelled. Completed work is preserved.",
+        }, run_id=run_id, require_active=True, strict=True)
+        return self.read_state()
+
+    def request_cancel(self, run_id: str, *, message: Optional[str] = None,
+                       stage: Optional[str] = None, blocker_id: Optional[str] = None) -> dict:
+        """Record that cancellation was requested but is NOT yet confirmed by the
+        external orchestrator. Moves the run to a NON-terminal ``cancelling`` state
+        with a ``control_unconfirmed`` blocker — the user can retry. Never reports
+        terminal ``cancelled`` until :meth:`cancel` is called on acknowledgment."""
+        self._guarded_append({
+            "type": "run_cancel_requested", "run_id": run_id, "project_id": self.project_dir.name,
+            "stage": stage, "level": "warning",
+            "message": message or "External cancellation is unconfirmed — retry.",
+            "data": {"message": message, "blocker_id": blocker_id},
         }, run_id=run_id, require_active=True, strict=True)
         return self.read_state()
 

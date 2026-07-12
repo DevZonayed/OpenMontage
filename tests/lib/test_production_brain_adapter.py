@@ -195,6 +195,49 @@ class TestHermesFailClosed:
         winners = [r for r in results if not r.get("already_active")]
         assert len(winners) == 1
 
+    def test_orphan_compensated_when_local_persist_fails(self, tmp_path):
+        from lib.production_brain.store import BrainStoreError
+
+        d = tmp_path / "p"
+        d.mkdir()
+        s = ProductionBrainStore(d, gen_id=lambda: "run_1")
+        client = FakeOrchestratorClient()
+        h = HermesBrainAdapter(client=client)
+
+        # Make the durable run_started write fail AFTER the external job is created.
+        def boom(*a, **k):
+            raise OSError("disk full")
+
+        s._append_locked = boom  # type: ignore[assignment]
+        with pytest.raises(BrainStoreError) as ei:
+            h.start(s, requested_duration_seconds=60)
+        # No local run opened...
+        assert s.read_state()["state"] == "not_started"
+        assert s.read_events_raw() == []
+        # ...and the orphaned external job was cancelled EXACTLY once.
+        assert len(client.created) == 1
+        job = next(iter(client.created.values())).job_id
+        assert client.cancelled == [job]
+        assert "cancelled" in str(ei.value).lower()
+
+    def test_compensation_failure_is_reported_no_run(self, tmp_path):
+        from lib.production_brain.store import BrainStoreError
+
+        d = tmp_path / "p"
+        d.mkdir()
+        s = ProductionBrainStore(d, gen_id=lambda: "run_1")
+        client = FakeOrchestratorClient(fail_control=True)  # cancel will also fail
+        h = HermesBrainAdapter(client=client)
+
+        def boom(*a, **k):
+            raise OSError("disk full")
+
+        s._append_locked = boom  # type: ignore[assignment]
+        with pytest.raises(BrainStoreError) as ei:
+            h.start(s, requested_duration_seconds=60)
+        assert s.read_events_raw() == []  # no run, truthfully reported
+        assert "could not be cancelled" in str(ei.value).lower()
+
     def test_cancel_correlates_with_external_handle(self, tmp_path):
         s = _store(tmp_path)
         client = FakeOrchestratorClient()

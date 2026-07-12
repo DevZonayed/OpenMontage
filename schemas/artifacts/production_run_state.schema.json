@@ -109,7 +109,7 @@
           "stage": { "type": "string" },
           "kind": {
             "type": "string",
-            "enum": ["auth", "provider_access", "tool_bug", "quality", "runtime_unavailable", "brain_unavailable", "other"]
+            "enum": ["auth", "provider_access", "tool_bug", "quality", "runtime_unavailable", "brain_unavailable", "control_unconfirmed", "other"]
           },
           "message": { "type": "string" },
           "options": { "type": "array", "items": { "type": "string" } },

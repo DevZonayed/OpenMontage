@@ -109,6 +109,7 @@ EVENT_TYPES: frozenset[str] = frozenset(
         "retry",
         "resume",
         "heartbeat",
+        "run_cancel_requested",
         "run_completed",
         "run_failed",
         "run_cancelled",
@@ -117,7 +118,8 @@ EVENT_TYPES: frozenset[str] = frozenset(
 )
 
 BLOCKER_KINDS: frozenset[str] = frozenset(
-    {"auth", "provider_access", "tool_bug", "quality", "runtime_unavailable", "brain_unavailable", "other"}
+    {"auth", "provider_access", "tool_bug", "quality", "runtime_unavailable",
+     "brain_unavailable", "control_unconfirmed", "other"}
 )
 
 
@@ -569,11 +571,38 @@ def reduce_event(state: dict, ev: dict, *, strict: bool = False) -> dict:
         _set_state("failed")
         st["activity"] = ev.get("message") or "Production run failed."
 
+    elif etype == "run_cancel_requested":
+        # Cancellation was requested but the EXTERNAL orchestrator has not
+        # acknowledged it. This is a NON-terminal, retryable state — never report
+        # a terminal ``cancelled`` until the external job is confirmed cancelled.
+        _set_state("cancelling")
+        bid = data.get("blocker_id") or f"blk-{seq}"
+        bstage = stage_id or st.get("current_stage") or STAGES[0]
+        if not any(b.get("blocker_id") == bid for b in st.get("blockers", [])):
+            st.setdefault("blockers", []).append({
+                "blocker_id": bid,
+                "stage": bstage,
+                "kind": "control_unconfirmed",
+                "message": data.get("message") or ev.get("message")
+                or "External cancellation is unconfirmed — retry.",
+                "options": ["Retry cancellation"],
+                "created_at": ts,
+                "resolved": False,
+                "resolved_at": None,
+            })
+        st["activity"] = ev.get("message") or (
+            "Cancellation requested — awaiting external orchestrator acknowledgment.")
+
     elif etype == "run_cancelled":
         for s in st["stages"]:
             if s["status"] in ("active", "awaiting_approval", "blocked"):
                 s["status"] = "skipped"
                 s["ended_at"] = ts
+        # A confirmed cancel resolves any outstanding cancellation blocker.
+        for b in st.get("blockers", []):
+            if not b.get("resolved"):
+                b["resolved"] = True
+                b["resolved_at"] = ts
         _set_state("cancelled")
         st["current_stage"] = None
         st["activity"] = ev.get("message") or "Production run cancelled. Completed work is preserved."

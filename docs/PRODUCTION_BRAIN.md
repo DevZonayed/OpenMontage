@@ -108,7 +108,11 @@ is exactly how crash/restart recovery works.
 | Crash recovery | `state.json` is always rebuildable from `run_events.jsonl`; a torn trailing line is skipped |
 | Truthful terminal states | terminal runs are sticky — a stray event cannot re-animate a completed/cancelled/failed run |
 | No duplicate writers | `brain/*` is written only by `ProductionBrainStore` |
-| Secret redaction | keys matching secret patterns and credential-shaped values are masked before persistence; `redacted:true` is stamped |
+| No orphan external jobs | if `create_job` succeeds but the local `run_started` write fails, the store invokes a one-shot compensator to cancel the external job and raises a sanitized combined failure — no local run opens, no orphan is silently claimed |
+| Truthful cancellation | an external run is only terminal `cancelled` after the orchestrator acknowledges; an unconfirmed cancel is a **non-terminal** `cancelling` + `control_unconfirmed` blocker (survives restart, retryable) |
+| Real control | retry/resume/cancel of an external run call the orchestrator FIRST; local state advances only on acknowledgment — a `job_id` field alone never implies control happened |
+| Hardened transport | HTTPS-only (loopback-HTTP exception), redirects disabled + 3xx rejected (token never replayed), canonical bounded external ids validated before persistence/URL-encoding |
+| Secret redaction | keys matching secret patterns and credential-shaped values are masked before persistence; `redacted:true` is stamped; the orchestrator bearer token lives only in the keyring and never enters telemetry or errors |
 
 ---
 
@@ -138,9 +142,9 @@ changes; brain telemetry is intentionally poll-only to avoid UI flicker.
 | `POST /api/project/{id}/brain/start` | `{}` | provision a **real durable orchestrator job** and open the run, or `409` if no orchestrator is available / it returns no canonical ids (fail-closed). Idempotent — a retry keeps the same external job. |
 | `POST /api/project/{id}/brain/approve` | `{run_id, stage?, approval_id?, note?}` | grant a pending approval gate |
 | `POST /api/project/{id}/brain/reject` | `{run_id, stage?, approval_id?, note?}` | reject a gate (marks the stage failed) |
-| `POST /api/project/{id}/brain/cancel` | `{run_id}` | cancel the exact active run |
-| `POST /api/project/{id}/brain/retry` | `{stage, run_id?}` | reopen a failed/blocked stage |
-| `POST /api/project/{id}/brain/resume` | `{}` | reconcile from the log + continue |
+| `POST /api/project/{id}/brain/cancel` | `{run_id}` | for an external run the orchestrator is cancelled FIRST — only on **acknowledgment** is the run terminal `cancelled`; an unconfirmed external cancel moves it to a **non-terminal `cancelling`** state with a `control_unconfirmed` blocker (retryable) |
+| `POST /api/project/{id}/brain/retry` | `{stage, run_id?}` | for an external run the orchestrator is told to `retry` FIRST; local state advances only on ack — on failure the run is `blocked` with a `control_unconfirmed` blocker (no fake local retry) |
+| `POST /api/project/{id}/brain/resume` | `{}` | for an external run the orchestrator is told to `resume` FIRST; local state advances only on ack — else a truthful blocker |
 
 Errors are sanitized: `400` (missing field / malformed JSON), `403` (CSRF /
 cross-origin), `404` (unknown project), `409` (no active run / wrong `run_id` /
@@ -198,8 +202,22 @@ orchestration port** — the brain never fabricates identity:
   the operator-approved endpoint (`OPENMONTAGE_HERMES_ORCHESTRATOR_URL`) with an
   optional bearer token read **only** from the OS keyring
   (`hermes_orchestrator_token`) — never logged, never placed in telemetry.
-  Unconfigured ⇒ `available() is False` ⇒ Start Production fails closed with an
-  actionable blocker. **This client is never exercised by the test suite.**
+  **Transport is hardened** because a token rides the request:
+  - **endpoint policy is fail-closed** (`validate_endpoint`): HTTPS only, with an
+    explicit **loopback-HTTP** exception (`127.0.0.1`/`::1`/`localhost`) for a
+    local Hermes/Mochlet; no embedded credentials, fragments, non-http schemes,
+    ambiguous hosts, or control/whitespace characters. An invalid/absent endpoint
+    ⇒ `available() is False` ⇒ Start Production fails closed.
+  - **redirects are disabled** (`allow_redirects=False`) and **any 3xx is
+    rejected** — the token is never replayed to a redirect target, and no second
+    request is made.
+  - **canonical external ids** (`is_canonical_id`): `session_id`/`job_id` must
+    match a strict bounded ASCII allowlist (no slash/backslash/`..`-traversal/
+    control/whitespace, ≤128 chars) and be real strings (never `str()`-coerced)
+    before they are persisted; the `job_id` path segment is percent-encoded.
+  It also exposes `control_job(job_id, action, idempotency_key)` for typed
+  retry/resume/cancel. **This client is never exercised by the test suite** (an
+  injected transport/fake client is used instead).
 - `FakeOrchestratorClient` — deterministic, offline, **TEST-ONLY**. Returns
   canonical-shaped ids derived from the run id and records the start/cancel calls
   it receives. Runs backed by it are visibly `orchestration: "fake_driver"`.

@@ -122,51 +122,106 @@ def reject_approval(project_dir: Path, body: dict) -> dict:
         raise BrainApiError(str(exc), status=exc.status)
 
 
-def cancel_run(project_dir: Path, body: dict, *, orchestrator=None) -> dict:
-    """Cancel the exact active run AND correlate with the external orchestrator.
+def _client(orchestrator):
+    if orchestrator is not None:
+        return orchestrator
+    from lib.production_brain.orchestrator import default_orchestrator_client
 
-    For a run backed by a real external job (``orchestration == "external_job"``)
-    the external job is cancelled first so the handle stays truthful; the local
-    cancel proceeds regardless (best-effort correlation, never blocks the user's
-    cancel). ``orchestrator`` is injectable for tests."""
+    return default_orchestrator_client()
+
+
+def cancel_run(project_dir: Path, body: dict, *, orchestrator=None) -> dict:
+    """Cancel the exact active run, TRUTHFULLY correlated with the external job.
+
+    For a run backed by a real external job, the external job is cancelled FIRST.
+    Only on the orchestrator's acknowledgment is the local run marked terminal
+    ``cancelled``. If the external cancel is unconfirmed (timeout/5xx/etc.), the
+    run moves to a NON-terminal ``cancelling`` state with a ``control_unconfirmed``
+    blocker so the user can retry — it is never reported as terminally cancelled
+    on an unconfirmed external cancel. ``orchestrator`` is injectable for tests."""
     rid = _require_run_id(body)
     store = _store(project_dir)
     state = store.read_state()
     brain = state.get("brain") or {}
-    ext_note = None
-    if state.get("run_id") == rid and brain.get("external") and brain.get("job_id"):
-        client = orchestrator
-        if client is None:
-            from lib.production_brain.orchestrator import default_orchestrator_client
-
-            client = default_orchestrator_client()
-        try:
-            client.cancel_job(job_id=brain["job_id"])
-            ext_note = f"external orchestrator job {brain['job_id']} cancelled"
-        except Exception:
-            ext_note = (f"local run cancelled; external job {brain['job_id']} "
-                        "cancel could not be confirmed")
+    is_external = state.get("run_id") == rid and brain.get("external") and brain.get("job_id")
     try:
-        msg = None
-        if ext_note:
-            msg = f"Production run cancelled. Completed work is preserved. ({ext_note})"
-        return store.cancel(rid, message=msg)
+        if is_external:
+            job_id = brain["job_id"]
+            try:
+                _client(orchestrator).cancel_job(job_id=job_id)
+            except Exception:
+                # Unconfirmed → non-terminal, retryable. NOT cancelled.
+                return store.request_cancel(
+                    rid, stage=state.get("current_stage"),
+                    message=f"External cancellation of job {job_id} is unconfirmed — retry.")
+            return store.cancel(
+                rid, message=f"Production run cancelled. Completed work is preserved. "
+                             f"(external job {job_id} cancelled)")
+        # No external job — a purely local run cancels terminally.
+        return store.cancel(rid)
     except BrainStoreError as exc:
         raise BrainApiError(str(exc), status=exc.status)
 
 
-def retry_stage(project_dir: Path, body: dict) -> dict:
+def retry_stage(project_dir: Path, body: dict, *, orchestrator=None) -> dict:
+    """Retry a stage. For an external run the orchestrator is told to retry FIRST;
+    local state advances only on acknowledgment. On failure the run is blocked
+    with a truthful ``control_unconfirmed`` blocker (no fake local retry)."""
     stage = body.get("stage")
     if not isinstance(stage, str) or not stage:
         raise BrainApiError("stage is required", status=400)
+    store = _store(project_dir)
+    state = store.read_state()
+    brain = state.get("brain") or {}
+    run_id = body.get("run_id")
     try:
-        return _store(project_dir).retry_stage(stage, run_id=body.get("run_id"))
+        if state.get("run_id") and brain.get("external") and brain.get("job_id"):
+            _require_active_for_control(state, run_id)
+            key = f"{state['run_id']}:retry:{stage}"
+            try:
+                _client(orchestrator).control_job(job_id=brain["job_id"], action="retry", idempotency_key=key)
+            except Exception:
+                store.raise_blocker(stage, kind="control_unconfirmed",
+                                   message=f"External retry of stage '{stage}' is unconfirmed — retry.",
+                                   options=["Retry"])
+                return store.read_state()
+        return store.retry_stage(stage, run_id=run_id)
     except BrainStoreError as exc:
         raise BrainApiError(str(exc), status=exc.status)
 
 
-def resume_run(project_dir: Path, body: dict) -> dict:
-    return _store(project_dir).resume()
+def resume_run(project_dir: Path, body: dict, *, orchestrator=None) -> dict:
+    """Resume a run. For an external run the orchestrator is told to resume FIRST;
+    local state advances only on acknowledgment (else a truthful blocker)."""
+    store = _store(project_dir)
+    state = store.read_state()
+    brain = state.get("brain") or {}
+    try:
+        if state.get("run_id") and brain.get("external") and brain.get("job_id"):
+            if state.get("state") in ("running", "awaiting_approval", "blocked", "cancelling"):
+                key = f"{state['run_id']}:resume"
+                try:
+                    _client(orchestrator).control_job(job_id=brain["job_id"], action="resume", idempotency_key=key)
+                except Exception:
+                    from lib.production_brain.schema import STAGES
+
+                    store.raise_blocker(state.get("current_stage") or STAGES[0],
+                                       kind="control_unconfirmed",
+                                       message="External resume is unconfirmed — retry.",
+                                       options=["Retry"])
+                    return store.read_state()
+        return store.resume()
+    except BrainStoreError as exc:
+        raise BrainApiError(str(exc), status=exc.status)
+
+
+def _require_active_for_control(state: dict, run_id) -> None:
+    from lib.production_brain.schema import ACTIVE_RUN_STATES
+
+    if state.get("state") not in ACTIVE_RUN_STATES:
+        raise BrainApiError("There is no active run for this control action.", status=409)
+    if run_id is not None and state.get("run_id") != run_id:
+        raise BrainApiError("Run id does not match the active run.", status=409)
 
 
 def _intake_target(project_dir: Path) -> Optional[int]:

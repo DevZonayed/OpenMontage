@@ -88,3 +88,88 @@ def test_production_mode_refuses_without_external_ids(project, monkeypatch):
         assert r.status_code == 409
         assert "orchestrator" in r.json()["detail"].lower()
         assert c.get("/api/project/demo/brain").json()["state"] == "not_started"
+
+
+# --------------------------------------------------------------------------- #
+# Truthful cancellation + real retry/resume control (B4 / B5)
+# --------------------------------------------------------------------------- #
+from lib.production_brain.adapter import HermesBrainAdapter
+from lib.production_brain.store import ProductionBrainStore
+
+
+def _external_run(project_dir, client):
+    store = ProductionBrainStore(project_dir, gen_id=lambda: "run_x")
+    HermesBrainAdapter(client=client).start(store, requested_duration_seconds=60)
+    return store
+
+
+def _job(store):
+    return (store.read_state().get("brain") or {}).get("job_id")
+
+
+class TestTruthfulCancellation:
+    def test_unconfirmed_cancel_is_nonterminal(self, tmp_path):
+        d = tmp_path / "p"; d.mkdir()
+        fail = FakeOrchestratorClient(fail_control=True)
+        _external_run(d, fail)
+        st = brain_api.cancel_run(d, {"run_id": "run_x"}, orchestrator=fail)
+        # Never terminally cancelled on an unconfirmed external cancel.
+        assert st["state"] == "cancelling" and st["terminal"] is False
+        assert any(b["kind"] == "control_unconfirmed" and not b["resolved"] for b in st["blockers"])
+
+    def test_retry_cancel_after_ack_is_terminal(self, tmp_path):
+        d = tmp_path / "p"; d.mkdir()
+        fail = FakeOrchestratorClient(fail_control=True)
+        store = _external_run(d, fail)
+        job = _job(store)
+        brain_api.cancel_run(d, {"run_id": "run_x"}, orchestrator=fail)  # → cancelling
+        good = FakeOrchestratorClient()
+        st = brain_api.cancel_run(d, {"run_id": "run_x"}, orchestrator=good)
+        assert st["state"] == "cancelled" and st["terminal"] is True
+        assert good.cancelled == [job]
+
+    def test_restart_recovery_keeps_cancelling(self, tmp_path):
+        d = tmp_path / "p"; d.mkdir()
+        fail = FakeOrchestratorClient(fail_control=True)
+        store = _external_run(d, fail)
+        brain_api.cancel_run(d, {"run_id": "run_x"}, orchestrator=fail)
+        store.state_path.unlink()  # simulate a crash losing the cache
+        rebuilt = ProductionBrainStore(d).read_state()
+        assert rebuilt["state"] == "cancelling" and rebuilt["terminal"] is False
+
+
+class TestRealRetryResume:
+    def test_retry_tells_orchestrator_then_advances_local(self, tmp_path):
+        d = tmp_path / "p"; d.mkdir()
+        good = FakeOrchestratorClient()
+        store = _external_run(d, good)
+        store.fail_stage("render", error="boom")
+        st = brain_api.retry_stage(d, {"stage": "render", "run_id": "run_x"}, orchestrator=good)
+        assert any(c["action"] == "retry" for c in good.controls)
+        assert next(s for s in st["stages"] if s["id"] == "render")["status"] == "active"
+
+    def test_retry_failure_blocks_and_does_not_fake_local_retry(self, tmp_path):
+        d = tmp_path / "p"; d.mkdir()
+        fail = FakeOrchestratorClient(fail_control=True)
+        store = _external_run(d, fail)
+        store.fail_stage("render", error="boom")
+        st = brain_api.retry_stage(d, {"stage": "render", "run_id": "run_x"}, orchestrator=fail)
+        assert st["state"] == "blocked"
+        assert any(b["kind"] == "control_unconfirmed" for b in st["blockers"])
+        assert next(s for s in st["stages"] if s["id"] == "render")["status"] != "active"
+
+    def test_resume_tells_orchestrator(self, tmp_path):
+        d = tmp_path / "p"; d.mkdir()
+        good = FakeOrchestratorClient()
+        _external_run(d, good)
+        st = brain_api.resume_run(d, {}, orchestrator=good)
+        assert any(c["action"] == "resume" for c in good.controls)
+        assert st["state"] == "running"
+
+    def test_resume_failure_blocks(self, tmp_path):
+        d = tmp_path / "p"; d.mkdir()
+        fail = FakeOrchestratorClient(fail_control=True)
+        _external_run(d, fail)
+        st = brain_api.resume_run(d, {}, orchestrator=fail)
+        assert st["state"] == "blocked"
+        assert any(b["kind"] == "control_unconfirmed" for b in st["blockers"])

@@ -33,6 +33,7 @@
         "retry",
         "resume",
         "heartbeat",
+        "run_cancel_requested",
         "run_completed",
         "run_failed",
         "run_cancelled",

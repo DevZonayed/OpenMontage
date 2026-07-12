@@ -141,7 +141,10 @@ class BrainAdapter:
                 "external": bool(self._external),
             }
             msg = message or self._start_message(ident, job_id, orchestration)
-            return session_id, job_id, brain_extra, msg
+            # One-shot compensator: if the store fails to durably record the run
+            # after this external job exists, cancel it exactly once.
+            compensate = self._compensator(job_id) if self._external else None
+            return session_id, job_id, brain_extra, msg, compensate
 
         return store.start_provisioned(
             provision=_provisioner,
@@ -149,6 +152,10 @@ class BrainAdapter:
             requested_duration_seconds=requested_duration_seconds,
             message=message,
         )
+
+    def _compensator(self, job_id: Optional[str]):
+        """Base: no external job to compensate (offline driver)."""
+        return None
 
     def _start_message(self, ident: "BrainIdentity", job: Optional[str], orchestration: str) -> str:
         if orchestration == "external_job":
@@ -246,6 +253,29 @@ class HermesBrainAdapter(BrainAdapter):
             return True
         except Exception:
             return False
+
+    def _compensator(self, job_id: Optional[str]):
+        """A one-shot cancel of the just-provisioned external job, used by the
+        store to undo an orphan if the local run_started write fails."""
+        if not job_id:
+            return None
+        state = {"done": False}
+
+        def _compensate():
+            if state["done"]:
+                return
+            state["done"] = True
+            self._client.cancel_job(job_id=job_id)  # may raise → store reports it
+
+        return _compensate
+
+    def control_external(self, *, job_id: Optional[str], action: str, idempotency_key: str) -> None:
+        """Issue an explicit typed lifecycle action (retry/resume/cancel) to the
+        external job. Raises OrchestratorUnavailable on failure (caller reports a
+        truthful pending/blocked state instead of updating local state)."""
+        if not job_id:
+            raise OrchestratorUnavailable("no external job to control")
+        self._client.control_job(job_id=job_id, action=action, idempotency_key=idempotency_key)
 
 
 # --------------------------------------------------------------------------- #
