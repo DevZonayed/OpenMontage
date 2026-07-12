@@ -221,13 +221,18 @@ export const StudioApp: React.FC<StudioAppProps> = ({ client }) => {
   }, [client, dirty]);
 
   // ── transport ──
+  // Clamp to the EFFECTIVE duration (real layers → the composition; empty → the
+  // canonical target frames), and always update `frame` so the scrubber works even
+  // when there is no Player yet (empty timeline shows the placeholder, not a Player).
   const seek = useCallback((f: number) => {
-    const p = playerRef.current;
-    if (!p || !model) return;
-    const clamped = Math.max(0, Math.min(model.totalFrames - 1, Math.round(f)));
-    p.seekTo(clamped);
-    setFrame(clamped);
-  }, [model]);
+    if (!model) return;
+    const effectiveFrames = model.layers.length > 0
+      ? model.totalFrames
+      : (status.view?.target?.frames || model.totalFrames);
+    const clamped = Math.max(0, Math.min(effectiveFrames - 1, Math.round(f)));
+    playerRef.current?.seekTo(clamped);   // seek only if a Player exists
+    setFrame(clamped);                     // but always move the playhead/timecode
+  }, [model, status.view]);
 
   const togglePlay = useCallback(() => playerRef.current?.toggle(), []);
   const step = useCallback((delta: number) => seek(frame + delta), [frame, seek]);
@@ -265,7 +270,8 @@ export const StudioApp: React.FC<StudioAppProps> = ({ client }) => {
           seek(0);
           break;
         case "End":
-          if (model) seek(model.totalFrames - 1);
+          // seek() clamps to the effective end (target frames on an empty timeline).
+          if (model) seek(Number.MAX_SAFE_INTEGER);
           break;
         default:
           break;

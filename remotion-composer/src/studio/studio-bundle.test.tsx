@@ -155,6 +155,19 @@ describe("shipped studio.bundle.js — real mount, canonical UI, no legacy leaka
     expect(conn?.querySelector("button")).toBeNull();
   });
 
+  it("scrubber advances on an empty timeline (no Player) using the target duration", async () => {
+    const container = mountBundle();
+    await settle(container, "f0/4500");
+    // step forward — with no Player, `seek` must still move the playhead/timecode.
+    const nextBtn = [...container.querySelectorAll("button")].find(
+      (b) => (b.getAttribute("aria-label") || "") === "Next frame") as HTMLButtonElement | undefined;
+    expect(nextBtn).toBeTruthy();
+    nextBtn!.click();
+    const after = await settle(container, "f1/4500");
+    expect(after).toContain("f1/4500");     // playhead advanced (denominator = target 4500)
+    expect(after).not.toMatch(/\b1800\b/);
+  });
+
   it("live run shows a SANITIZED short job id (never the raw handle)", async () => {
     const FULL_JOB = "11111111-1111-4111-8111-111111111111";
     statusOverride = {
