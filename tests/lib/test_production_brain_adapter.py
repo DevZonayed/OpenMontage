@@ -136,6 +136,36 @@ class TestHermesFailClosed:
         h = HermesBrainAdapter(client=_Boom())
         assert h.available() is False
 
+    def test_adapter_rejects_non_canonical_ids_from_client(self, tmp_path):
+        # Defense in depth: even a misbehaving client that returns unsafe ids must
+        # not get them persisted — the adapter validates at the persistence boundary.
+        class _EvilClient:
+            kind = "live"
+            engine = "hermes"
+
+            def __init__(self, sid, jid):
+                self._h = OrchestratorHandle(session_id=sid, job_id=jid)
+
+            def available(self):
+                return True
+
+            def create_job(self, **kw):
+                return self._h
+
+            def cancel_job(self, **kw):
+                pass
+
+            def control_job(self, **kw):
+                pass
+
+        for sid, jid in [("sess/1", "job-1"), ("sess-1", "../x"), ("sess-1", "job\n1")]:
+            d = tmp_path / f"p-{abs(hash((sid, jid)))}"
+            d.mkdir()
+            s = ProductionBrainStore(d, gen_id=lambda: "run_1")
+            with pytest.raises(BrainUnavailable):
+                HermesBrainAdapter(client=_EvilClient(sid, jid)).start(s, requested_duration_seconds=60)
+            assert s.read_events_raw() == []  # nothing persisted
+
     def test_real_ids_are_recorded_verbatim(self, tmp_path):
         s = _store(tmp_path)
         client = FakeOrchestratorClient(engine="hermes-fake")

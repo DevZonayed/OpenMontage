@@ -70,16 +70,30 @@ def validate_endpoint(url: Any) -> str:
             "(and store its token via credential settings) to start real production runs.")
     if any((ord(c) < 0x20) or c.isspace() for c in url):
         raise OrchestratorUnavailable("orchestrator endpoint contains control/whitespace characters")
-    parts = urlsplit(url)
-    scheme = (parts.scheme or "").lower()
+    # ALL parser access is wrapped: a malformed bracketed host or a bad port makes
+    # ``.hostname``/``.port`` raise ValueError — every such failure must fail
+    # closed as OrchestratorUnavailable, never bubble up (available() only catches
+    # OrchestratorUnavailable) and never be silently accepted.
+    try:
+        parts = urlsplit(url)
+        scheme = (parts.scheme or "").lower()
+        netloc = parts.netloc or ""
+        username = parts.username
+        password = parts.password
+        fragment = parts.fragment
+        hostname = parts.hostname
+        port = parts.port  # raises ValueError for a non-numeric/out-of-range port
+    except ValueError as exc:
+        raise OrchestratorUnavailable(f"orchestrator endpoint is malformed ({exc.__class__.__name__})") from exc
     if scheme not in ("http", "https"):
         raise OrchestratorUnavailable("orchestrator endpoint must use http or https")
-    netloc = parts.netloc or ""
-    if "@" in netloc or parts.username or parts.password:
+    if "@" in netloc or username or password:
         raise OrchestratorUnavailable("orchestrator endpoint must not embed credentials")
-    if parts.fragment:
+    if fragment:
         raise OrchestratorUnavailable("orchestrator endpoint must not contain a fragment")
-    host = (parts.hostname or "").lower()
+    if isinstance(port, int) and not (0 < port <= 65535):
+        raise OrchestratorUnavailable("orchestrator endpoint has an invalid port")
+    host = (hostname or "").lower()
     if not host:
         raise OrchestratorUnavailable("orchestrator endpoint has no host")
     # Reject an ambiguous host (a bracket/colon that urlsplit could not parse into

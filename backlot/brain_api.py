@@ -175,11 +175,14 @@ def retry_stage(project_dir: Path, body: dict, *, orchestrator=None) -> dict:
     brain = state.get("brain") or {}
     run_id = body.get("run_id")
     try:
-        if state.get("run_id") and brain.get("external") and brain.get("job_id"):
-            _require_active_for_control(state, run_id)
+        if brain.get("external"):
+            # A lifecycle control on a real external job requires the EXACT active
+            # run_id AND the caller's job_id to match the persisted handle — a
+            # stale caller must not be able to control whichever run is active.
+            job_id = _require_control_handle(state, brain, body)
             key = f"{state['run_id']}:retry:{stage}"
             try:
-                _client(orchestrator).control_job(job_id=brain["job_id"], action="retry", idempotency_key=key)
+                _client(orchestrator).control_job(job_id=job_id, action="retry", idempotency_key=key)
             except Exception:
                 store.raise_blocker(stage, kind="control_unconfirmed",
                                    message=f"External retry of stage '{stage}' is unconfirmed — retry.",
@@ -197,31 +200,46 @@ def resume_run(project_dir: Path, body: dict, *, orchestrator=None) -> dict:
     state = store.read_state()
     brain = state.get("brain") or {}
     try:
-        if state.get("run_id") and brain.get("external") and brain.get("job_id"):
-            if state.get("state") in ("running", "awaiting_approval", "blocked", "cancelling"):
-                key = f"{state['run_id']}:resume"
-                try:
-                    _client(orchestrator).control_job(job_id=brain["job_id"], action="resume", idempotency_key=key)
-                except Exception:
-                    from lib.production_brain.schema import STAGES
+        if brain.get("external"):
+            job_id = _require_control_handle(state, brain, body)
+            key = f"{state['run_id']}:resume"
+            try:
+                _client(orchestrator).control_job(job_id=job_id, action="resume", idempotency_key=key)
+            except Exception:
+                from lib.production_brain.schema import STAGES
 
-                    store.raise_blocker(state.get("current_stage") or STAGES[0],
-                                       kind="control_unconfirmed",
-                                       message="External resume is unconfirmed — retry.",
-                                       options=["Retry"])
-                    return store.read_state()
+                store.raise_blocker(state.get("current_stage") or STAGES[0],
+                                   kind="control_unconfirmed",
+                                   message="External resume is unconfirmed — retry.",
+                                   options=["Retry"])
+                return store.read_state()
         return store.resume()
     except BrainStoreError as exc:
         raise BrainApiError(str(exc), status=exc.status)
 
 
-def _require_active_for_control(state: dict, run_id) -> None:
+def _require_control_handle(state: dict, brain: dict, body: dict) -> str:
+    """Gate an external lifecycle control on the EXACT caller-supplied handles.
+
+    Requires an active run, a body ``run_id`` that matches the active run, and a
+    ``job_id`` that matches the persisted external handle (when the caller supplies
+    one). Returns the validated persisted ``job_id``."""
     from lib.production_brain.schema import ACTIVE_RUN_STATES
 
     if state.get("state") not in ACTIVE_RUN_STATES:
         raise BrainApiError("There is no active run for this control action.", status=409)
-    if run_id is not None and state.get("run_id") != run_id:
+    persisted_job = brain.get("job_id")
+    if not persisted_job:
+        raise BrainApiError("The active run has no external job handle to control.", status=409)
+    body_run_id = body.get("run_id")
+    if not isinstance(body_run_id, str) or not body_run_id:
+        raise BrainApiError("run_id is required to control an external run", status=400)
+    if body_run_id != state.get("run_id"):
         raise BrainApiError("Run id does not match the active run.", status=409)
+    body_job_id = body.get("job_id")
+    if body_job_id is not None and body_job_id != persisted_job:
+        raise BrainApiError("Job id does not match the active run's external job.", status=409)
+    return persisted_job
 
 
 def _intake_target(project_dir: Path) -> Optional[int]:

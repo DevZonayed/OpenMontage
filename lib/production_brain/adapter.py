@@ -35,6 +35,7 @@ from lib.production_brain.orchestrator import (
     HermesOrchestratorClient,
     OrchestratorUnavailable,
     default_orchestrator_client,
+    is_canonical_id,
 )
 from lib.production_brain.store import ProductionBrainStore
 
@@ -234,14 +235,19 @@ class HermesBrainAdapter(BrainAdapter):
             raise BrainUnavailable(
                 f"Hermes orchestrator could not create a job ({exc.__class__.__name__})."
             ) from exc
-        if not handle or not getattr(handle, "session_id", None) or not getattr(handle, "job_id", None):
+        # Enforce canonical id validation at the PERSISTENCE boundary — never trust
+        # the client to have done it. A custom/misbehaving client returning
+        # session_id="sess/1" or job_id="../x" is refused here, before run_started.
+        sid = getattr(handle, "session_id", None)
+        jid = getattr(handle, "job_id", None)
+        if not is_canonical_id(sid) or not is_canonical_id(jid):
             raise BrainUnavailable(
-                "Hermes orchestrator returned no canonical session/job id; refusing "
-                "to open a run without a real external job.")
+                "Hermes orchestrator returned non-canonical session/job id; refusing "
+                "to open a run without safe external ids.")
         self._handle = handle
         self._external = True  # an orchestrator client provisioned the job
         kind = getattr(self._client, "kind", "live")
-        return handle.session_id, handle.job_id, ("external_job" if kind == "live" else "fake_driver")
+        return sid, jid, ("external_job" if kind == "live" else "fake_driver")
 
     def cancel_external(self, *, job_id: Optional[str]) -> bool:
         """Best-effort: cancel the external job to keep the handle truthful.

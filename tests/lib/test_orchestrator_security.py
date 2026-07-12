@@ -69,10 +69,17 @@ class TestEndpointPolicy:
         "https://hermes.example.com\n",       # control char
         "https://her mes.example.com",        # whitespace
         "javascript:alert(1)",                 # bogus scheme
+        "https://example.com:badport",         # non-numeric port
+        "https://example.com:99999",           # out-of-range port
+        "https://example.com:-1",              # negative port
+        "https://[::1",                        # malformed bracketed host
+        "https://[not:an:ip]",                 # malformed bracketed host
         "",                                    # empty
         None,                                  # missing
     ])
     def test_rejected(self, url):
+        # Fail-closed: every malformed input raises OrchestratorUnavailable (never
+        # a bare ValueError) and reports unavailable.
         with pytest.raises(OrchestratorUnavailable):
             validate_endpoint(url)
         assert ConfiguredHermesOrchestratorClient(url=url).available() is False

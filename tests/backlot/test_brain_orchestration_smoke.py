@@ -162,7 +162,7 @@ class TestRealRetryResume:
         d = tmp_path / "p"; d.mkdir()
         good = FakeOrchestratorClient()
         _external_run(d, good)
-        st = brain_api.resume_run(d, {}, orchestrator=good)
+        st = brain_api.resume_run(d, {"run_id": "run_x"}, orchestrator=good)
         assert any(c["action"] == "resume" for c in good.controls)
         assert st["state"] == "running"
 
@@ -170,6 +170,38 @@ class TestRealRetryResume:
         d = tmp_path / "p"; d.mkdir()
         fail = FakeOrchestratorClient(fail_control=True)
         _external_run(d, fail)
-        st = brain_api.resume_run(d, {}, orchestrator=fail)
+        st = brain_api.resume_run(d, {"run_id": "run_x"}, orchestrator=fail)
         assert st["state"] == "blocked"
         assert any(b["kind"] == "control_unconfirmed" for b in st["blockers"])
+
+
+class TestExternalControlRequiresExactHandles:
+    def test_resume_without_run_id_rejected(self, tmp_path):
+        d = tmp_path / "p"; d.mkdir()
+        good = FakeOrchestratorClient()
+        _external_run(d, good)
+        with pytest.raises(brain_api.BrainApiError) as ei:
+            brain_api.resume_run(d, {}, orchestrator=good)  # no run_id → refused
+        assert ei.value.status == 400
+        assert good.controls == []  # orchestrator NEVER contacted
+
+    def test_retry_wrong_run_id_rejected(self, tmp_path):
+        d = tmp_path / "p"; d.mkdir()
+        good = FakeOrchestratorClient()
+        store = _external_run(d, good)
+        store.fail_stage("render", error="boom")
+        with pytest.raises(brain_api.BrainApiError) as ei:
+            brain_api.retry_stage(d, {"stage": "render", "run_id": "run_STALE"}, orchestrator=good)
+        assert ei.value.status == 409
+        assert good.controls == []
+
+    def test_retry_wrong_job_id_rejected(self, tmp_path):
+        d = tmp_path / "p"; d.mkdir()
+        good = FakeOrchestratorClient()
+        store = _external_run(d, good)
+        store.fail_stage("render", error="boom")
+        with pytest.raises(brain_api.BrainApiError) as ei:
+            brain_api.retry_stage(d, {"stage": "render", "run_id": "run_x", "job_id": "job-WRONG"},
+                                 orchestrator=good)
+        assert ei.value.status == 409
+        assert good.controls == []
