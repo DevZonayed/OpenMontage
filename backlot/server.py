@@ -66,6 +66,8 @@ _RATE_LIMITS = {
     "run": (10, 60.0),       # start/cancel a production run — spawns a worker
     "render": (12, 60.0),    # single-frame stills — a subprocess each, but scrub-and-render is interactive
     "inbox": (40, 10.0),     # agent-queue READ polled ~every 2s by the board — own bucket, never drains 'projects'
+    "brain": (60, 10.0),     # production-brain control (approve/cancel/retry/resume) — bursty on a live run
+    "preferences": (30, 10.0),  # learned-style read/update/reset — user-driven, infrequent
 }
 _RATE_MAX_KEYS = 4096  # hard cap on tracked buckets (memory bound)
 
@@ -144,7 +146,11 @@ def _enforce_rate(request: Request, bucket: str) -> None:
 
 
 # Paths inside a project whose changes are pure noise for the board.
-_IGNORE_PARTS = {"node_modules", ".git", "__pycache__", ".cache"}
+# ``brain`` holds the production-brain telemetry (state.json + run_events.jsonl):
+# it changes at high frequency on a live run and is surfaced by its own polling
+# endpoints (/api/project/{id}/brain[/events]) — exactly like run.json — so it
+# must not trigger a full board SSE re-render (which would flicker the UI).
+_IGNORE_PARTS = {"node_modules", ".git", "__pycache__", ".cache", "brain"}
 # Run/timeline state files change frequently (worker heartbeat, editor saves) and
 # are surfaced by their own polling endpoints — don't trigger a full board SSE
 # re-render (which would flicker the UI and collapse expanded sections).
@@ -577,6 +583,99 @@ def create_app() -> FastAPI:
         try:
             return await asyncio.to_thread(cancel_run, project_dir, run_id)
         except RunError as exc:
+            raise HTTPException(status_code=getattr(exc, "status", 400), detail=str(exc))
+
+    # ---- Production brain (canonical run state + append-only event history) ----
+    # The Hermes brain's observable telemetry: which agent/job/tool/provider is
+    # doing which task, current stage, progress, elapsed time, latest event,
+    # outputs, approvals, blockers, errors. Reads are non-blocking snapshots
+    # (the board polls, like it polls /run); control is CSRF + rate guarded.
+
+    @app.get("/api/project/{project_id}/brain")
+    async def project_brain_state(project_id: str) -> dict:
+        from backlot.brain_api import build_run_payload
+        project_dir = _safe_project_dir(project_id)
+        return await asyncio.to_thread(build_run_payload, project_dir)
+
+    @app.get("/api/project/{project_id}/brain/events")
+    async def project_brain_events(project_id: str, after: int = 0, limit: int = 200) -> dict:
+        """Cursor page of the append-only event history (non-blocking snapshot)."""
+        from backlot.brain_api import read_events_payload
+        project_dir = _safe_project_dir(project_id)
+        return await asyncio.to_thread(read_events_payload, project_dir, after=after, limit=limit)
+
+    @app.get("/api/project/{project_id}/brain/assets")
+    async def project_brain_assets(project_id: str) -> dict:
+        from backlot.brain_api import assets_payload
+        project_dir = _safe_project_dir(project_id)
+        return await asyncio.to_thread(assets_payload, project_dir)
+
+    def _brain_control(handler_name: str):
+        async def _route(project_id: str, request: Request) -> dict:
+            import backlot.brain_api as brain_api
+            from backlot.brain_api import BrainApiError
+            project_dir = _safe_project_dir(project_id)
+            body = await _guarded_json_body(request)
+            _enforce_rate(request, "brain")
+            handler = getattr(brain_api, handler_name)
+            try:
+                return await asyncio.to_thread(handler, project_dir, body)
+            except BrainApiError as exc:
+                raise HTTPException(status_code=getattr(exc, "status", 400), detail=str(exc))
+        _route.__name__ = f"project_brain_{handler_name}"
+        return _route
+
+    app.post("/api/project/{project_id}/brain/start")(_brain_control("start_run"))
+    app.post("/api/project/{project_id}/brain/approve")(_brain_control("grant_approval"))
+    app.post("/api/project/{project_id}/brain/reject")(_brain_control("reject_approval"))
+    app.post("/api/project/{project_id}/brain/cancel")(_brain_control("cancel_run"))
+    app.post("/api/project/{project_id}/brain/retry")(_brain_control("retry_stage"))
+    app.post("/api/project/{project_id}/brain/resume")(_brain_control("resume_run"))
+
+    # ---- Learned style preferences (visible, auditable, reversible) ----------
+
+    @app.get("/api/project/{project_id}/preferences")
+    async def project_preferences_get(project_id: str, scope: str = "all",
+                                      category: Optional[str] = None) -> dict:
+        from backlot.brain_api import read_preferences
+        project_dir = _safe_project_dir(project_id)
+        return await asyncio.to_thread(read_preferences, project_dir, scope=scope, category=category)
+
+    @app.post("/api/project/{project_id}/preferences")
+    async def project_preferences_post(project_id: str, request: Request) -> dict:
+        from backlot.brain_api import BrainApiError, update_preference
+        project_dir = _safe_project_dir(project_id)
+        body = await _guarded_json_body(request)
+        _enforce_rate(request, "preferences")
+        try:
+            return await asyncio.to_thread(update_preference, body, project_dir=project_dir)
+        except BrainApiError as exc:
+            raise HTTPException(status_code=getattr(exc, "status", 400), detail=str(exc))
+
+    @app.post("/api/project/{project_id}/preferences/reset")
+    async def project_preferences_reset(project_id: str, request: Request) -> dict:
+        from backlot.brain_api import reset_preferences
+        project_dir = _safe_project_dir(project_id)
+        body = await _guarded_json_body(request)
+        _enforce_rate(request, "preferences")
+        return await asyncio.to_thread(reset_preferences, body, project_dir=project_dir)
+
+    @app.get("/api/preferences")
+    async def preferences_get(scope: str = "global", category: Optional[str] = None) -> dict:
+        """Global learned-style preferences (cross-project defaults)."""
+        from backlot.brain_api import read_preferences
+        return await asyncio.to_thread(read_preferences, None,
+                                      scope="global" if scope != "project" else "global",
+                                      category=category)
+
+    @app.post("/api/preferences")
+    async def preferences_post(request: Request) -> dict:
+        from backlot.brain_api import BrainApiError, update_preference
+        body = await _guarded_json_body(request)
+        _enforce_rate(request, "preferences")
+        try:
+            return await asyncio.to_thread(update_preference, body, project_dir=None)
+        except BrainApiError as exc:
             raise HTTPException(status_code=getattr(exc, "status", 400), detail=str(exc))
 
     @app.get("/api/project/{project_id}/events")

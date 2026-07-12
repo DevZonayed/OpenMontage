@@ -1,0 +1,147 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "openmontage/artifacts/production_run_state",
+  "title": "Production Run State",
+  "description": "Canonical, versioned, materialized snapshot of a Hermes-brain production run. It is a VIEW derived from the append-only production_event log (run_events.jsonl) — the log is authoritative and this document can always be rebuilt from it. Single-writer: lib.production_brain.store.ProductionBrainStore. Distinguishes requested (target) duration from actual rendered duration and exposes per-stage progress, timing, the latest event, outputs, approvals, blockers, and errors so an observer always knows which agent/job/tool/provider is doing which task.",
+  "type": "object",
+  "required": ["version", "kind", "run_id", "project_id", "state", "stages", "cursor", "terminal"],
+  "properties": {
+    "version": { "type": "string", "const": "1.0" },
+    "kind": { "type": "string", "const": "production_run_state" },
+    "run_id": { "type": "string" },
+    "project_id": { "type": "string" },
+    "state": {
+      "type": "string",
+      "enum": ["not_started", "running", "awaiting_approval", "blocked", "cancelling", "cancelled", "failed", "completed"],
+      "description": "Coarse run lifecycle. Terminal states: cancelled/failed/completed."
+    },
+    "terminal": { "type": "boolean" },
+    "brain": {
+      "type": "object",
+      "description": "Stable identity of the orchestrating brain. Never contains secrets.",
+      "properties": {
+        "name": { "type": "string", "description": "e.g. hermes" },
+        "adapter": { "type": "string", "description": "adapter class id, e.g. hermes / fake" },
+        "available": { "type": "boolean" },
+        "agent_id": { "type": ["string", "null"] },
+        "session_id": { "type": ["string", "null"] },
+        "engine": { "type": ["string", "null"], "description": "subscription engine backing the brain, if any" }
+      },
+      "additionalProperties": true
+    },
+    "requested_duration_seconds": {
+      "type": ["integer", "null"],
+      "minimum": 1,
+      "maximum": 300,
+      "description": "The user's target duration (1..300). Distinct from actual."
+    },
+    "actual_duration_seconds": {
+      "type": ["number", "null"],
+      "description": "The real duration of the produced deliverable once rendered. Null until render/complete."
+    },
+    "current_stage": { "type": ["string", "null"] },
+    "stages": {
+      "type": "array",
+      "description": "Ordered production stages with live status/progress/timing.",
+      "items": {
+        "type": "object",
+        "required": ["id", "title", "status"],
+        "properties": {
+          "id": { "type": "string" },
+          "title": { "type": "string" },
+          "status": {
+            "type": "string",
+            "enum": ["pending", "active", "blocked", "awaiting_approval", "done", "failed", "skipped"]
+          },
+          "progress": { "type": "number", "minimum": 0, "maximum": 1 },
+          "started_at": { "type": ["string", "null"], "format": "date-time" },
+          "ended_at": { "type": ["string", "null"], "format": "date-time" },
+          "elapsed_seconds": { "type": ["number", "null"] },
+          "tool": { "type": ["string", "null"], "description": "tool currently/last used in this stage" },
+          "provider": { "type": ["string", "null"] },
+          "job_id": { "type": ["string", "null"] },
+          "latest_event_seq": { "type": ["integer", "null"] },
+          "latest_activity": { "type": ["string", "null"] },
+          "outputs": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "properties": {
+                "kind": { "type": "string" },
+                "path": { "type": ["string", "null"] },
+                "label": { "type": ["string", "null"] }
+              },
+              "additionalProperties": true
+            }
+          },
+          "error": { "type": ["string", "null"] }
+        },
+        "additionalProperties": true
+      }
+    },
+    "approvals": {
+      "type": "array",
+      "description": "Approval gates raised during the run and their disposition.",
+      "items": {
+        "type": "object",
+        "required": ["approval_id", "stage", "status"],
+        "properties": {
+          "approval_id": { "type": "string" },
+          "stage": { "type": "string" },
+          "status": { "type": "string", "enum": ["pending", "approved", "rejected"] },
+          "requested_at": { "type": ["string", "null"], "format": "date-time" },
+          "decided_at": { "type": ["string", "null"], "format": "date-time" },
+          "by": { "type": ["string", "null"] },
+          "note": { "type": ["string", "null"] },
+          "prompt": { "type": ["string", "null"] }
+        },
+        "additionalProperties": true
+      }
+    },
+    "blockers": {
+      "type": "array",
+      "description": "Active + resolved blockers with a truthful classification.",
+      "items": {
+        "type": "object",
+        "required": ["blocker_id", "stage", "kind", "message", "resolved"],
+        "properties": {
+          "blocker_id": { "type": "string" },
+          "stage": { "type": "string" },
+          "kind": {
+            "type": "string",
+            "enum": ["auth", "provider_access", "tool_bug", "quality", "runtime_unavailable", "brain_unavailable", "control_unconfirmed", "other"]
+          },
+          "message": { "type": "string" },
+          "options": { "type": "array", "items": { "type": "string" } },
+          "created_at": { "type": ["string", "null"], "format": "date-time" },
+          "resolved": { "type": "boolean" },
+          "resolved_at": { "type": ["string", "null"], "format": "date-time" }
+        },
+        "additionalProperties": true
+      }
+    },
+    "outputs": {
+      "type": "array",
+      "description": "Flat roll-up of every asset/artifact produced across stages.",
+      "items": { "type": "object", "additionalProperties": true }
+    },
+    "error": { "type": ["string", "null"] },
+    "activity": { "type": ["string", "null"], "description": "Human-readable latest activity line." },
+    "counts": {
+      "type": "object",
+      "properties": {
+        "events": { "type": "integer" },
+        "tool_calls": { "type": "integer" },
+        "decisions": { "type": "integer" },
+        "outputs": { "type": "integer" }
+      },
+      "additionalProperties": true
+    },
+    "cursor": { "type": "integer", "description": "Sequence number of the last applied event." },
+    "created_at": { "type": ["string", "null"], "format": "date-time" },
+    "started_at": { "type": ["string", "null"], "format": "date-time" },
+    "updated_at": { "type": ["string", "null"], "format": "date-time" },
+    "ended_at": { "type": ["string", "null"], "format": "date-time" }
+  },
+  "additionalProperties": true
+}
