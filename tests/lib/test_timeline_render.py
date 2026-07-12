@@ -43,6 +43,14 @@ def test_no_timeline_not_ok(tmp_path):
     assert res["ok"] is False and "timeline" in res["reason"].lower()
 
 
+def test_empty_timeline_refuses_render(tmp_path):
+    # A skeleton timeline with positive frames but ZERO layers must not render a
+    # misleading blank film — even via a direct API caller bypassing the UI.
+    proj = tmp_path / "p"; _seed(proj, secs=150, layers=[])
+    res = tr.render_timeline_preview(proj, runner=_ok_runner, browser="/x", doctor=_doc_ok)
+    assert res["ok"] is False and "layer" in res["reason"].lower()
+
+
 def test_doctor_unavailable(tmp_path):
     proj = tmp_path / "p"; _seed(proj)
     res = tr.render_timeline_preview(proj, runner=_ok_runner, browser="/x",

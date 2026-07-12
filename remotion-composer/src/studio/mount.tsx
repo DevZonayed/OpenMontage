@@ -12,16 +12,19 @@ import { BacklotClient } from "../composition/client";
 export interface MountOptions {
   projectId: string;
   baseUrl?: string;
-  forceFixtures?: boolean;
-  fixtureFallback?: boolean;
+  forceFixtures?: boolean; // EXPLICIT demo mode ("Try demo mode")
 }
 
 export function mount(container: HTMLElement, options: MountOptions): () => void {
+  // Demo mode is EXPLICIT only: the caller opts in, or the URL carries ?demo=1.
+  // There is no automatic fixture fallback — a failed live fetch shows a
+  // reconnecting indicator, never fabricated data.
+  const urlDemo =
+    typeof location !== "undefined" && /[?&]demo=1\b/.test(location.search);
   const client = new BacklotClient({
     projectId: options.projectId,
     baseUrl: options.baseUrl,
-    forceFixtures: options.forceFixtures,
-    fixtureFallback: options.fixtureFallback ?? true,
+    forceFixtures: options.forceFixtures ?? urlDemo,
   });
   const root = createRoot(container);
   root.render(
