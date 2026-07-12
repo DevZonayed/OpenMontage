@@ -201,6 +201,53 @@ def test_indeterminate_send_never_double_sends(tmp_path, monkeypatch):
     assert sends["n"] == 1  # exactly ONE real sendChat attempt, never a duplicate
 
 
+class _FailingIdem:
+    """Idempotency store that fails to persist the FINAL handle (post-send)."""
+
+    def __init__(self):
+        self.data = {}
+        self.deleted = []
+
+    def get(self, key):
+        return self.data.get(key)
+
+    def put(self, key, value):
+        if value.get("job_id"):
+            raise OSError("disk full")  # fails only for the real-handle persist
+        self.data[key] = value
+
+    def delete(self, key):
+        self.deleted.append(key)
+        self.data.pop(key, None)
+
+
+def test_persist_failure_after_send_compensates_by_cancelling():
+    fake = FakeMochletMcp()
+    idem = _FailingIdem()
+    c = MochletMcpOrchestratorClient(
+        endpoint="http://127.0.0.1:9235/mcp", mochlet_project_id=PID,
+        transport=fake.transport, token_getter=lambda: fake.token, idempotency_store=idem)
+    with pytest.raises(OrchestratorUnavailable):
+        c.create_job(project_id="p", run_id="rc", requested_duration_seconds=60, idempotency_key="kc")
+    # the just-created Mochlet job was CANCELLED (no orphan), and the pending marker cleared
+    assert len(fake.sent_chats) == 1
+    assert len(fake.cancelled) == 1 and is_uuid(fake.cancelled[0])
+    assert "kc" in idem.deleted
+
+
+def test_find_existing_job_skips_cancelled(tmp_path):
+    # A cancelled job carrying the marker must not be resurrected as the handle.
+    fake = FakeMochletMcp()
+    c = _client(fake, tmp_path)
+    h = c.create_job(project_id="p", run_id="r", requested_duration_seconds=60, idempotency_key="k")
+    fake.jobs[h.job_id]["status"] = "cancelled"
+    from lib.production_brain.mcp_client import MochletMcpClient
+    client = MochletMcpClient("http://127.0.0.1:9235/mcp", transport=fake.transport,
+                              token_getter=lambda: fake.token)
+    client.initialize()
+    assert c._find_existing_job(client, "r") is None
+
+
 def test_token_never_appears_in_handle(tmp_path):
     fake = FakeMochletMcp(token="tok-super-secret")
     c = _client(fake, tmp_path)

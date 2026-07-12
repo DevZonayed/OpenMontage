@@ -39,6 +39,7 @@ from lib.production_brain.mochlet import (
     REQUIRED_TOOLS,
     JobIdempotencyStore,
     MochletMcpOrchestratorClient,
+    looks_like_mochlet,
 )
 from lib.production_brain.orchestrator import (
     ORCHESTRATOR_TOKEN_ACCOUNT,
@@ -156,7 +157,8 @@ def verify_mcp(endpoint: str, *, transport: Optional[Callable[..., Any]] = None,
     """
     out: dict = {"reachable": False, "authenticated": False, "needs_token": False,
                  "server_name": None, "tools": [], "has_required_tools": False,
-                 "health_ok": False, "projects": [], "detail": ""}
+                 "health_ok": False, "projects": [], "projects_listed": False,
+                 "is_mochlet": False, "detail": ""}
     try:
         client = MochletMcpClient(endpoint, transport=transport, token_getter=lambda: token)
     except Exception as exc:
@@ -171,8 +173,9 @@ def verify_mcp(endpoint: str, *, transport: Optional[Callable[..., Any]] = None,
     except McpError as exc:
         out["detail"] = str(exc)
         return out
-    out.update(reachable=True, authenticated=True,
-               server_name=(client.server_info or {}).get("name"))
+    server_name = (client.server_info or {}).get("name")
+    out.update(reachable=True, authenticated=True, server_name=server_name,
+               is_mochlet=looks_like_mochlet(server_name))
     try:
         client.ping()
     except McpError:
@@ -196,6 +199,7 @@ def verify_mcp(endpoint: str, *, transport: Optional[Callable[..., Any]] = None,
             page = client.call_tool("listProjects", {})
             projs = page.get("projects") if isinstance(page, dict) else None
             if isinstance(projs, list):
+                out["projects_listed"] = True  # the discovery call actually succeeded
                 out["projects"] = [
                     {"id": p.get("id"), "name": p.get("name"), "path": p.get("path")}
                     for p in projs if isinstance(p, dict) and isinstance(p.get("id"), str)]
@@ -327,6 +331,14 @@ def connection_status(
         return _base("needs_token", False, "Hermes needs a credential",
                      "Mochlet is reachable but rejected the request. Reconnect with a valid token.",
                      [{"id": "connect_hermes", "label": "Reconnect Hermes"}])
+    if not v.get("is_mochlet"):
+        # A foreign MCP server that merely exposes the tool names must NOT be
+        # trusted to run production.
+        return _base("wrong_server", False,
+                     "Connected endpoint is not a recognized Hermes/Mochlet server",
+                     "This MCP endpoint did not identify as Hermes/Mochlet. Point "
+                     "OpenMontage at the local Mochlet orchestrator.",
+                     [connect_action], server_name=v["server_name"])
     if not v["has_required_tools"]:
         return _base("tools_disabled", False,
                      "Mochlet connection found, but chat/control tools are disabled",
@@ -338,9 +350,10 @@ def connection_status(
         return _base("degraded", False, "Hermes is connected but reports unhealthy",
                      "The Mochlet health check reported a problem. Production is paused "
                      "until it recovers.", [retry_action], server_name=v["server_name"])
-    # capable + healthy — is a project chosen and still valid?
-    project_ids = {p["id"] for p in v["projects"]} if v["projects"] else set()
-    if not selected_project or (project_ids and selected_project not in project_ids):
+    # capable + healthy — the project must be VERIFIABLE (listProjects succeeded)
+    # AND an exact match; a stale persisted id can't pass on an unverifiable list.
+    project_ids = {p["id"] for p in v["projects"]}
+    if not v.get("projects_listed") or not selected_project or selected_project not in project_ids:
         return _base("needs_project", False,
                      "Choose the OpenMontage project in Mochlet",
                      "Mochlet is connected. Select which Mochlet project drives this "
@@ -408,6 +421,13 @@ def connect(
         return _fail("needs_token", False, "Hermes rejected the connection",
                      "Mochlet requires a valid credential.",
                      [{"id": "connect_hermes", "label": "Reconnect Hermes"}], loop, verify_token)
+    if not v.get("is_mochlet"):
+        return _fail("wrong_server", False,
+                     "Connected endpoint is not a recognized Hermes/Mochlet server",
+                     "This MCP endpoint did not identify as Hermes/Mochlet — refusing to "
+                     "enable production against an unknown server.",
+                     [{"id": "connect_hermes", "label": "Connect Hermes"}], loop, verify_token,
+                     server_name=v["server_name"])
     if not v["has_required_tools"]:
         return _fail("tools_disabled", False,
                      "Mochlet connection found, but chat/control tools are disabled",
@@ -420,8 +440,14 @@ def connect(
                      [{"id": "retry_connect", "label": "Retry connection"}], loop, verify_token,
                      server_name=v["server_name"])
 
-    # choose the project
+    # choose the project — the discovery call MUST have succeeded (fail closed).
     projects = v["projects"]
+    if not v.get("projects_listed"):
+        return _fail("needs_project", False, "Choose the OpenMontage project in Mochlet",
+                     "Mochlet did not return a project list to verify against. Ensure "
+                     "project discovery is enabled, then reconnect.",
+                     [{"id": "connect_hermes", "label": "Choose project"}], loop, verify_token,
+                     server_name=v["server_name"], projects=projects)
     chosen = _resolve_project(projects, project_id, stored_config(base_dir).get("mochlet_project_id"))
     if chosen is None:
         return _fail("needs_project", False, "Choose the OpenMontage project in Mochlet",

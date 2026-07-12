@@ -47,9 +47,24 @@ _UUID_RE = re.compile(
 # can be de-duplicated against ``listJobPage`` after an indeterminate sendChat.
 _RUN_MARKER_PREFIX = "OM-RUN"
 
-# Tools the bridge must have to actually start + control a production.
-REQUIRED_TOOLS = ("sendChat", "cancelJob")
-CONTROL_TOOLS = ("runJob", "continueSession")
+# Tools the bridge must have to actually start, discover, and control a production
+# (create + cancel + retry/resume + project discovery + dedup/status). If any is
+# missing the connection is "tools disabled", not "connected".
+REQUIRED_TOOLS = (
+    "sendChat", "cancelJob", "runJob", "continueSession",
+    "listProjects", "listJobPage", "getJob",
+)
+
+# Non-secret Mochlet server identity — verify_mcp refuses to mark a foreign MCP
+# server (that merely happens to expose these tool names) as connected.
+MOCHLET_SERVER_MARKERS = ("mochlet", "mochi", "maestro")
+
+
+def looks_like_mochlet(server_name) -> bool:
+    if not isinstance(server_name, str) or not server_name:
+        return False
+    low = server_name.lower()
+    return any(m in low for m in MOCHLET_SERVER_MARKERS)
 
 
 def is_uuid(value: Any) -> bool:
@@ -153,19 +168,44 @@ class MochletMcpOrchestratorClient:
             # Indeterminate: the job may have been persisted before the error.
             recovered = self._find_existing_job(client, run_id)
             if recovered:
-                self._remember(key, recovered)
+                self._remember(key, recovered)  # discovered pre-existing job — best effort
                 return recovered
             raise OrchestratorUnavailable(f"Mochlet sendChat failed ({exc}).") from exc
         handle = self._parse_handle(result)
-        if handle is None:
-            # Empty reply is INDETERMINATE — the job may exist; discover it.
-            recovered = self._find_existing_job(client, run_id)
-            if recovered is None:
+        if handle is not None:
+            # We just created this job — if local persistence fails, COMPENSATE by
+            # cancelling it so a persist failure never leaves an orphaned production.
+            return self._persist_or_compensate(key, handle)
+        # Empty reply is INDETERMINATE — the job may exist; discover it (do NOT
+        # cancel a merely-discovered job on a persist failure).
+        recovered = self._find_existing_job(client, run_id)
+        if recovered is None:
+            raise OrchestratorUnavailable(
+                "Mochlet sendChat returned no job handle and no matching job was "
+                "found; refusing to open a run without a real external job.")
+        try:
+            self._remember(key, recovered)
+        except Exception:
+            pass  # the job exists regardless; idempotency cache is best-effort here
+        return recovered
+
+    def _persist_or_compensate(self, key: str, handle: OrchestratorHandle) -> OrchestratorHandle:
+        try:
+            self._remember(key, handle)
+        except Exception as exc:
+            # The real Mochlet job exists but we could not durably record it. Cancel
+            # it to avoid an orphan, then fail so Start can be retried cleanly.
+            try:
+                self.cancel_job(job_id=handle.job_id)
+            except Exception as cancel_exc:
                 raise OrchestratorUnavailable(
-                    "Mochlet sendChat returned no job handle and no matching job was "
-                    "found; refusing to open a run without a real external job.")
-            handle = recovered
-        self._remember(key, handle)
+                    f"Mochlet job {handle.job_id} was created but local persistence "
+                    "failed AND the orphaned job could not be cancelled — manual "
+                    "cleanup may be required.") from cancel_exc
+            self._forget(key)  # clear the pending marker so a retry starts fresh
+            raise OrchestratorUnavailable(
+                f"Mochlet job {handle.job_id} was created but local persistence failed; "
+                "the orphaned job was cancelled — retry Start.") from exc
         return handle
 
     def _find_existing_job(self, client: MochletMcpClient, run_id: str) -> Optional[OrchestratorHandle]:
@@ -179,6 +219,11 @@ class MochletMcpOrchestratorClient:
             return None
         for job in jobs:
             if not isinstance(job, dict):
+                continue
+            # Only a live (non-terminal) job dedupes a run — a cancelled/failed job
+            # (e.g. one we just compensated) must NOT be resurrected as the handle.
+            status = str(job.get("status") or "").lower()
+            if status in ("cancelled", "canceled", "failed", "error"):
                 continue
             if marker in _json.dumps(job):
                 jid = job.get("id") or (job.get("job") or {}).get("id")
@@ -304,6 +349,13 @@ class MochletMcpOrchestratorClient:
         if self._idem is not None:
             self._idem.put(key, {"pending": True, "run_id": run_id})
 
+    def _forget(self, key: str) -> None:
+        if self._idem is not None:
+            try:
+                self._idem.delete(key)
+            except Exception:
+                pass
+
 
 def _session_of(job: Any) -> Optional[str]:
     """Extract a session id from a job object in either flat or nested shape."""
@@ -344,6 +396,15 @@ class JobIdempotencyStore:
     def put(self, key: str, value: dict) -> None:
         data = self._read()
         data[key] = value
+        self._write(data)
+
+    def delete(self, key: str) -> None:
+        data = self._read()
+        if key in data:
+            del data[key]
+            self._write(data)
+
+    def _write(self, data: dict) -> None:
         self._path.parent.mkdir(parents=True, exist_ok=True)
         tmp = self._path.with_suffix(".tmp")
         tmp.write_text(_json.dumps(data), encoding="utf-8")

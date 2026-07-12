@@ -58,6 +58,20 @@ def test_verify_mcp_unreachable():
     assert v["reachable"] is False
 
 
+def test_verify_mcp_rejects_foreign_server():
+    v = C.verify_mcp(C.DEFAULT_MOCHLET_URL,
+                     transport=FakeMochletMcp(token=TOKEN, server_name="some-other-mcp").transport,
+                     token=TOKEN)
+    assert v["authenticated"] is True and v["is_mochlet"] is False
+
+
+def test_verify_mcp_requires_control_and_discovery_tools():
+    # sendChat+cancelJob present but runJob/continueSession/listProjects missing.
+    fake = FakeMochletMcp(token=TOKEN, tools=["health", "sendChat", "cancelJob"])
+    v = C.verify_mcp(C.DEFAULT_MOCHLET_URL, transport=fake.transport, token=TOKEN)
+    assert v["has_required_tools"] is False
+
+
 # --------------------------------------------------------------------------- #
 # Connection status
 # --------------------------------------------------------------------------- #
@@ -103,6 +117,35 @@ def test_status_tools_disabled(tmp_path):
     s = C.connection_status(env={}, base_dir=tmp_path, transport=fake.transport,
                             secret_getter=_MemSecrets({ORCHESTRATOR_TOKEN_ACCOUNT: TOKEN}).getter)
     assert s["status"] == "tools_disabled" and s["available"] is False
+
+
+def test_status_wrong_server_not_connected(tmp_path):
+    C._persist_config(endpoint=C.DEFAULT_MOCHLET_URL, kind="mcp", project_id=PID,
+                      project_path=None, base_dir=tmp_path)
+    fake = FakeMochletMcp(token=TOKEN, server_name="totally-different-mcp")
+    s = C.connection_status(env={}, base_dir=tmp_path, transport=fake.transport,
+                            secret_getter=_MemSecrets({ORCHESTRATOR_TOKEN_ACCOUNT: TOKEN}).getter)
+    assert s["status"] == "wrong_server" and s["available"] is False
+
+
+def test_status_fail_closed_when_projects_cannot_be_listed(tmp_path):
+    # A stale persisted project must NOT pass when listProjects fails (unverifiable).
+    C._persist_config(endpoint=C.DEFAULT_MOCHLET_URL, kind="mcp", project_id=PID,
+                      project_path=None, base_dir=tmp_path)
+    fake = FakeMochletMcp(token=TOKEN, projects_error=True)
+    s = C.connection_status(env={}, base_dir=tmp_path, transport=fake.transport,
+                            secret_getter=_MemSecrets({ORCHESTRATOR_TOKEN_ACCOUNT: TOKEN}).getter)
+    assert s["status"] == "needs_project" and s["available"] is False
+
+
+def test_connect_rejects_foreign_server(tmp_path):
+    secrets = _MemSecrets()
+    fake = FakeMochletMcp(token="t", server_name="evil-mcp")
+    s = C.connect(url=C.DEFAULT_MOCHLET_URL, token="t", project_id=PID, base_dir=tmp_path,
+                  transport=fake.transport, secret_setter=secrets.setter,
+                  secret_getter=secrets.getter, env={})
+    assert s["status"] == "wrong_server" and s["available"] is False
+    assert C.stored_config(tmp_path) == {}
 
 
 def test_status_degraded_when_health_reports_unhealthy(tmp_path):
