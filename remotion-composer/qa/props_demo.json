@@ -1,0 +1,19 @@
+{
+  "timeline": {
+    "version": "1.0",
+    "fps": 30,
+    "target_duration_seconds": 12,
+    "total_frames": 360,
+    "width": 1920,
+    "height": 1080,
+    "layers": [
+      { "id": "bg1", "type": "video", "track": 0, "start_frame": 0, "duration_frames": 360, "z": 0, "enabled": true, "opacity": 1, "text": "Establishing shot", "source": null },
+      { "id": "title1", "type": "text", "track": 1, "start_frame": 15, "duration_frames": 110, "z": 3, "enabled": true, "opacity": 1, "title": "LIVE REMOTION STUDIO", "subtitle": "preview equals render", "transitionIn": { "kind": "fade", "durationFrames": 12 }, "transitionOut": { "kind": "fade", "durationFrames": 12 } },
+      { "id": "shape1", "type": "shape", "track": 0, "start_frame": 120, "duration_frames": 120, "z": 1, "enabled": true, "opacity": 1, "text": "One canonical composition", "transform": { "scale": 1.0, "opacity": 1 }, "transitionIn": { "kind": "slide", "durationFrames": 14 } },
+      { "id": "cap1", "type": "caption", "track": 1, "start_frame": 240, "duration_frames": 110, "z": 3, "enabled": true, "opacity": 1, "text": "Same pixels in the player and the final render." },
+      { "id": "narr1", "type": "narration", "track": 2, "start_frame": 10, "duration_frames": 340, "z": 1, "enabled": true, "opacity": 1, "volume": 0.9, "source": null },
+      { "id": "music1", "type": "music", "track": 2, "start_frame": 0, "duration_frames": 360, "z": 0, "enabled": true, "opacity": 1, "volume": 0.4, "fade": { "inFrames": 20, "outFrames": 30 }, "source": null }
+    ]
+  },
+  "meta": { "title": "Live Remotion Studio", "pipeline": "animation", "targetFormatted": "0:12" }
+}

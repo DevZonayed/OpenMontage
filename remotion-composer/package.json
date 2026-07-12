@@ -5,7 +5,11 @@
   "scripts": {
     "start": "npx remotion studio",
     "build": "npx remotion render src/index.tsx Explainer out/video.mp4",
-    "upgrade": "npx remotion upgrade"
+    "upgrade": "npx remotion upgrade",
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "build:studio": "node scripts/build-studio.mjs"
   },
   "dependencies": {
     "@remotion/captions": "^4.0.484",
@@ -23,6 +27,10 @@
   },
   "devDependencies": {
     "@types/react": "^18.2.0",
-    "typescript": "^5.3.0"
+    "@types/react-dom": "^18.3.7",
+    "esbuild": "^0.24.2",
+    "jsdom": "^25.0.1",
+    "typescript": "^5.3.0",
+    "vitest": "^2.1.9"
   }
 }
