@@ -39,6 +39,7 @@ from lib.production_brain.mochlet import (
     REQUIRED_TOOLS,
     JobIdempotencyStore,
     MochletMcpOrchestratorClient,
+    extract_project_list,
     looks_like_mochlet,
 )
 from lib.production_brain.orchestrator import (
@@ -197,12 +198,13 @@ def verify_mcp(endpoint: str, *, transport: Optional[Callable[..., Any]] = None,
     if "listProjects" in tools:
         try:
             page = client.call_tool("listProjects", {})
-            projs = page.get("projects") if isinstance(page, dict) else None
-            if isinstance(projs, list):
+            # Accept the live Mochlet ``{"result": [...]}`` envelope AND the legacy
+            # ``{"projects": [...]}`` shape; ``None`` means no recognizable array
+            # (unverifiable → leave projects_listed False, fail-closed).
+            projs = extract_project_list(page)
+            if projs is not None:
                 out["projects_listed"] = True  # the discovery call actually succeeded
-                out["projects"] = [
-                    {"id": p.get("id"), "name": p.get("name"), "path": p.get("path")}
-                    for p in projs if isinstance(p, dict) and isinstance(p.get("id"), str)]
+                out["projects"] = projs
         except McpError:
             pass
     out["detail"] = "Connected." if out["has_required_tools"] else (
