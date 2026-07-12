@@ -8,12 +8,14 @@
 // documented HTTP contract through `BacklotClient`.
 
 import {
+  AUDIO_LAYER_TYPES,
   CanonicalComposition,
   CompositionAsset,
   createEmptyComposition,
   DEFAULT_FPS,
   DEFAULT_HEIGHT,
   DEFAULT_WIDTH,
+  Fade,
   framesForDuration,
   Layer,
   LayerType,
@@ -21,9 +23,13 @@ import {
   makeId,
   Track,
   trackKindForType,
+  Transform,
+  Transition,
 } from "./model";
 
 // ── Backend contract types (mirror lib/timeline.py + timeline_api.py) ──────────
+// `validate_timeline` (Worker A) validates known fields but preserves unknown keys
+// verbatim on save, so the richer edit fields below persist and reach the CLI render.
 export interface BackendLayer {
   id: string;
   type: string;
@@ -38,6 +44,12 @@ export interface BackendLayer {
   title?: string;
   subtitle?: string;
   source?: string | null;
+  volume?: number;
+  sourceOffsetFrames?: number;
+  transform?: Transform;
+  fade?: Fade;
+  transitionIn?: Transition;
+  transitionOut?: Transition;
   provenance?: Record<string, unknown>;
 }
 
@@ -76,20 +88,30 @@ export function backendToCanonical(
   doc: BackendTimelineDoc,
   opts: { id?: string; title?: string; pipeline?: string; targetFormatted?: string } = {},
 ): CanonicalComposition {
-  const fps = intOr(doc.fps, DEFAULT_FPS);
-  const secs = intOr(doc.target_duration_seconds, 60);
+  let fps = intOr(doc.fps, DEFAULT_FPS);
+  if (!(fps > 0)) fps = DEFAULT_FPS;
+  const secs = clampSecs(intOr(doc.target_duration_seconds, 60));
   const c = createEmptyComposition({
     id: opts.id ?? "project",
     title: opts.title,
     pipeline: opts.pipeline,
-    targetDurationSeconds: clampSecs(secs),
+    targetDurationSeconds: secs,
     fps,
     width: intOr(doc.width, DEFAULT_WIDTH),
     height: intOr(doc.height, DEFAULT_HEIGHT),
   });
   c.meta.targetFormatted = opts.targetFormatted;
-  // Trust the backend's total_frames if consistent; otherwise recompute.
-  c.totalFrames = intOr(doc.total_frames, framesForDuration(clampSecs(secs), fps));
+  // Trust the backend's total_frames ONLY when it matches the frame invariant
+  // (target_duration_seconds * fps); a stale/inconsistent value is recomputed so
+  // the Player and CLI never disagree on duration.
+  const expectedFrames = framesForDuration(secs, fps);
+  const backendFrames = doc.total_frames;
+  c.totalFrames =
+    typeof backendFrames === "number" &&
+    Number.isFinite(backendFrames) &&
+    backendFrames === expectedFrames
+      ? backendFrames
+      : expectedFrames;
 
   const assets: CompositionAsset[] = [];
   const layers: Layer[] = (doc.layers ?? []).map((bl, i) => {
@@ -113,7 +135,7 @@ export function backendToCanonical(
           : undefined,
       });
     }
-    return {
+    const layer: Layer = {
       id: bl.id,
       type,
       trackId: trackKindForType(type),
@@ -129,6 +151,14 @@ export function backendToCanonical(
       subtitle: bl.subtitle,
       source: bl.source ?? null,
     };
+    // Preserve richer edit fields across a reload so nothing is silently dropped.
+    if (typeof bl.volume === "number") layer.volume = bl.volume;
+    if (typeof bl.sourceOffsetFrames === "number") layer.sourceOffsetFrames = bl.sourceOffsetFrames;
+    if (bl.transform) layer.transform = bl.transform;
+    if (bl.fade) layer.fade = bl.fade;
+    if (bl.transitionIn) layer.transitionIn = bl.transitionIn;
+    if (bl.transitionOut) layer.transitionOut = bl.transitionOut;
+    return layer;
   });
   c.layers = layers;
   c.assets = assets;
@@ -148,6 +178,7 @@ const TRACK_INDEX: Record<string, number> = { visual: 0, text: 1, audio: 2 };
 
 export function canonicalToBackendDoc(c: CanonicalComposition): BackendTimelineDoc {
   const assetById = new Map(c.assets.map((a) => [a.id, a]));
+  const mutedTracks = new Set(c.tracks.filter((t) => t.muted).map((t) => t.id));
   return {
     version: "1.0",
     fps: c.fps,
@@ -157,21 +188,38 @@ export function canonicalToBackendDoc(c: CanonicalComposition): BackendTimelineD
     height: c.height,
     layers: c.layers.map((l) => {
       const src = l.assetId ? assetById.get(l.assetId)?.url ?? l.source ?? null : l.source ?? null;
+      const trackId = trackKindForType(l.type);
+      const muted = mutedTracks.has(trackId);
+      const isAudio = AUDIO_LAYER_TYPES.has(l.type);
       const bl: BackendLayer = {
         id: l.id,
         type: l.type,
-        track: TRACK_INDEX[trackKindForType(l.type)] ?? 0,
+        track: TRACK_INDEX[trackId] ?? 0,
         start_frame: l.startFrame,
         duration_frames: l.durationFrames,
         z: l.z,
         enabled: l.enabled,
         locked: l.locked,
+        // A muted track silences its audio layers in preview AND render.
         opacity: l.opacity,
         source: src,
       };
       if (l.text !== undefined) bl.text = l.text;
       if (l.title !== undefined) bl.title = l.title;
       if (l.subtitle !== undefined) bl.subtitle = l.subtitle;
+      // Serialize the richer edit fields so inspector edits actually affect the
+      // Player preview, the pinned-CLI render, and persistence.
+      if (isAudio) {
+        const baseVol = typeof l.volume === "number" ? l.volume : 1;
+        bl.volume = muted ? 0 : baseVol;
+      } else if (typeof l.volume === "number") {
+        bl.volume = l.volume;
+      }
+      if (l.sourceOffsetFrames !== undefined) bl.sourceOffsetFrames = l.sourceOffsetFrames;
+      if (l.transform) bl.transform = l.transform;
+      if (l.fade) bl.fade = l.fade;
+      if (l.transitionIn) bl.transitionIn = l.transitionIn;
+      if (l.transitionOut) bl.transitionOut = l.transitionOut;
       return bl;
     }),
   };

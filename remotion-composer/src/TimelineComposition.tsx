@@ -52,6 +52,7 @@ export type TimelineLayer = {
   title?: string;
   subtitle?: string;
   source?: string | null;
+  sourceOffsetFrames?: number;
   volume?: number;
   transform?: Transform;
   fade?: Fade;
@@ -93,12 +94,18 @@ const AUDIO = new Set(["narration", "music", "sfx"]);
 const isText = (t: string) => t === "text" || t === "caption";
 const accentOf = (t: string) => (TYPE[t] ? TYPE[t][1] : DIM);
 
-// A source is "loadable media" only when it is an absolute URL a browser (and the
-// headless render browser) can fetch. Project-local relative paths render as a
-// designed placeholder — see BACKEND_CONTRACT.md for the media-resolution gap.
-function isLoadableUrl(src?: string | null): src is string {
+// A source is "loadable media" when a browser can fetch it: an absolute URL
+// (http/https/protocol-relative/blob) OR a same-origin absolute path such as
+// `/media/...` or `/thumb/...` (which validation also treats as safe/render-ready).
+// Bare project-local RELATIVE paths still render as a designed placeholder — see
+// BACKEND_CONTRACT.md for the headless-CLI media-resolution gap.
+export function isLoadableUrl(src?: string | null): src is string {
   if (!src || typeof src !== "string") return false;
-  return /^(https?:)?\/\//.test(src) || src.startsWith("blob:");
+  const s = src.trim();
+  if (s === "" || s.includes("\\")) return false;
+  if (/^(https?:)?\/\//.test(s) || s.startsWith("blob:")) return true;
+  // Same-origin absolute path (but not a scheme like `javascript:` or `//`).
+  return s.startsWith("/") && !s.startsWith("//") && !s.split("/").includes("..");
 }
 
 // ── Animated cinematic backdrop ───────────────────────────────────────────────
@@ -214,7 +221,11 @@ const MediaScene: React.FC<{ layer: TimelineLayer }> = ({ layer }) => {
       <AbsoluteFill style={{ ...transformStyle(layer.transform), ...tstyle, opacity: undefined }}>
         <AbsoluteFill style={{ transform: `scale(${zoom})` }}>
           {layer.type === "video" ? (
-            <OffthreadVideo src={src} style={{ width: "100%", height: "100%", objectFit: "cover" }} />
+            <OffthreadVideo
+              src={src}
+              trimBefore={layer.sourceOffsetFrames ? Math.max(0, Math.round(layer.sourceOffsetFrames)) : undefined}
+              style={{ width: "100%", height: "100%", objectFit: "cover" }}
+            />
           ) : (
             <Img src={src} style={{ width: "100%", height: "100%", objectFit: "cover" }} />
           )}
@@ -419,7 +430,13 @@ const AudioScene: React.FC<{ layer: TimelineLayer }> = ({ layer }) => {
   const bottomPad = layer.type === "narration" ? 34 : layer.type === "music" ? 104 : 174;
   return (
     <AbsoluteFill style={{ justifyContent: "flex-end", alignItems: "center", padding: `0 0 ${bottomPad}px` }}>
-      {isLoadableUrl(layer.source) ? <Audio src={layer.source} volume={volAt} /> : null}
+      {isLoadableUrl(layer.source) ? (
+        <Audio
+          src={layer.source}
+          volume={volAt}
+          trimBefore={layer.sourceOffsetFrames ? Math.max(0, Math.round(layer.sourceOffsetFrames)) : undefined}
+        />
+      ) : null}
       <div style={{ display: "flex", gap: 5, alignItems: "flex-end", height: 46, opacity: 0.85 }}>
         {Array.from({ length: bars }).map((_, i) => {
           const h = 8 + (Math.sin(i * 0.6 + frame * 0.22) * 0.5 + 0.5) * 38 * (0.4 + 0.6 * vol);
