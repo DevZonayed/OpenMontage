@@ -286,6 +286,13 @@ def create_app() -> FastAPI:
     @app.on_event("startup")
     async def _startup() -> None:
         app.state.watch_task = asyncio.create_task(_watch_projects())
+        # Trusted loopback base for CLI render media resolution (active bound port
+        # via BACKLOT_PORT / default). NEVER derived from a request Host header.
+        try:
+            from lib.render_meta import resolve_render_base_url
+            app.state.render_base_url = resolve_render_base_url()
+        except Exception:
+            app.state.render_base_url = None
 
     @app.on_event("shutdown")
     async def _shutdown() -> None:
@@ -427,8 +434,9 @@ def create_app() -> FastAPI:
             frame = int(frame)
         except (TypeError, ValueError):
             raise HTTPException(status_code=400, detail="frame must be an integer")
+        base = getattr(request.app.state, "render_base_url", None)
         try:
-            res = await asyncio.to_thread(render_still, project_dir, frame)
+            res = await asyncio.to_thread(render_still, project_dir, frame, base_url=base)
         except FrameRenderError as exc:
             raise HTTPException(status_code=400, detail=str(exc))
         if not res.get("ok"):
@@ -443,7 +451,8 @@ def create_app() -> FastAPI:
         project_dir = _safe_project_dir(project_id)
         await _guarded_json_body(request)   # CSRF + origin + size guard
         _enforce_rate(request, "render")
-        res = await asyncio.to_thread(render_timeline_preview, project_dir)
+        base = getattr(request.app.state, "render_base_url", None)
+        res = await asyncio.to_thread(render_timeline_preview, project_dir, base_url=base)
         if not res.get("ok"):
             raise HTTPException(status_code=400, detail=res.get("reason") or "Timeline render failed.")
         return res

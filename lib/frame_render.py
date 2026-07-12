@@ -34,6 +34,8 @@ def render_still(project_dir: Path, frame: int, *,
                  runner: Optional[Callable] = None,
                  browser: Optional[str] = None,
                  timeout: int = 120,
+                 base_url: Optional[str] = None,
+                 port: Optional[int] = None,
                  doctor: Optional[Callable] = None) -> dict:
     """Render a single real frame of the timeline. Returns a sanitized result dict.
 
@@ -68,8 +70,10 @@ def render_still(project_dir: Path, frame: int, *,
     tmp_out = out.parent / f"frame_{frame}.{secrets.token_hex(4)}.tmp.png"
 
     try:
-        from lib.timeline_render import build_meta
-        meta = build_meta(d)
+        from lib import render_meta as _render_meta
+        # projectId + trusted loopback assetBaseUrl → the still resolves project-local
+        # media to the same /media URL the Player uses (operational parity).
+        meta = _render_meta.build_render_meta(d, base_url=base_url, port=port)
     except Exception:
         meta = {}
     with tempfile.TemporaryDirectory() as td:

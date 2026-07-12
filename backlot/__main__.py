@@ -82,6 +82,10 @@ def cmd_open(project_id: str | None) -> int:
 def cmd_serve(port: int) -> int:
     import uvicorn
 
+    # Publish the ACTUAL bound port to the process env so render endpoints can build
+    # a trusted loopback assetBaseUrl (http://127.0.0.1:<port>) for CLI media parity.
+    # This is operator-set (the --port we bind), never a request header.
+    os.environ["BACKLOT_PORT"] = str(port)
     uvicorn.run("backlot.server:app", host="127.0.0.1", port=port, log_level="warning")
     return 0
 

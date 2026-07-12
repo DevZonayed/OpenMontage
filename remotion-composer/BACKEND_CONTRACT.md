@@ -73,17 +73,41 @@ confidence, provenance{source,verified,run_id,stage,decision_ref,note,…}, crea
 Categories: visual_language, pacing, typography, transitions, narration, music,
 scene_density, editing_patterns.
 
-## Media resolution parity (Player == pinned CLI)
+## Media resolution parity (Player == pinned CLI) — OPERATIONAL
 
-The Remotion Player and the pinned CLI render must resolve the SAME project-local
-`source` to the SAME loadable URL. `src/composition/media.ts::resolveAssetSrc(source, base)`
-turns a project-local relative path into `{base}/media/{projectId}/{path}` for BOTH:
-- the Player is fed `assetBaseUrl` = the page origin;
-- for the CLI, Worker A's render invocation can pass the same `assetBaseUrl` (the
-  Backlot server is up during a render, so the headless browser can fetch
-  `http://127.0.0.1:<port>/media/...`). `renderProps(c, {assetBaseUrl})` resolves sources
-  identically, and `adapter.test.ts` proves the same transform is used for preview and
-  render doc. Path safety is preserved — absolute URLs pass through, traversal is rejected.
+The Remotion Player and the pinned CLI render resolve the SAME project-local
+`source` to the SAME loadable URL: `src/composition/media.ts::resolveAssetSrc(source,
+{projectId, assetBaseUrl})` → `{assetBaseUrl}/media/{projectId}/{path}`. This is wired
+on BOTH sides, not "can pass":
+
+- **Player** — `StudioApp` calls `renderProps(model, {assetBaseUrl: window.location.origin,
+  projectId})`; the composition reads `meta.assetBaseUrl`/`meta.projectId` via a media
+  context and resolves each `source`.
+- **CLI render** — `lib/render_meta.py::build_render_meta(project_dir, base_url=...)`
+  adds `projectId` + a **trusted** `assetBaseUrl` to `meta` for EVERY `TimelineFrame`
+  render call site: `lib/timeline_render.py::render_timeline_preview` and
+  `lib/frame_render.py::render_still` both call it. The Backlot render endpoints
+  (`POST /api/project/{id}/frame`, `POST /api/project/{id}/timeline/render`) pass
+  `base_url=request.app.state.render_base_url` into those functions.
+
+**Security model for the base:**
+- `app.state.render_base_url` is set at server startup by `resolve_render_base_url()`,
+  which reads the **active bound port** from `BACKLOT_PORT` (set by `backlot serve
+  --port`) or the documented default → `http://127.0.0.1:<port>`. It is NEVER derived
+  from a request `Host` / `X-Forwarded-*` header.
+- `resolve_render_base_url` accepts only **loopback HTTP** (127.0.0.1 / ::1 / localhost)
+  or an explicitly-configured **`BACKLOT_RENDER_BASE_URL` HTTPS** base (operator trust).
+  Non-loopback http, other schemes, and any path/query/fragment are rejected.
+- The port/base is explicitly injectable (`base_url`/`port` params) for tests and runtime.
+- Per-layer path safety is unchanged: `lib.timeline` only persists project-local
+  `source`s, and `resolveAssetSrc` rejects `..` traversal and non-loopback schemes.
+
+Proven by: `tests/backlot/test_render_media_parity.py` (captures the real props file
+handed to `_rr.render_argv`/`_rr.still_argv` and asserts `meta.{projectId,assetBaseUrl}`;
+a direct route test proves the active port is wired), `adapter.test.ts` +
+`media.test.ts` (identical transform for Player + render doc), and a real still render
+of a project-local red image served via `/media` whose top-region pixels are (254,0,0)
+— the real media, not the placeholder.
 
 ## Regenerating the studio bundle
 
