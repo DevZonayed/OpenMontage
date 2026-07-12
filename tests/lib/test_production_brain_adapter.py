@@ -1,8 +1,10 @@
 """Hermes brain adapter contract + deterministic fake brain.
 
-  * The real HermesBrainAdapter FAILS CLOSED when no subscription engine is
-    signed in — it never fabricates an LLM and never opens a run.
-  * Identity is stable + non-secret and is stamped onto telemetry.
+  * The real HermesBrainAdapter FAILS CLOSED when no orchestrator can create a
+    durable job — it never fabricates session/job ids and never opens a run.
+  * When an orchestrator returns canonical ids, they are recorded VERBATIM
+    (never minted) and stamped onto telemetry; cancellation correlates with the
+    external handle.
   * The FakeBrain drives the entire 11-stage machine offline (no paid services),
     producing visible, ordered stage/task changes with an approval gate.
 """
@@ -15,6 +17,11 @@ from lib.production_brain.adapter import (
     BrainUnavailable,
     FakeBrain,
     HermesBrainAdapter,
+)
+from lib.production_brain.orchestrator import (
+    FakeOrchestratorClient,
+    OrchestratorHandle,
+    OrchestratorUnavailable,
 )
 from lib.production_brain.store import ProductionBrainStore
 
@@ -35,60 +42,111 @@ def _store(tmp_path, rid="run_1"):
     return ProductionBrainStore(d, now=_clock(), gen_id=lambda: rid)
 
 
+class _UnavailableClient:
+    kind = "live"
+    engine = "hermes"
+
+    def available(self):
+        return False
+
+    def create_job(self, **kw):
+        raise OrchestratorUnavailable("no orchestrator configured")
+
+    def cancel_job(self, **kw):
+        pass
+
+
+class _NoIdClient(_UnavailableClient):
+    """Available, but returns an invalid (empty-id) handle → must fail closed."""
+
+    def available(self):
+        return True
+
+    def create_job(self, **kw):
+        return OrchestratorHandle(session_id="", job_id="")
+
+
 class TestHermesFailClosed:
-    def test_unavailable_brain_refuses_to_start(self, tmp_path):
+    def test_unavailable_orchestrator_refuses_to_start(self, tmp_path):
         s = _store(tmp_path)
-        h = HermesBrainAdapter(probe=lambda: {"available": False, "engine": None, "detail": "not signed in"})
+        h = HermesBrainAdapter(client=_UnavailableClient())
         assert h.available() is False
         with pytest.raises(BrainUnavailable):
             h.start(s, requested_duration_seconds=60)
-        # No run was opened — the state is still not_started.
+        # No run was opened — the state is still not_started, log empty.
         assert s.read_state()["state"] == "not_started"
         assert s.read_events_raw() == []
 
-    def test_probe_exception_is_treated_as_unavailable(self, tmp_path):
-        def boom():
-            raise RuntimeError("cli missing")
+    def test_client_returning_no_canonical_id_fails_closed(self, tmp_path):
+        s = _store(tmp_path)
+        h = HermesBrainAdapter(client=_NoIdClient())
+        assert h.available() is True  # endpoint reachable...
+        with pytest.raises(BrainUnavailable):  # ...but it returned no real ids
+            h.start(s, requested_duration_seconds=60)
+        assert s.read_events_raw() == []
 
-        h = HermesBrainAdapter(probe=boom)
+    def test_client_exception_is_treated_as_unavailable(self, tmp_path):
+        class _Boom:
+            kind = "live"
+            engine = "hermes"
+
+            def available(self):
+                raise RuntimeError("network down")
+
+            def create_job(self, **kw):
+                raise RuntimeError("network down")
+
+            def cancel_job(self, **kw):
+                pass
+
+        h = HermesBrainAdapter(client=_Boom())
         assert h.available() is False
 
-    def test_available_brain_stamps_identity(self, tmp_path):
+    def test_real_ids_are_recorded_verbatim(self, tmp_path):
         s = _store(tmp_path)
-        h = HermesBrainAdapter(
-            probe=lambda: {"available": True, "engine": "claude", "detail": "ok"},
-            session_id="sess-abc")
+        client = FakeOrchestratorClient(engine="hermes-fake")
+        h = HermesBrainAdapter(client=client)
         st = h.start(s, requested_duration_seconds=90)
         assert st["state"] == "running"
-        assert st["brain"]["engine"] == "claude"
-        assert st["brain"]["agent_id"] == "hermes:claude"
-        assert st["brain"]["session_id"] == "sess-abc"
-        # A real session + job identity is attached, and orchestration is honestly
-        # labelled agent-driven (not a background orchestrator claim).
-        assert st["brain"]["orchestration"] == "agent_driven"
-        assert st["brain"]["job_id"]
-        # The run_started event carries the same session + job identity.
+        # session/job ids are the ones the orchestrator returned, not minted here.
+        handle = client.created[f"{s.project_dir.name}:{st['run_id']}"]
+        assert st["brain"]["session_id"] == handle.session_id
+        assert st["brain"]["job_id"] == handle.job_id
+        # A fake client is visibly fake_driver — never a live external job.
+        assert st["brain"]["orchestration"] == "fake_driver"
+        # The run_started event carries the same external identity.
         started = [e for e in s.read_events_raw() if e["type"] == "run_started"][0]
-        assert started["session_id"] == "sess-abc" and started["job_id"] == st["brain"]["job_id"]
+        assert started["session_id"] == handle.session_id
+        assert started["job_id"] == handle.job_id
 
-    def test_session_is_attached_even_without_caller_id(self, tmp_path):
+    def test_idempotent_start_does_not_provision_second_job(self, tmp_path):
+        s = ProductionBrainStore(tmp_path / "p", now=_clock(), gen_id=lambda: "run_1")
+        (tmp_path / "p").mkdir(exist_ok=True)
+        client = FakeOrchestratorClient()
+        h = HermesBrainAdapter(client=client)
+        first = h.start(s, requested_duration_seconds=60)
+        second = h.start(s, requested_duration_seconds=60)
+        assert second.get("already_active") is True
+        assert first["run_id"] == second["run_id"]
+        assert len(client.created) == 1  # only ONE external job was created
+
+    def test_cancel_correlates_with_external_handle(self, tmp_path):
         s = _store(tmp_path)
-        h = HermesBrainAdapter(probe=lambda: {"available": True, "engine": "claude"})
+        client = FakeOrchestratorClient()
+        h = HermesBrainAdapter(client=client)
         st = h.start(s, requested_duration_seconds=60)
-        # A genuine (non-None) session id is minted + attached to the run.
-        assert st["brain"]["session_id"]
-        assert st["brain"]["session_id"].startswith("hermes-session_")
+        job = st["brain"]["job_id"]
+        assert h.cancel_external(job_id=job) is True
+        assert client.cancelled == [job]
 
     def test_start_message_does_not_claim_online_orchestrator(self, tmp_path):
         s = _store(tmp_path)
-        h = HermesBrainAdapter(probe=lambda: {"available": True, "engine": "claude"})
+        h = HermesBrainAdapter(client=FakeOrchestratorClient())
         st = h.start(s, requested_duration_seconds=60)
-        act = (st.get("activity") or "").lower()
-        assert "online" not in act
-        assert "agent-driven" in act
+        assert "online" not in (st.get("activity") or "").lower()
 
     def test_identity_carries_no_secret(self, tmp_path):
-        h = HermesBrainAdapter(probe=lambda: {"available": True, "engine": "claude"})
+        h = HermesBrainAdapter(client=FakeOrchestratorClient())
         block = h.identity().to_brain_block()
         assert set(block) == {"name", "adapter", "available", "agent_id",
                               "session_id", "engine", "orchestration"}

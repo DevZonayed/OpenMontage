@@ -1,25 +1,28 @@
 """Hermes brain adapter — the secure, explicit orchestrator contract.
 
-The *brain* is the intelligence that drives a production run through its stages.
-OpenMontage has NO internal LLM-calling layer by design (Rule Zero: production is
-agent-driven), so this adapter does exactly two honest things:
+A production run may only be opened once a REAL, durable orchestrator job/session
+has been created through an injected orchestration port and has returned canonical
+``session_id`` + ``job_id`` (see ``lib.production_brain.orchestrator``). The
+adapter never fabricates those IDs. If no orchestrator is safely available, Start
+Production **fails closed** with an actionable blocker rather than opening a run.
 
-  1. Establishes **stable, non-secret identity** (name / adapter / agent_id /
-     session_id / backing engine) that gets stamped onto every telemetry event,
-     so an observer always knows *which* brain/session/job did each task.
-  2. **Fails closed** when Hermes is unavailable — it never fabricates an LLM,
-     never silently degrades to a stub, and (optionally) records an honest
-     ``brain_unavailable`` blocker instead of pretending to make progress.
+What the adapter does:
+
+  1. Provisions a durable job through the injected
+     :class:`~lib.production_brain.orchestrator.HermesOrchestratorClient` and
+     records the **returned** canonical session/job identity (never minted).
+  2. Fails closed when the orchestrator is unavailable or returns no valid IDs —
+     it never runs an LLM, never fabricates progress, never calls a paid service.
+  3. Stamps that non-secret identity onto every telemetry event and correlates
+     cancellation with the external handle truthfully.
 
 Two adapters ship:
 
-  * :class:`HermesBrainAdapter` — the real one. Availability is probed from the
-    subscription-engine layer (``lib.engines``): the Hermes brain is "available"
-    only when a consumer-plan engine is actually logged in and ready. No probe,
-    no run.
-  * :class:`FakeBrain` — deterministic, offline, dependency-free. It NEVER calls
-    a paid service. Used by tests and the smoke harness to drive the whole state
-    machine and prove visible stage/task changes.
+  * :class:`HermesBrainAdapter` — the real one, backed by the orchestration port.
+    Unconfigured on this machine → unavailable → fail-closed.
+  * :class:`FakeBrain` — deterministic, offline, dependency-free, TEST-ONLY. It
+    NEVER calls a paid service and is visibly labelled ``fake_driver``; it drives
+    the whole state machine to prove visible stage/task changes.
 """
 
 from __future__ import annotations
@@ -28,17 +31,16 @@ from dataclasses import asdict, dataclass, field
 from typing import Any, Callable, Optional
 
 from lib.production_brain import schema as S
+from lib.production_brain.orchestrator import (
+    HermesOrchestratorClient,
+    OrchestratorUnavailable,
+    default_orchestrator_client,
+)
 from lib.production_brain.store import ProductionBrainStore
 
 
 class BrainUnavailable(RuntimeError):
     """Raised when the brain cannot orchestrate — the run must NOT proceed."""
-
-
-def _mint_id(prefix: str) -> str:
-    import secrets
-
-    return f"{prefix}_" + secrets.token_hex(4)
 
 
 @dataclass
@@ -51,13 +53,12 @@ class BrainIdentity:
     engine: Optional[str] = None
     detail: Optional[str] = None
     # How this run is actually driven. Truthful, non-secret:
-    #   "agent_driven" — OpenMontage has no internal LLM; the Hermes AGENT (this
-    #                    session) advances stages as it works — NOT a background
-    #                    autonomous process. ``available`` is only the precondition
-    #                    (a subscription engine is signed in), never a claim that
-    #                    an orchestrator is running unattended.
-    #   "fake_driver"  — the deterministic offline brain genuinely drives the run.
-    orchestration: str = "agent_driven"
+    #   "external_job" — a REAL durable orchestrator job was created and its
+    #                    canonical session_id/job_id were returned by the external
+    #                    service (never fabricated here).
+    #   "fake_driver"  — the deterministic offline test driver (or a fake
+    #                    orchestrator client). Visibly a fake — never a live job.
+    orchestration: str = "external_job"
 
     def to_brain_block(self) -> dict:
         # Only non-secret identity fields ever leave this method.
@@ -73,10 +74,14 @@ class BrainIdentity:
 
 
 class BrainAdapter:
-    """Base contract. Subclasses decide availability + identity."""
+    """Base contract. Subclasses decide availability + identity + provisioning."""
 
     name = "brain"
     adapter_id = "base"
+    # True when a run is backed by an external orchestrator client (live OR the
+    # test fake), so cancellation can correlate with the external handle. False
+    # for the pure offline driver, which has no external service to cancel.
+    _external = False
 
     def available(self) -> bool:  # pragma: no cover - abstract
         raise NotImplementedError
@@ -89,6 +94,14 @@ class BrainAdapter:
         return {"available": self.available(), "identity": ident.to_brain_block(),
                 "detail": ident.detail}
 
+    # Subclasses return (session_id, job_id, orchestration_label) from a REAL
+    # source, or raise BrainUnavailable. The base implementation is for offline
+    # test drivers only.
+    def _provision(self, *, project_id: str, run_id: str,
+                   requested_duration_seconds: Optional[int]) -> tuple[Optional[str], Optional[str], str]:
+        ident = self.identity()
+        return ident.session_id, None, ident.orchestration
+
     def start(
         self,
         store: ProductionBrainStore,
@@ -96,80 +109,71 @@ class BrainAdapter:
         run_id: Optional[str] = None,
         requested_duration_seconds: Optional[int] = None,
         message: Optional[str] = None,
-        job_id: Optional[str] = None,
     ) -> dict:
-        """Open a run on ``store`` under this brain's identity — or fail closed.
+        """Open a run on ``store`` — or fail closed.
 
-        Fail-closed: if the brain is unavailable this raises
-        :class:`BrainUnavailable` and does NOT open a run.
-
-        Honesty: opening a run attaches a real, non-secret session + job identity,
-        but it does NOT itself run an LLM or drive stages. The default message and
-        the ``orchestration`` field make explicit that stages advance only as the
-        (agent-driven) brain does the work — the API never implies a background
-        orchestrator is running unattended.
+        A run is opened ONLY after a real orchestrator job/session has been
+        provisioned (``_provision``) and returned canonical ids. The returned ids
+        are recorded verbatim; nothing here fabricates identity. Idempotent: an
+        already-active run keeps its existing external job (no second job is
+        provisioned).
         """
         if not self.available():
             raise BrainUnavailable(
                 f"{self.name} brain is unavailable; a production run cannot be "
-                "orchestrated. Sign in to the brain engine and retry."
+                "orchestrated. Configure/sign in to the orchestrator and retry."
             )
+        # Idempotency: if a run is already active, return it — do NOT provision a
+        # second external job. (The store's single-lock start is the ultimate
+        # guard; this avoids a redundant provisioning call in the common case.)
+        existing = store.read_state()
+        if existing.get("state") in S.ACTIVE_RUN_STATES:
+            out = dict(existing)
+            out["already_active"] = True
+            return out
+        run_id = run_id or store._gen_id()
+        session_id, job_id, orchestration = self._provision(
+            project_id=store.project_dir.name, run_id=run_id,
+            requested_duration_seconds=requested_duration_seconds)
         ident = self.identity()
-        job = job_id or _mint_id("job")
-        brain_block = {**ident.to_brain_block(), "job_id": job}
-        default_msg = self._start_message(ident, job)
+        brain_block = {
+            **ident.to_brain_block(),
+            "session_id": session_id,
+            "job_id": job_id,
+            "orchestration": orchestration,
+            "external": bool(self._external),
+        }
         return store.start(
             run_id=run_id,
             brain=brain_block,
             requested_duration_seconds=requested_duration_seconds,
             agent_id=ident.agent_id,
-            session_id=ident.session_id,
-            job_id=job,
-            message=message or default_msg,
+            session_id=session_id,
+            job_id=job_id,
+            message=message or self._start_message(ident, job_id, orchestration),
         )
 
-    def _start_message(self, ident: "BrainIdentity", job: str) -> str:
-        if ident.orchestration == "agent_driven":
+    def _start_message(self, ident: "BrainIdentity", job: Optional[str], orchestration: str) -> str:
+        if orchestration == "external_job":
             eng = f" (engine {ident.engine})" if ident.engine else ""
             return (
-                f"Production run opened under the {ident.name} brain{eng}. "
-                "Orchestration is agent-driven (Rule Zero): stages advance as the "
-                "agent works — no autonomous background orchestrator is running."
+                f"Production run opened under the {ident.name} brain{eng} — "
+                f"attached to durable orchestrator job {job}. Stages advance as "
+                "that job executes them."
             )
-        return f"{ident.name} brain (offline driver) starting production."
+        return f"{ident.name} brain (fake driver, test-only) starting production."
 
 
 # --------------------------------------------------------------------------- #
-# Real Hermes adapter — availability probed from the subscription-engine layer.
+# Real Hermes adapter — backed by the injected orchestration port.
 # --------------------------------------------------------------------------- #
-def _default_probe() -> dict:
-    """Non-secret availability probe. Returns {available, engine, detail}."""
-    try:
-        from lib import engines as _eng
-
-        summary = _eng.engines_summary(probe_auth=True)
-    except Exception as exc:  # engines layer or CLI missing → unavailable
-        return {"available": False, "engine": None, "detail": f"engine probe failed: {exc.__class__.__name__}"}
-    ready = list(summary.get("subscription_ready") or [])
-    # Hermes prefers the Claude engine but any ready subscription engine can back it.
-    # NOTE: this is only the PRECONDITION for the brain (an engine is signed in) —
-    # it is not, and must not be reported as, proof that an orchestrator is running.
-    engine = "claude" if "claude" in ready else (ready[0] if ready else None)
-    return {
-        "available": bool(ready),
-        "engine": engine,
-        "detail": (f"'{engine}' subscription engine signed in — Hermes brain "
-                   "precondition met; orchestration is agent-driven"
-                   if engine else "no subscription-ready brain engine is signed in"),
-    }
-
-
 class HermesBrainAdapter(BrainAdapter):
-    """The real brain. Available only when a subscription engine is signed in.
+    """The real brain. Availability + identity come from the orchestration port.
 
-    ``probe`` is injectable (no wall-clock / no secrets) so availability can be
-    driven deterministically in tests. ``session_id`` is derived from a caller-
-    supplied stable token (never random) so identity is reproducible per run.
+    A run opens ONLY when the injected ``client`` reports it is available AND
+    ``create_job`` returns canonical session/job ids. Unconfigured on this machine
+    → unavailable → fail closed. The ``client`` is injectable so tests use the
+    deterministic fake client (never a paid service).
     """
 
     name = "hermes"
@@ -178,52 +182,73 @@ class HermesBrainAdapter(BrainAdapter):
     def __init__(
         self,
         *,
-        probe: Callable[[], dict] = _default_probe,
-        session_id: Optional[str] = None,
+        client: Optional[HermesOrchestratorClient] = None,
         agent_id: Optional[str] = None,
     ) -> None:
-        self._probe = probe
-        self._session_id = session_id  # caller-supplied stable id, if any
+        self._client = client if client is not None else default_orchestrator_client()
         self._agent_id = agent_id
-        self._cache: Optional[dict] = None
-        self._minted_session: Optional[str] = None
-
-    def _probed(self) -> dict:
-        if self._cache is None:
-            try:
-                self._cache = dict(self._probe() or {})
-            except Exception:
-                self._cache = {"available": False, "engine": None, "detail": "probe error"}
-        return self._cache
+        self._handle = None  # OrchestratorHandle, once a job is provisioned
 
     def available(self) -> bool:
-        return bool(self._probed().get("available"))
+        try:
+            return bool(self._client) and bool(self._client.available())
+        except Exception:
+            return False
 
-    def _session(self) -> Optional[str]:
-        # A caller-supplied session wins (reproducible). Otherwise, once the brain
-        # is available, attach a real (non-secret) session id and cache it so the
-        # run carries a genuine orchestrator session identity rather than None.
-        if self._session_id:
-            return self._session_id
-        if not self.available():
-            return None
-        if self._minted_session is None:
-            self._minted_session = _mint_id("hermes-session")
-        return self._minted_session
+    @property
+    def client(self) -> HermesOrchestratorClient:
+        return self._client
 
     def identity(self) -> BrainIdentity:
-        p = self._probed()
-        engine = p.get("engine")
+        h = self._handle
+        kind = getattr(self._client, "kind", "live")
+        engine = (h.engine if h else getattr(self._client, "engine", None)) or ("hermes" if kind == "live" else "fake")
+        orchestration = "external_job" if kind == "live" else "fake_driver"
+        detail = (h.detail if h else None) or (
+            "orchestrator endpoint configured" if self.available()
+            else "no Hermes orchestrator is configured/available")
         return BrainIdentity(
             name="hermes",
             adapter="hermes",
-            available=bool(p.get("available")),
-            agent_id=self._agent_id or (f"hermes:{engine}" if engine else None),
-            session_id=self._session(),
+            available=self.available(),
+            agent_id=self._agent_id or (h.job_id if h else None),
+            session_id=(h.session_id if h else None),
             engine=engine,
-            detail=p.get("detail"),
-            orchestration="agent_driven",
+            detail=detail,
+            orchestration=orchestration,
         )
+
+    def _provision(self, *, project_id, run_id, requested_duration_seconds):
+        try:
+            handle = self._client.create_job(
+                project_id=project_id, run_id=run_id,
+                requested_duration_seconds=requested_duration_seconds,
+                idempotency_key=f"{project_id}:{run_id}")
+        except OrchestratorUnavailable as exc:
+            raise BrainUnavailable(str(exc)) from exc
+        except Exception as exc:  # any client fault → fail closed, no fabricated run
+            raise BrainUnavailable(
+                f"Hermes orchestrator could not create a job ({exc.__class__.__name__})."
+            ) from exc
+        if not handle or not getattr(handle, "session_id", None) or not getattr(handle, "job_id", None):
+            raise BrainUnavailable(
+                "Hermes orchestrator returned no canonical session/job id; refusing "
+                "to open a run without a real external job.")
+        self._handle = handle
+        self._external = True  # an orchestrator client provisioned the job
+        kind = getattr(self._client, "kind", "live")
+        return handle.session_id, handle.job_id, ("external_job" if kind == "live" else "fake_driver")
+
+    def cancel_external(self, *, job_id: Optional[str]) -> bool:
+        """Best-effort: cancel the external job to keep the handle truthful.
+        Returns True if the orchestrator acknowledged the cancel."""
+        if not job_id:
+            return False
+        try:
+            self._client.cancel_job(job_id=job_id)
+            return True
+        except Exception:
+            return False
 
 
 # --------------------------------------------------------------------------- #
@@ -266,6 +291,11 @@ class FakeBrain(BrainAdapter):
             orchestration="fake_driver",
             detail="deterministic offline brain (no paid services)",
         )
+
+    def _provision(self, *, project_id, run_id, requested_duration_seconds):
+        # Deterministic, visibly-fake ids — the offline driver genuinely drives
+        # the run itself, so no external orchestrator is contacted.
+        return self._session_id, f"fake-job-{run_id}", "fake_driver"
 
     def _plan(self, requested_duration_seconds: int) -> list[_FakeStep]:
         return [

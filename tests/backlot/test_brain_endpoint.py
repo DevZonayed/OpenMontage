@@ -163,29 +163,33 @@ class TestControlFlow:
 
 
 class TestStartFailClosed:
-    def test_start_fails_closed_when_brain_unavailable(self, client, monkeypatch):
-        # The default adapter probes engines; force it unavailable.
+    def test_start_fails_closed_when_orchestrator_unavailable(self, client, monkeypatch):
+        # Production default client is unconfigured on this machine → fail closed.
         import backlot.brain_api as brain_api
         from lib.production_brain.adapter import HermesBrainAdapter
+        from lib.production_brain.orchestrator import ConfiguredHermesOrchestratorClient
 
         monkeypatch.setattr(
             brain_api, "default_adapter",
-            lambda: HermesBrainAdapter(probe=lambda: {"available": False, "engine": None}))
+            lambda: HermesBrainAdapter(client=ConfiguredHermesOrchestratorClient(url=None)))
         r = _post(client, "/api/project/demo/brain/start", {})
         assert r.status_code == 409
-        # No run opened.
         assert client.get("/api/project/demo/brain").json()["state"] == "not_started"
 
-    def test_start_opens_run_when_available(self, client, monkeypatch):
+    def test_start_opens_run_with_external_ids(self, client, monkeypatch):
         import backlot.brain_api as brain_api
         from lib.production_brain.adapter import HermesBrainAdapter
+        from lib.production_brain.orchestrator import FakeOrchestratorClient
 
         monkeypatch.setattr(
             brain_api, "default_adapter",
-            lambda: HermesBrainAdapter(probe=lambda: {"available": True, "engine": "claude"}))
+            lambda: HermesBrainAdapter(client=FakeOrchestratorClient()))
         r = _post(client, "/api/project/demo/brain/start", {})
         assert r.status_code == 200 and r.json()["state"] == "running"
         assert r.json()["requested_duration_seconds"] == 120
+        # The run carries the orchestrator-returned ids (visibly a fake driver).
+        assert r.json()["brain"]["session_id"] and r.json()["brain"]["job_id"]
+        assert r.json()["brain"]["orchestration"] == "fake_driver"
 
 
 class TestRateLimit:
@@ -204,47 +208,139 @@ class TestRateLimit:
         assert "retry-after" in {k.lower() for k in last.headers}
 
 
-class TestPreferencesApi:
-    def test_learn_and_read_project_scope(self, client):
+def _approval_ref(store, run_id="run_demo", stage="proposal"):
+    """The approval_id of the granted approval for run/stage in the event log."""
+    for e in store.read_events_raw():
+        if (e.get("type") == "approval_granted" and e.get("run_id") == run_id
+                and e.get("stage") == stage):
+            return (e.get("data") or {}).get("approval_id")
+    return None
+
+
+class TestVerifiedLearningApi:
+    def test_learn_requires_verified_event_log_evidence(self, client):
+        store = _seed(client, approver="auto")  # grants the proposal approval
+        ref = _approval_ref(store)
+        assert ref
         r = _post(client, "/api/project/demo/preferences", {
             "action": "learn", "scope": "project", "category": "pacing",
-            "key": "cuts_per_min", "value": 18, "source": "approval", "confidence": 0.8})
-        assert r.status_code == 200
-        prefs = client.get("/api/project/demo/preferences?scope=all").json()
-        assert len(prefs["project"]["preferences"]) == 1
-        assert prefs["project"]["preferences"][0]["provenance"]["source"] == "approval"
+            "key": "cuts_per_min", "value": 18, "source": "approval",
+            "run_id": "run_demo", "stage": "proposal", "decision_ref": ref, "confidence": 0.8})
+        assert r.status_code == 200, r.text
+        prefs = client.get("/api/project/demo/preferences?scope=project").json()
+        p = prefs["project"]["preferences"][0]
+        assert p["provenance"]["source"] == "approval"
+        assert p["provenance"]["verified"] is True
+
+    def test_missing_source_rejected_without_mutation(self, client):
+        _seed(client, approver="auto")
+        r = _post(client, "/api/project/demo/preferences", {
+            "action": "learn", "scope": "project", "category": "pacing",
+            "key": "x", "value": 1, "run_id": "run_demo", "stage": "proposal",
+            "decision_ref": "whatever"})
+        assert r.status_code == 400
+        assert client.get("/api/project/demo/preferences?scope=project").json()["project"]["preferences"] == []
 
     def test_opaque_source_rejected(self, client):
+        _seed(client, approver="auto")
         r = _post(client, "/api/project/demo/preferences", {
-            "action": "learn", "scope": "global", "category": "pacing",
-            "key": "x", "value": 1, "source": "profiling"})
+            "action": "learn", "scope": "project", "category": "pacing", "key": "x",
+            "value": 1, "source": "profiling", "run_id": "run_demo",
+            "stage": "proposal", "decision_ref": "x"})
         assert r.status_code == 400
 
-    def test_correct_and_reject_and_reset(self, client):
-        _post(client, "/api/preferences", {
-            "action": "learn", "scope": "global", "category": "typography",
-            "key": "font", "value": "Inter", "source": "approval"})
-        g = client.get("/api/preferences").json()
-        pid = g["global"]["preferences"][0]["pref_id"]
-        r = _post(client, "/api/preferences", {"action": "correct", "scope": "global",
-                                               "pref_id": pid, "value": "Fraunces"})
+    def test_missing_run_stage_ref_rejected(self, client):
+        _seed(client, approver="auto")
+        r = _post(client, "/api/project/demo/preferences", {
+            "action": "learn", "scope": "project", "category": "pacing",
+            "key": "x", "value": 1, "source": "approval"})  # no run/stage/ref
+        assert r.status_code in (400, 409)
+        assert client.get("/api/project/demo/preferences?scope=project").json()["project"]["preferences"] == []
+
+    def test_forged_ref_rejected(self, client):
+        _seed(client, approver="auto")
+        r = _post(client, "/api/project/demo/preferences", {
+            "action": "learn", "scope": "project", "category": "pacing", "key": "x",
+            "value": 1, "source": "approval", "run_id": "run_demo",
+            "stage": "proposal", "decision_ref": "appr-does-not-exist"})
+        assert r.status_code == 409
+        assert client.get("/api/project/demo/preferences?scope=project").json()["project"]["preferences"] == []
+
+    def test_mismatched_stage_rejected(self, client):
+        store = _seed(client, approver="auto")
+        ref = _approval_ref(store)
+        r = _post(client, "/api/project/demo/preferences", {
+            "action": "learn", "scope": "project", "category": "pacing", "key": "x",
+            "value": 1, "source": "approval", "run_id": "run_demo",
+            "stage": "assets", "decision_ref": ref})  # ref belongs to proposal
+        assert r.status_code == 409
+
+    def test_rejected_decision_cannot_be_learned(self, client):
+        store = _seed(client, approver=lambda st: False)  # proposal approval REJECTED
+        # find the rejected approval id
+        ref = None
+        for e in store.read_events_raw():
+            if e.get("type") == "approval_rejected":
+                ref = (e.get("data") or {}).get("approval_id")
+        assert ref
+        r = _post(client, "/api/project/demo/preferences", {
+            "action": "learn", "scope": "project", "category": "pacing", "key": "x",
+            "value": 1, "source": "approval", "run_id": "run_demo",
+            "stage": "proposal", "decision_ref": ref})
+        assert r.status_code == 409
+
+    def test_global_learn_directly_rejected(self, client):
+        r = _post(client, "/api/preferences", {
+            "action": "learn", "scope": "global", "category": "pacing",
+            "key": "x", "value": 1, "source": "approval"})
+        assert r.status_code == 400
+        assert client.get("/api/preferences").json()["global"]["preferences"] == []
+
+    def test_promotion_requires_verified_project_pref(self, client):
+        # A project pref recorded WITHOUT verification (via direct store) cannot be
+        # promoted; only a verified one can.
+        from lib.production_brain.learning import StyleLearningStore
+
+        proj = StyleLearningStore.project_store(client._proj)
+        proj.learn(category="music", key="genre", value="ambient", source="approval")  # unverified
+        unverified_id = proj.preferences()[0]["pref_id"]
+        r = _post(client, "/api/project/demo/preferences",
+                  {"action": "promote", "pref_id": unverified_id})
+        assert r.status_code == 409
+        assert client.get("/api/preferences").json()["global"]["preferences"] == []
+
+    def test_promotion_of_verified_pref_succeeds(self, client):
+        store = _seed(client, approver="auto")
+        ref = _approval_ref(store)
+        _post(client, "/api/project/demo/preferences", {
+            "action": "learn", "scope": "project", "category": "typography",
+            "key": "font", "value": "Fraunces", "source": "approval",
+            "run_id": "run_demo", "stage": "proposal", "decision_ref": ref})
+        pid = client.get("/api/project/demo/preferences?scope=project").json()["project"]["preferences"][0]["pref_id"]
+        r = _post(client, "/api/project/demo/preferences", {"action": "promote", "pref_id": pid})
         assert r.status_code == 200
-        applied = [p for p in client.get("/api/preferences").json()["global"]["preferences"]
-                   if p["status"] == "applied"]
-        assert applied and applied[0]["value"] == "Fraunces"
-        # reset wipes
-        _post(client, "/api/preferences", {"action": "opt_out", "scope": "global", "opted_out": True, "wipe": True})
-        g = client.get("/api/preferences").json()
-        assert g["global"]["opted_out"] is True and g["global"]["preferences"] == []
+        g = client.get("/api/preferences").json()["global"]["preferences"]
+        assert g and g[0]["value"] == "Fraunces"
+        assert g[0]["provenance"]["source"] == "promotion"
+        assert g[0]["provenance"]["promoted_from"] == pid
 
     def test_reset_endpoint(self, client):
+        store = _seed(client, approver="auto")
+        ref = _approval_ref(store)
         _post(client, "/api/project/demo/preferences", {
             "action": "learn", "scope": "project", "category": "music",
-            "key": "genre", "value": "ambient", "source": "approval"})
+            "key": "genre", "value": "ambient", "source": "approval",
+            "run_id": "run_demo", "stage": "proposal", "decision_ref": ref})
         r = _post(client, "/api/project/demo/preferences/reset", {"scope": "project"})
         assert r.status_code == 200
         prefs = client.get("/api/project/demo/preferences?scope=project").json()
         assert prefs["project"]["preferences"] == []
+
+    def test_global_opt_out_wipe(self, client):
+        _post(client, "/api/preferences",
+              {"action": "opt_out", "scope": "global", "opted_out": True, "wipe": True})
+        g = client.get("/api/preferences").json()
+        assert g["global"]["opted_out"] is True and g["global"]["preferences"] == []
 
 
 class TestRedactionOverWire:

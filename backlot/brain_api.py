@@ -122,10 +122,35 @@ def reject_approval(project_dir: Path, body: dict) -> dict:
         raise BrainApiError(str(exc), status=exc.status)
 
 
-def cancel_run(project_dir: Path, body: dict) -> dict:
+def cancel_run(project_dir: Path, body: dict, *, orchestrator=None) -> dict:
+    """Cancel the exact active run AND correlate with the external orchestrator.
+
+    For a run backed by a real external job (``orchestration == "external_job"``)
+    the external job is cancelled first so the handle stays truthful; the local
+    cancel proceeds regardless (best-effort correlation, never blocks the user's
+    cancel). ``orchestrator`` is injectable for tests."""
     rid = _require_run_id(body)
+    store = _store(project_dir)
+    state = store.read_state()
+    brain = state.get("brain") or {}
+    ext_note = None
+    if state.get("run_id") == rid and brain.get("external") and brain.get("job_id"):
+        client = orchestrator
+        if client is None:
+            from lib.production_brain.orchestrator import default_orchestrator_client
+
+            client = default_orchestrator_client()
+        try:
+            client.cancel_job(job_id=brain["job_id"])
+            ext_note = f"external orchestrator job {brain['job_id']} cancelled"
+        except Exception:
+            ext_note = (f"local run cancelled; external job {brain['job_id']} "
+                        "cancel could not be confirmed")
     try:
-        return _store(project_dir).cancel(rid)
+        msg = None
+        if ext_note:
+            msg = f"Production run cancelled. Completed work is preserved. ({ext_note})"
+        return store.cancel(rid, message=msg)
     except BrainStoreError as exc:
         raise BrainApiError(str(exc), status=exc.status)
 
@@ -187,24 +212,69 @@ def read_preferences(project_dir: Optional[Path] = None, *, scope: str = "all",
     return result
 
 
-def update_preference(body: dict, *, project_dir: Optional[Path] = None) -> dict:
+def update_preference(body: dict, *, project_dir: Optional[Path] = None, evidence: Any = None) -> dict:
     """Dispatch an explicit learning action.
 
     body = { action, scope, ... }. action ∈
-    {learn, correct, reject, delete, opt_out}. All learning is from explicit
-    user choices only (enforced by the store).
+    {learn, promote, correct, reject, delete, opt_out}.
+
+    Honesty rules enforced here:
+      * ``source`` is NEVER defaulted — a ``learn`` without an explicit
+        approval/correction source is rejected.
+      * ``learn`` is only allowed at PROJECT scope, and only when the run's
+        authoritative event log actually contains a matching, non-rejected user
+        approval/correction (verified via the injected/derived evidence checker).
+      * a GLOBAL preference cannot be learned directly — it must be ``promote``d
+        from a VERIFIED project preference (or edited via an explicit correction).
+      * correct/reject/delete/opt_out are explicit user actions with provenance.
     """
     action = body.get("action")
     scope = body.get("scope") or "global"
-    store = _learning_store(scope, project_dir)
     try:
         if action == "learn":
+            source = body.get("source")
+            if source not in ("approval", "correction"):
+                raise BrainApiError("learn requires an explicit source of 'approval' or 'correction'")
+            if scope != "project":
+                raise BrainApiError(
+                    "global preferences cannot be learned directly — promote a "
+                    "verified project preference (action='promote') or record an "
+                    "explicit correction", status=400)
+            if project_dir is None:
+                raise BrainApiError("project scope requires a project", status=400)
+            store = _learn.StyleLearningStore.project_store(project_dir)
+            ev = evidence
+            if ev is None:
+                from lib.production_brain.evidence import BrainLogEvidence
+
+                ev = BrainLogEvidence(project_dir)
             return store.learn(
                 category=body.get("category"), key=body.get("key"), value=body.get("value"),
-                source=body.get("source") or "approval", confidence=body.get("confidence", 0.5),
+                source=source, confidence=body.get("confidence", 0.5),
                 run_id=body.get("run_id"), stage=body.get("stage"),
                 decision_ref=body.get("decision_ref"), note=body.get("note"),
-                corrects=body.get("corrects"))
+                require_evidence=True, evidence=ev)
+
+        if action == "promote":
+            if project_dir is None:
+                raise BrainApiError("promotion requires the source project", status=400)
+            pref_id = body.get("pref_id")
+            if not isinstance(pref_id, str) or not pref_id:
+                raise BrainApiError("promote requires pref_id (a verified project preference)")
+            proj = _learn.StyleLearningStore.project_store(project_dir)
+            src = proj.get(pref_id)
+            if src is None or src.get("status") != "applied":
+                raise BrainApiError("preference not found or not applied", status=404)
+            if not (src.get("provenance") or {}).get("verified"):
+                raise BrainApiError(
+                    "only a verified (event-log-backed) project preference can be "
+                    "promoted to global", status=409)
+            g = _learn.StyleLearningStore.global_store()
+            return g.record_promotion(category=src["category"], key=src["key"],
+                                     value=src["value"], from_pref=pref_id,
+                                     note=body.get("note"))
+
+        store = _learning_store(scope, project_dir)
         if action == "correct":
             return store.correct(body.get("pref_id"), value=body.get("value"),
                                 confidence=body.get("confidence", 0.6), run_id=body.get("run_id"),
@@ -216,7 +286,7 @@ def update_preference(body: dict, *, project_dir: Optional[Path] = None) -> dict
             return store.delete(body.get("pref_id"))
         if action == "opt_out":
             return store.set_opt_out(bool(body.get("opted_out", True)), wipe=bool(body.get("wipe", False)))
-        raise BrainApiError("unknown action; expected learn|correct|reject|delete|opt_out")
+        raise BrainApiError("unknown action; expected learn|promote|correct|reject|delete|opt_out")
     except _learn.LearningError as exc:
         raise BrainApiError(str(exc), status=exc.status)
 

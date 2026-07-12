@@ -182,3 +182,97 @@ class TestPersistence:
         reopened = StyleLearningStore(tmp_path / "persist.json", scope="global")
         assert len(reopened.preferences()) == 1
         assert reopened.preferences()[0]["value"] is True
+
+
+class _StubEvidence:
+    def __init__(self, ok: bool):
+        self.ok = ok
+        self.calls = []
+
+    def verify(self, **kw):
+        self.calls.append(kw)
+        return self.ok
+
+
+class TestVerifiedLearning:
+    def test_verified_learn_marks_verified_true(self, tmp_path):
+        p = _project(tmp_path)
+        ev = _StubEvidence(True)
+        p.learn(category="pacing", key="cpm", value=18, source="approval",
+                run_id="r1", stage="proposal", decision_ref="appr-1",
+                require_evidence=True, evidence=ev)
+        pref = p.preferences()[0]
+        assert pref["provenance"]["verified"] is True
+        assert ev.calls[0] == {"run_id": "r1", "stage": "proposal",
+                               "decision_ref": "appr-1", "source": "approval"}
+
+    def test_unverifiable_claim_rejected_without_mutation(self, tmp_path):
+        p = _project(tmp_path)
+        with pytest.raises(LearningError):
+            p.learn(category="pacing", key="cpm", value=18, source="approval",
+                    run_id="r1", stage="proposal", decision_ref="forged",
+                    require_evidence=True, evidence=_StubEvidence(False))
+        assert p.preferences() == []
+
+    def test_missing_anchor_rejected(self, tmp_path):
+        p = _project(tmp_path)
+        for kw in ({"run_id": None}, {"stage": None}, {"decision_ref": None}):
+            base = dict(run_id="r", stage="proposal", decision_ref="x")
+            base.update(kw)
+            with pytest.raises(LearningError):
+                p.learn(category="pacing", key="k", value=1, source="approval",
+                        require_evidence=True, evidence=_StubEvidence(True), **base)
+        assert p.preferences() == []
+
+    def test_no_evidence_source_rejected(self, tmp_path):
+        p = _project(tmp_path)
+        with pytest.raises(LearningError):
+            p.learn(category="pacing", key="k", value=1, source="approval",
+                    run_id="r", stage="proposal", decision_ref="x",
+                    require_evidence=True, evidence=None)
+        assert p.preferences() == []
+
+    def test_promotion_records_verified_provenance(self, tmp_path):
+        g = _global(tmp_path)
+        g.record_promotion(category="music", key="genre", value="ambient",
+                          from_pref="pref_042")
+        pref = g.preferences()[0]
+        assert pref["provenance"]["source"] == "promotion"
+        assert pref["provenance"]["promoted_from"] == "pref_042"
+        assert pref["provenance"]["verified"] is True
+
+
+class TestBrainLogEvidenceIntegration:
+    def _seed_run(self, tmp_path, *, reject=False):
+        from lib.production_brain.adapter import FakeBrain
+        from lib.production_brain.store import ProductionBrainStore
+
+        d = tmp_path / "proj"
+        d.mkdir()
+        store = ProductionBrainStore(d, gen_id=lambda: "run_e")
+        FakeBrain().drive(store, requested_duration_seconds=60, run_id="run_e",
+                          approver=(lambda st: False) if reject else "auto")
+        ref = None
+        wanted = "approval_rejected" if reject else "approval_granted"
+        for e in store.read_events_raw():
+            if e.get("type") == wanted and e.get("stage") == "proposal":
+                ref = (e.get("data") or {}).get("approval_id")
+        return d, ref
+
+    def test_verifies_a_real_granted_approval(self, tmp_path):
+        from lib.production_brain.evidence import BrainLogEvidence
+
+        d, ref = self._seed_run(tmp_path)
+        ev = BrainLogEvidence(d)
+        assert ev.verify(run_id="run_e", stage="proposal", decision_ref=ref, source="approval") is True
+        # forged ref / wrong stage / wrong run all fail
+        assert ev.verify(run_id="run_e", stage="proposal", decision_ref="nope", source="approval") is False
+        assert ev.verify(run_id="run_e", stage="assets", decision_ref=ref, source="approval") is False
+        assert ev.verify(run_id="other", stage="proposal", decision_ref=ref, source="approval") is False
+
+    def test_rejected_approval_does_not_verify(self, tmp_path):
+        from lib.production_brain.evidence import BrainLogEvidence
+
+        d, ref = self._seed_run(tmp_path, reject=True)
+        ev = BrainLogEvidence(d)
+        assert ev.verify(run_id="run_e", stage="proposal", decision_ref=ref, source="approval") is False

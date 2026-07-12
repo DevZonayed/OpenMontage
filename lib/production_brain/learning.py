@@ -154,22 +154,58 @@ class StyleLearningStore:
         decision_ref: Optional[str] = None,
         note: Optional[str] = None,
         corrects: Optional[str] = None,
+        require_evidence: bool = False,
+        evidence: Any = None,
     ) -> dict:
         """Record ONE preference learned from an explicit user choice.
 
-        Requires ``source`` ∈ {approval, correction}. If opted out, this is a
+        ``source`` MUST be an explicit member of {approval, correction} — it is
+        NEVER defaulted. When ``require_evidence`` is set (the project-scope path),
+        ``run_id``/``stage``/``decision_ref`` are all mandatory AND an ``evidence``
+        verifier must confirm the authoritative event log holds a matching,
+        non-rejected approval/correction decision for that run+stage. A claim that
+        cannot be verified raises and mutates nothing. If opted out, this is a
         no-op and returns the current store unchanged.
         """
         if category not in CATEGORIES:
             raise LearningError(f"unknown style category: {category}")
         if source not in SOURCES:
-            raise LearningError("source must be 'approval' or 'correction' (explicit choices only)")
+            raise LearningError("source must be an explicit 'approval' or 'correction'")
         if not isinstance(key, str) or not key:
             raise LearningError("key is required")
         try:
             conf = max(0.0, min(1.0, float(confidence)))
         except (TypeError, ValueError):
             raise LearningError("confidence must be a number in [0,1]")
+
+        verified = False
+        if require_evidence:
+            if not (run_id and stage and decision_ref):
+                raise LearningError(
+                    "a learned preference must cite run_id, stage and decision_ref "
+                    "so it can be verified against the run's event log")
+            if evidence is None:
+                raise LearningError("no evidence source is available to verify this learning")
+            if not evidence.verify(run_id=run_id, stage=stage, decision_ref=decision_ref, source=source):
+                raise LearningError(
+                    "no matching, non-rejected user approval/correction for this "
+                    "run+stage exists in the authoritative event log", status=409)
+            verified = True
+
+        provenance = {
+            "source": source,
+            "run_id": run_id,
+            "stage": stage,
+            "decision_ref": decision_ref,
+            "note": note,
+            "verified": verified,  # event-log-backed?
+        }
+        return self._commit_pref(category=category, key=key, value=value, confidence=conf,
+                                provenance=provenance, corrects=corrects)
+
+    def _commit_pref(self, *, category: str, key: str, value: Any, confidence: float,
+                     provenance: dict, corrects: Optional[str]) -> dict:
+        """Append one preference (superseding a prior one) atomically. Honors opt-out."""
         with _lock:
             store = self.read()
             if store.get("opted_out"):
@@ -183,20 +219,12 @@ class StyleLearningStore:
                 "key": key,
                 "value": value,
                 "status": "applied",
-                "confidence": conf,
-                "provenance": {
-                    "source": source,
-                    "run_id": run_id,
-                    "stage": stage,
-                    "decision_ref": decision_ref,
-                    "note": note,
-                },
+                "confidence": confidence,
+                "provenance": dict(provenance),
                 "corrects": corrects,
                 "created_at": ts,
                 "updated_at": ts,
             }
-            # A correction supersedes the corrected preference (kept for lineage,
-            # marked rejected so the audit trail shows what changed and why).
             if corrects:
                 for existing in prefs:
                     if existing.get("pref_id") == corrects:
@@ -204,8 +232,7 @@ class StyleLearningStore:
                         existing["updated_at"] = ts
                         existing.setdefault("provenance", {})["superseded_by"] = pref["pref_id"]
             else:
-                # Re-approving the same (category,key) reinforces confidence rather
-                # than piling up duplicates: supersede the prior applied one.
+                # Re-recording the same (category,key) supersedes the prior applied one.
                 for existing in prefs:
                     if (existing.get("category") == category and existing.get("key") == key
                             and existing.get("status") == "applied"):
@@ -218,17 +245,51 @@ class StyleLearningStore:
             _atomic_write(self.path, store)
             return store
 
-    def correct(self, pref_id: str, *, value: Any, source: str = "correction",
-                confidence: float = 0.6, run_id: Optional[str] = None,
-                stage: Optional[str] = None, decision_ref: Optional[str] = None,
-                note: Optional[str] = None) -> dict:
-        """User-corrects an existing preference — appends a new one that supersedes."""
+    def correct(self, pref_id: str, *, value: Any, confidence: float = 0.6,
+                run_id: Optional[str] = None, stage: Optional[str] = None,
+                decision_ref: Optional[str] = None, note: Optional[str] = None) -> dict:
+        """Explicit user correction of an existing preference — appends a new one
+        that supersedes it. A correction is a direct, authenticated user action
+        (not an event-log claim), so it is recorded with auditable provenance but
+        is not marked event-log ``verified``."""
         existing = self.get(pref_id)
         if existing is None:
             raise LearningError("preference not found", status=404)
-        return self.learn(category=existing["category"], key=existing["key"], value=value,
-                          source=source, confidence=confidence, run_id=run_id, stage=stage,
-                          decision_ref=decision_ref, note=note, corrects=pref_id)
+        try:
+            conf = max(0.0, min(1.0, float(confidence)))
+        except (TypeError, ValueError):
+            raise LearningError("confidence must be a number in [0,1]")
+        provenance = {
+            "source": "correction",
+            "run_id": run_id,
+            "stage": stage,
+            "decision_ref": decision_ref,
+            "note": note,
+            "verified": False,
+            "corrects_pref": pref_id,
+        }
+        return self._commit_pref(category=existing["category"], key=existing["key"],
+                                value=value, confidence=conf, provenance=provenance,
+                                corrects=pref_id)
+
+    def record_promotion(self, *, category: str, key: str, value: Any,
+                         from_pref: str, from_scope: str = "project",
+                         confidence: float = 0.7, note: Optional[str] = None) -> dict:
+        """Promote a VERIFIED project preference to this (global) scope. This is an
+        explicit user action; provenance links to the verified source preference."""
+        try:
+            conf = max(0.0, min(1.0, float(confidence)))
+        except (TypeError, ValueError):
+            raise LearningError("confidence must be a number in [0,1]")
+        provenance = {
+            "source": "promotion",
+            "promoted_from": from_pref,
+            "promoted_from_scope": from_scope,
+            "note": note,
+            "verified": True,  # only verified project prefs may be promoted (enforced by caller)
+        }
+        return self._commit_pref(category=category, key=key, value=value,
+                                confidence=conf, provenance=provenance, corrects=None)
 
     def reject(self, pref_id: str, *, note: Optional[str] = None) -> dict:
         with _lock:

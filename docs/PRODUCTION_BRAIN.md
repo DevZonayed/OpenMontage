@@ -22,10 +22,12 @@ telemetry + control plane around that work.
 
 ```
 lib/production_brain/
-  schema.py     # stages, run states, transition table, secret redaction, reducer
-  store.py      # ProductionBrainStore — the single writer (durable, atomic)
-  adapter.py    # BrainAdapter contract: HermesBrainAdapter (fail-closed) + FakeBrain
-  learning.py   # StyleLearningStore — visible style learning from explicit choices
+  schema.py       # stages, run states, transition table, secret redaction, reducer
+  store.py        # ProductionBrainStore — the single writer (durable, atomic)
+  orchestrator.py # HermesOrchestratorClient port + Configured (prod) + Fake (test)
+  adapter.py      # BrainAdapter: HermesBrainAdapter (real IDs, fail-closed) + FakeBrain
+  evidence.py     # BrainLogEvidence — verifies learning claims vs the event log
+  learning.py     # StyleLearningStore — verified style learning from explicit choices
 
 backlot/brain_api.py   # pure read/control functions the server routes call
 schemas/artifacts/
@@ -132,7 +134,7 @@ changes; brain telemetry is intentionally poll-only to avoid UI flicker.
 
 | Endpoint | Body | Effect |
 |---|---|---|
-| `POST /api/project/{id}/brain/start` | `{}` | open a run under the **real Hermes brain**, or `409` if the brain is unavailable (fail-closed). Idempotent. |
+| `POST /api/project/{id}/brain/start` | `{}` | provision a **real durable orchestrator job** and open the run, or `409` if no orchestrator is available / it returns no canonical ids (fail-closed). Idempotent — a retry keeps the same external job. |
 | `POST /api/project/{id}/brain/approve` | `{run_id, stage?, approval_id?, note?}` | grant a pending approval gate |
 | `POST /api/project/{id}/brain/reject` | `{run_id, stage?, approval_id?, note?}` | reject a gate (marks the stage failed) |
 | `POST /api/project/{id}/brain/cancel` | `{run_id}` | cancel the exact active run |
@@ -154,40 +156,64 @@ brain unavailable), `413` (body too large), `415` (wrong content-type), `429`
 | `GET /api/preferences` | global preferences only |
 | `POST /api/preferences` | global learn/correct/reject/delete/opt_out |
 
-`action` ∈ `learn | correct | reject | delete | opt_out`. **Learning is only
-from explicit user choices**: `learn` requires `source ∈ {approval, correction}`
-— an opaque `source` (e.g. "profiling") is rejected with `400`. Categories are
-fixed: `visual_language, pacing, typography, transitions, narration, music,
-scene_density, editing_patterns`. Every preference records provenance
-(`source, run_id, stage, decision_ref`), `confidence`, `status`
-(`applied|rejected`), and correction lineage (`corrects`, `superseded_by`).
-`opt_out` (optionally `wipe:true`) disables all learning for privacy.
+`action` ∈ `learn | promote | correct | reject | delete | opt_out`.
+
+**Learning evidence is verified, not client-asserted.** A project-scope `learn`:
+- requires an **explicit** `source ∈ {approval, correction}` — it is NEVER
+  defaulted (a missing/opaque source ⇒ `400`);
+- requires nonempty `run_id`, `stage`, and `decision_ref`; and
+- is verified against the **authoritative append-only event log**: a matching,
+  non-rejected user approval/correction decision for that run + stage must exist
+  (a forged/mismatched ref, or a *rejected* decision ⇒ `409`).
+
+A **global** preference cannot be learned directly (`400`): it must be
+`promote`d from a **verified** (`provenance.verified == true`) project preference
+(`{action:"promote", pref_id}`), or edited via an explicit `correct`. Correct /
+reject / delete / reset / opt-out are explicit authenticated user actions that
+log auditable provenance. Categories are fixed: `visual_language, pacing,
+typography, transitions, narration, music, scene_density, editing_patterns`.
+Every preference records provenance (`source, run_id, stage, decision_ref,
+verified`), `confidence`, `status` (`applied|rejected`), and lineage (`corrects`,
+`superseded_by`, `promoted_from`). `opt_out` (`wipe:true`) disables learning for
+privacy.
 
 ---
 
-## 5. The brain adapter (fail-closed)
+## 5. The orchestration port + brain adapter (fail-closed, real IDs)
 
-`lib/production_brain/adapter.py` defines the **secure, explicit** brain contract:
+`lib/production_brain/orchestrator.py` defines the **secure, explicit
+orchestration port** — the brain never fabricates identity:
 
-- `HermesBrainAdapter` — the real brain. Availability is probed from the
-  subscription-engine layer (`lib.engines`): a signed-in consumer-plan engine is
-  the **precondition** for the brain — `available` is *not* a claim that an
-  orchestrator is running. If no engine is signed in, `.start()` raises
-  `BrainUnavailable` and **no run is opened** (API `409`). When it opens a run it
-  attaches a **real, non-secret session + job identity** (a session id is minted
-  if the caller supplies none) and stamps `orchestration: "agent_driven"` into
-  the brain block. **Honesty:** opening a run does not run an LLM or drive stages —
-  OpenMontage has no internal LLM layer; the Hermes *agent* (this session)
-  advances stages as it works. The start activity says so explicitly ("agent-driven
-  … no autonomous background orchestrator is running") — the API never implies a
-  green "brain online" without work actually happening. Identity fields
-  (`name, adapter, available, agent_id, session_id, engine, orchestration`) are
-  non-secret and stamped onto every event.
-- `FakeBrain` — deterministic, offline, **never calls a paid service**. Its
-  `.drive(store, requested_duration_seconds, approver=…, stop_after=…)` walks the
-  whole stage machine, emitting ordered stage/tool/decision/output/approval
-  events. Used by tests and the smoke harness to prove visible stage/task
-  changes.
+- `HermesOrchestratorClient` (Protocol) — the injected port. `create_job(...)`
+  returns an `OrchestratorHandle{session_id, job_id, engine}` and MUST be
+  idempotent on `idempotency_key`; `cancel_job(job_id)` correlates cancellation.
+  `kind` is `"live"` or `"fake"`.
+- `ConfiguredHermesOrchestratorClient` — the **production** client. It POSTs to
+  the operator-approved endpoint (`OPENMONTAGE_HERMES_ORCHESTRATOR_URL`) with an
+  optional bearer token read **only** from the OS keyring
+  (`hermes_orchestrator_token`) — never logged, never placed in telemetry.
+  Unconfigured ⇒ `available() is False` ⇒ Start Production fails closed with an
+  actionable blocker. **This client is never exercised by the test suite.**
+- `FakeOrchestratorClient` — deterministic, offline, **TEST-ONLY**. Returns
+  canonical-shaped ids derived from the run id and records the start/cancel calls
+  it receives. Runs backed by it are visibly `orchestration: "fake_driver"`.
+
+`lib/production_brain/adapter.py`:
+
+- `HermesBrainAdapter(client=…)` — opens a run ONLY after `client.create_job`
+  returns canonical `session_id`/`job_id`; those ids are recorded **verbatim**
+  (never minted). If the client is unavailable, raises, or returns no valid ids,
+  `.start()` raises `BrainUnavailable` and **no run is opened** (API `409`).
+  `start` is idempotent (an already-active run keeps its existing external job —
+  no second job is provisioned). The run's brain block records
+  `orchestration` (`external_job` for a live job, `fake_driver` for the test
+  client) and `external: true`; `cancel` correlates with the external handle
+  (`cancel_job`). Default (`default_adapter()`) uses the production client, so on
+  a machine with no orchestrator configured **Start Production fails closed** —
+  it never shows a green run without a real job.
+- `FakeBrain` — deterministic, offline, **never calls a paid service**, visibly
+  `fake_driver`. Its `.drive(...)` walks the whole stage machine to prove visible
+  stage/task changes. Test + smoke only.
 
 The engine model is truthful: **Hermes** is the brain/orchestrator; **Remotion**,
 **HyperFrames**, **FFmpeg**, and the media providers are distinct compositors/
