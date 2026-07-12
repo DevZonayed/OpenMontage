@@ -36,6 +36,7 @@ import {
 } from "../composition/operations";
 import { BacklotClient } from "../composition/client";
 import { BrainPanel, PreferencesPanel } from "./BrainPanel";
+import { CommandCenter } from "./CommandCenter";
 
 // ── helpers ──
 function timecode(frame: number, fps: number): string {
@@ -79,7 +80,6 @@ export const StudioApp: React.FC<StudioAppProps> = ({ client }) => {
   const [usedFixture, setUsedFixture] = useState(false);
   const [renderReady, setRenderReady] = useState(false);
   const [renderReason, setRenderReason] = useState("");
-  const [run, setRun] = useState<Record<string, unknown>>({ state: "not_started" });
   const [rendering, setRendering] = useState(false);
   const [notice, setNotice] = useState<string | null>(null);
   const [rightTab, setRightTab] = useState<"production" | "inspector" | "style">("production");
@@ -110,36 +110,12 @@ export const StudioApp: React.FC<StudioAppProps> = ({ client }) => {
     }
   }, [client, rerender]);
 
-  const refreshStatus = useCallback(async () => {
-    try {
-      const r = await client.getRun();
-      setRun(r);
-    } catch {
-      /* ignore */
-    }
-  }, [client]);
-
   useEffect(() => {
     void load();
-    void refreshStatus();
-  }, [load, refreshStatus]);
+  }, [load]);
 
-  // Live status via SSE (falls back silently in fixture mode).
-  useEffect(() => {
-    if (typeof EventSource === "undefined") return;
-    let es: EventSource | null = null;
-    try {
-      es = new EventSource(`/api/project/${client.projectId}/events`);
-      es.onmessage = () => void refreshStatus();
-    } catch {
-      /* offline / fixtures */
-    }
-    const poll = setInterval(() => void refreshStatus(), 4000);
-    return () => {
-      es?.close();
-      clearInterval(poll);
-    };
-  }, [client.projectId, refreshStatus]);
+  // Live production status is owned by the shared <CommandCenter> (it polls the
+  // canonical /status view), so StudioApp no longer polls /run separately.
 
   // ── player frame tracking ──
   useEffect(() => {
@@ -211,6 +187,11 @@ export const StudioApp: React.FC<StudioAppProps> = ({ client }) => {
   }, [client, etag]);
 
   const renderFinal = useCallback(async () => {
+    const layerCount = histRef.current?.present.layers.length ?? 0;
+    if (layerCount === 0) {
+      setNotice("Nothing to render yet — the timeline has no layers. Hermes builds the timeline during production; a blank render is disabled on purpose.");
+      return;
+    }
     if (dirty) {
       setNotice("Save your edits before rendering so preview and render match.");
       return;
@@ -318,9 +299,13 @@ export const StudioApp: React.FC<StudioAppProps> = ({ client }) => {
 
   const validation = validateComposition(model);
   const selectedLayer = model.layers.find((l) => l.id === selected) ?? null;
+  const hasLayers = model.layers.length > 0;
 
   return (
     <div style={{ display: "flex", flexDirection: "column", height: "100%", color: "#ececef" }}>
+      {/* PRIMARY: the shared command-center card (same view model as the board). */}
+      <CommandCenter client={client} />
+
       {/* Header / actions */}
       <div style={header}>
         <div style={{ display: "flex", alignItems: "center", gap: 12 }}>
@@ -329,7 +314,7 @@ export const StudioApp: React.FC<StudioAppProps> = ({ client }) => {
             {model.width}×{model.height} · {model.fps}fps · {model.totalFrames} frames ·{" "}
             {model.meta.targetFormatted || `${model.targetDurationSeconds}s`}
           </span>
-          {usedFixture ? <span style={{ ...pill, borderColor: "#e8c07d", color: "#e8c07d" }}>fixture / offline</span> : null}
+          {usedFixture ? <span style={{ ...pill, borderColor: "#e8c07d", color: "#e8c07d" }}>◐ demo data</span> : null}
           <span
             style={{ ...pill, color: renderReady ? "#4fc283" : "#e8c07d", borderColor: renderReady ? "#4fc283" : "#e8c07d" }}
             title={renderReason}
@@ -347,7 +332,12 @@ export const StudioApp: React.FC<StudioAppProps> = ({ client }) => {
           <button style={{ ...btnPrimary, opacity: dirty ? 1 : 0.6 }} onClick={() => void save()} disabled={saving}>
             {saving ? "Saving…" : dirty ? "Save*" : "Saved"}
           </button>
-          <button style={btnAccent} onClick={() => void renderFinal()} disabled={rendering}>
+          <button
+            style={{ ...btnAccent, opacity: rendering || !hasLayers ? 0.5 : 1, cursor: hasLayers ? "pointer" : "not-allowed" }}
+            onClick={() => void renderFinal()}
+            disabled={rendering || !hasLayers}
+            title={!hasLayers ? "No renderable layers yet — Hermes builds the timeline during production." : "Render the final film"}
+          >
             {rendering ? "Rendering…" : "▶ Render final film"}
           </button>
         </div>
@@ -393,6 +383,11 @@ export const StudioApp: React.FC<StudioAppProps> = ({ client }) => {
 
         {/* Player + transport */}
         <div style={{ flex: 1, display: "flex", flexDirection: "column", minWidth: 0 }}>
+          {!hasLayers ? (
+            <div style={stage}>
+              <EmptyTimelineCard client={client} usedFixture={usedFixture} />
+            </div>
+          ) : (
           <div style={stage}>
             <div
               style={{
@@ -419,6 +414,7 @@ export const StudioApp: React.FC<StudioAppProps> = ({ client }) => {
               />
             </div>
           </div>
+          )}
 
           <Transport
             frame={frame}
@@ -831,33 +827,34 @@ const ValidationPanel: React.FC<{ result: ReturnType<typeof validateComposition>
   </div>
 );
 
-const LiveStatus: React.FC<{ run: Record<string, unknown> }> = ({ run }) => {
-  const state = String(run.state ?? "not_started");
-  const phase = String((run.phase as string) ?? (run.active_stage as string) ?? "—");
-  const label =
-    state === "not_started"
-      ? "NOT STARTED"
-      : state === "running"
-        ? "PRODUCTION RUNNING"
-        : state === "waiting_for_approval"
-          ? "AWAITING APPROVAL"
-          : state.toUpperCase();
-  const color =
-    state === "running" ? "#4fc283" : state === "waiting_for_approval" ? "#e8c07d" : "#5f5f68";
-  const log = Array.isArray(run.log) ? (run.log as unknown[]).slice(-4) : [];
+// Shown in place of a blank canvas when the timeline has no layers yet: an
+// intentional state card explaining the current production stage and what will
+// appear here — never a misleading empty "Rendering…" preview.
+const EmptyTimelineCard: React.FC<{ client: BacklotClient; usedFixture: boolean }> = ({ client, usedFixture }) => {
+  const [status, setStatus] = useState<import("../composition/status").StatusView | null>(null);
+  useEffect(() => {
+    let alive = true;
+    client.getStatus().then((v) => { if (alive) setStatus(v); }).catch(() => { /* keep neutral empty copy */ });
+    return () => { alive = false; };
+  }, [client]);
+  const stage = status?.current_stage_label ?? null;
+  const stageNo = status?.stage_number ?? null;
   return (
-    <div>
-      <div style={{ fontSize: 12, color: "#a0a0a9", marginBottom: 6 }}>LIVE PRODUCTION</div>
-      <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
-        <span style={{ width: 8, height: 8, borderRadius: 8, background: color }} />
-        <strong style={{ fontSize: 13, color }}>{label}</strong>
+    <div style={{ maxWidth: 560, textAlign: "center", padding: 28 }} data-testid="empty-timeline">
+      <div style={{ fontSize: 42, marginBottom: 12, opacity: 0.5 }}>🎬</div>
+      <div style={{ fontSize: 18, fontWeight: 650, color: "#ececef", marginBottom: 8 }}>
+        The timeline is empty
       </div>
-      <div style={{ fontSize: 11, color: "#a0a0a9", marginTop: 4 }}>phase: {phase}</div>
-      {log.map((l, i) => (
-        <div key={i} style={{ fontSize: 10, color: "#5f5f68", marginTop: 2 }}>
-          {typeof l === "string" ? l : JSON.stringify(l)}
-        </div>
-      ))}
+      <div style={{ fontSize: 13.5, color: "#a0a0a9", lineHeight: 1.5, marginBottom: 14 }}>
+        {stage
+          ? `Production is at ${stageNo ? `stage ${stageNo} of 11 · ` : ""}${stage}. Hermes builds the timeline as it produces assets — scenes, narration and captions will appear here automatically.`
+          : "Hermes builds the timeline as it produces your video. Once it generates the first assets, scenes and layers will appear here."}
+      </div>
+      <div style={{ fontSize: 12, color: "#5f5f68" }}>
+        {usedFixture
+          ? "Demo mode — no live production is running."
+          : "Nothing is rendering — the render button unlocks once there are layers to render."}
+      </div>
     </div>
   );
 };

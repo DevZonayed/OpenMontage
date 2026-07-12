@@ -98,6 +98,7 @@ export function useBrain(client: BacklotClient) {
   const [events, setEvents] = useState<BrainEvent[]>([]);
   const [assets, setAssets] = useState<BrainOutput[]>([]);
   const [usedFixture, setUsedFixture] = useState(false);
+  const [stale, setStale] = useState(false);
   const [notice, setNotice] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
   const cursorRef = useRef(0);
@@ -107,6 +108,7 @@ export function useBrain(client: BacklotClient) {
       const s = await client.getBrain();
       setState(s);
       setUsedFixture(client.usedFixture);
+      setStale(false);
       const page = await client.getBrainEvents(cursorRef.current, 200);
       if (page.events.length) {
         setEvents((prev) => [...prev, ...page.events].slice(-400));
@@ -115,7 +117,9 @@ export function useBrain(client: BacklotClient) {
       const a = await client.getBrainAssets();
       setAssets(a.outputs || []);
     } catch {
-      /* tolerant — reads never throw fatally in fixture mode */
+      // Network error: PRESERVE the last known state and flag it stale —
+      // never blank the panel or substitute fabricated data.
+      setStale(true);
     }
   }, [client]);
 
@@ -155,13 +159,18 @@ export function useBrain(client: BacklotClient) {
     [tick],
   );
 
-  return { state, events, assets, usedFixture, notice, setNotice, busy, control, tick };
+  return { state, events, assets, usedFixture, stale, notice, setNotice, busy, control, tick };
 }
 
 // ── The observable production panel ──
 export const BrainPanel: React.FC<{ client: BacklotClient }> = ({ client }) => {
-  const { state, events, assets, usedFixture, notice, busy, control } = useBrain(client);
-  if (!state) return <div style={{ color: C.faint, fontSize: 12 }}>Loading production brain…</div>;
+  const { state, events, assets, usedFixture, stale, notice, busy, control } = useBrain(client);
+  if (!state)
+    return (
+      <div style={{ color: C.faint, fontSize: 12 }}>
+        {stale ? "⟳ Couldn't reach the production brain — reconnecting…" : "Loading production brain…"}
+      </div>
+    );
 
   const live = isLive(state, usedFixture);
   const kind = orchestrationKind(state);
@@ -175,13 +184,23 @@ export const BrainPanel: React.FC<{ client: BacklotClient }> = ({ client }) => {
     <div style={{ display: "flex", flexDirection: "column", gap: 4, fontSize: 12, color: C.text }}>
       {/* LIVE vs FIXTURE + run state */}
       <div style={{ display: "flex", alignItems: "center", gap: 8, flexWrap: "wrap" }}>
-        <span style={chip(live ? C.green : C.amber)} data-testid="live-badge">
-          {live ? "● LIVE" : "◐ DETERMINISTIC FIXTURE"}
+        <span
+          style={chip(usedFixture ? C.amber : live ? C.green : C.faint)}
+          data-testid="live-badge"
+        >
+          {usedFixture
+            ? "◐ DEMO DATA"
+            : live
+              ? "● LIVE"
+              : runId
+                ? "◧ OFFLINE DRIVER"
+                : "○ NO LIVE RUN"}
         </span>
         <span style={chip(RUN_STATE_COLOR[state.state] || C.faint)} data-testid="run-state">
           {RUN_STATE_LABEL[state.state] || state.state}
         </span>
         <span style={{ fontSize: 10, color: C.faint }}>{kind === "external_job" ? "external_job" : "fake_driver"}</span>
+        {stale ? <span style={chip(C.blue)} data-testid="stale-badge">⟳ RECONNECTING</span> : null}
       </div>
       {state.state === "cancelling" ? (
         <div style={{ fontSize: 11, color: C.amber }}>

@@ -103,25 +103,6 @@ function _elapsed(startedAt) {
   return `${m}:${String(sVal).padStart(2, "0")}`;
 }
 
-function _setBadge(run) {
-  const badge = document.querySelector(".slate .live");
-  if (!badge) return;
-  const st = (run && run.state) || "not_started";
-  const map = {
-    not_started: "NOT STARTED", starting: "STARTING", running: "RUNNING",
-    waiting_for_approval: "AWAITING APPROVAL", cancelling: "CANCELLING",
-    cancelled: "CANCELLED", failed: "FAILED", completed: "COMPLETED",
-  };
-  // Keep the badge consistent with the panel: once approved, it's no longer
-  // "awaiting approval" — it's approved and awaiting the agent.
-  let txt = map[st];
-  if (st === "waiting_for_approval" && run && run.plan_approved) txt = "APPROVED · AWAITING AGENT";
-  if (!txt) return;
-  badge.textContent = "";
-  badge.append(el("span", { class: "dot" }), txt);
-  badge.classList.toggle("idle", st === "not_started" || st === "cancelled");
-}
-
 function advancedPrompt(s) {
   const box = el("pre", { class: "prompt-box", style: "margin-top:8px" }, "Loading your brief…");
   const copyBtn = el("button", { class: "set-mini", type: "button" }, "Copy production prompt");
@@ -267,7 +248,8 @@ async function refreshRun(s, body, wrap, force) {
   try { run._inbox = await getJSON(`/api/project/${encodedProjectId}/agent-inbox`); }
   catch { run._inbox = null; }
   const st = run.state || "not_started";
-  _setBadge(run);
+  // The command-center card (canonical /status) owns the slate badge now; the
+  // coarse run panel lives inside the collapsed technical-details section.
   if (boardHasProduction(s) && st === "not_started") { wrap.style.display = "none"; return; }
   wrap.style.display = "";
 
@@ -397,6 +379,377 @@ function boardHasProduction(s) {
   return (s.stages || []).some((x) => x.status === "completed" || x.status === "in_progress")
     || (s.storyboard && (s.storyboard.scenes || []).length)
     || (s.renders && s.renders.length);
+}
+
+// ===========================================================================
+// COMMAND CENTER — the single, dominant production-status card.
+// Driven by the canonical /status view model (shared with the Remotion Studio),
+// so the board and studio always show the same NOW / NEXT / LAST and stage.
+// ===========================================================================
+let statusPollTimer = null;
+let lastStatusSig = null;
+let lastStatusView = null;   // last-known-good view (preserved on network error)
+
+const OWNER_LABEL = { hermes: "Hermes", user: "You", system: "System" };
+const STEP_GLYPH = {
+  completed: "✓", current: "◉", blocked: "▲", awaiting: "◈",
+  failed: "✕", skipped: "–", upcoming: "",
+};
+
+function _statusPollMs(view) {
+  const st = view && view.overall_state;
+  if (st === "producing" || st === "planning" || st === "cancelling") return 2500;
+  if (st === "reconciling") return 2000;
+  if (["awaiting_approval", "awaiting_plan_approval", "blocked", "ready_to_produce"].includes(st)) return 4000;
+  return 8000;   // idle / terminal — still poll (connection state can change)
+}
+
+function _statusSig(v) {
+  if (!v) return "none";
+  return [v.overall_state, v.current_stage, v.owner, v.headline,
+    (v.primary_action || {}).id, v.stop_available, (v.connection || {}).status,
+    v.stale, (v.diagnostics || []).length, (v.latest_event || {}).seq,
+    v.render && v.render.renderable].join("|");
+}
+
+function _setStatusBadge(view) {
+  const badge = document.querySelector(".slate .live");
+  if (!badge) return;
+  const st = view.overall_state;
+  const label = {
+    not_started: "NOT STARTED", planning: "PREPARING",
+    awaiting_plan_approval: "REVIEW PLAN", ready_to_produce: "READY",
+    producing: "PRODUCING", awaiting_approval: "NEEDS YOU",
+    blocked: "BLOCKED", cancelling: "CANCELLING", cancelled: "CANCELLED",
+    failed: "FAILED", completed: "COMPLETE", reconciling: "RECONCILING",
+  }[st] || st.toUpperCase();
+  const live = ["producing", "planning", "cancelling"].includes(st);
+  const attention = ["awaiting_approval", "awaiting_plan_approval", "blocked", "failed"].includes(st);
+  badge.textContent = "";
+  badge.classList.remove("idle");
+  const dotStyle = attention ? "background:var(--amber,#e8c07d);animation:none" : "";
+  badge.append(el("span", { class: "dot", style: dotStyle }),
+    (view.stale ? "⟳ " : "") + label);
+  if (!live && !attention) badge.classList.add("idle");
+  badge.style.color = attention ? "var(--amber,#e8c07d)" : "";
+}
+
+function renderCommandCenter(s) {
+  const wrap = el("section", { class: "cmd-center", "aria-live": "polite" });
+  // Paint immediately from the last-known view (no flash), then refresh.
+  if (lastStatusView) renderStatusCard(wrap, lastStatusView);
+  else wrap.append(el("div", { class: "cmd-loading" }, "Loading production status…"));
+  refreshStatus(wrap, true);
+  return wrap;
+}
+
+async function refreshStatus(wrap, force) {
+  if (statusPollTimer) { clearTimeout(statusPollTimer); statusPollTimer = null; }
+  let view;
+  try {
+    view = await getJSON(`/api/project/${encodedProjectId}/status`);
+    lastStatusView = view;
+  } catch {
+    // Network error: PRESERVE the last-known-good state, flag it stale +
+    // reconnecting. NEVER blank the card or invent a fake state.
+    if (lastStatusView) {
+      view = Object.assign({}, lastStatusView, { stale: true });
+      view.diagnostics = (lastStatusView.diagnostics || []).concat(
+        [{ kind: "stale", message: "Reconnecting to live updates…" }]);
+    } else {
+      view = null;
+    }
+  }
+  if (!view) {
+    wrap.textContent = "";
+    wrap.append(el("div", { class: "cmd-loading" }, "Production status is temporarily unavailable — reconnecting…"));
+    statusPollTimer = setTimeout(() => refreshStatus(wrap, true), 3000);
+    return;
+  }
+  _setStatusBadge(view);
+  const sig = _statusSig(view);
+  if (force || sig !== lastStatusSig) {
+    lastStatusSig = sig;
+    renderStatusCard(wrap, view);
+  }
+  statusPollTimer = setTimeout(() => refreshStatus(wrap, false), _statusPollMs(view));
+}
+
+function renderStatusCard(wrap, view) {
+  wrap.textContent = "";
+  wrap.dataset.state = view.overall_state;
+  wrap.dataset.owner = view.owner || "";
+
+  // --- connection banner (only when connecting is the actual next step) ----
+  // Never nag to connect while a live run is already producing, or on a
+  // terminal run — the banner is for when the user must connect to proceed.
+  const conn = view.connection || {};
+  const activeRun = view.is_live || ["producing", "cancelling", "cancelled", "failed", "completed"].includes(view.overall_state);
+  if (!conn.available && conn.status && conn.status !== "unknown" && !activeRun) {
+    wrap.append(renderConnectionBanner(view));
+  }
+  // --- diagnostics (reconciling / stale) ----------------------------------
+  for (const d of (view.diagnostics || [])) {
+    if (d.kind === "stale") {
+      wrap.append(el("div", { class: "cmd-diag stale", role: "status" },
+        el("span", { class: "spinner" }), d.message));
+    } else if (d.kind === "source_conflict") {
+      wrap.append(el("div", { class: "cmd-diag conflict", role: "status" }, "⚠ " + d.message));
+    }
+  }
+
+  // --- the three-up NOW / NEXT / LAST -------------------------------------
+  const grid = el("div", { class: "cmd-grid" });
+
+  // NOW
+  const stageTag = view.stage_number
+    ? `Stage ${view.stage_number} of ${view.stage_count} · ${view.current_stage_label || ""}`
+    : "";
+  const now = el("div", { class: "cmd-now" });
+  now.append(el("div", { class: "cmd-eyebrow" }, "NOW"));
+  if (stageTag) now.append(el("div", { class: "cmd-stagetag" }, stageTag));
+  now.append(el("h2", { class: "cmd-headline" }, view.headline || "—"));
+  if (view.active_task) now.append(el("p", { class: "cmd-task" }, view.active_task));
+  const metaBits = [];
+  if (view.owner) metaBits.push(`Owner: ${OWNER_LABEL[view.owner] || view.owner}`);
+  if (typeof view.elapsed_seconds === "number") metaBits.push(`Elapsed ${_fmtSecs(view.elapsed_seconds)}`);
+  if (metaBits.length) now.append(el("div", { class: "cmd-meta" }, metaBits.join(" · ")));
+  grid.append(now);
+
+  // NEXT (single primary action + owner)
+  const next = el("div", { class: "cmd-next" });
+  next.append(el("div", { class: "cmd-eyebrow" }, "NEXT"));
+  const pa = view.primary_action || {};
+  const owns = OWNER_LABEL[pa.owner] || "";
+  next.append(el("div", { class: "cmd-owner-line" },
+    pa.owner === "user" ? "Your move" : pa.owner === "hermes" ? "Hermes' move" : "In progress"));
+  next.append(renderPrimaryAction(view, pa));
+  if (view.why_waiting) next.append(el("p", { class: "cmd-why" }, view.why_waiting));
+  // secondary actions
+  const secs = (view.secondary_actions || []);
+  if (secs.length || view.stop_available) {
+    const row = el("div", { class: "cmd-secondary" });
+    for (const a of secs) row.append(renderSecondaryAction(view, a));
+    if (view.stop_available) row.append(renderStopAction(view));
+    next.append(row);
+  }
+  grid.append(next);
+
+  // LAST (latest completed event / output)
+  const last = el("div", { class: "cmd-last" });
+  last.append(el("div", { class: "cmd-eyebrow" }, "LATEST"));
+  const ev = view.latest_event;
+  if (ev && ev.label) {
+    last.append(el("p", { class: "cmd-lastmsg" }, ev.label));
+    const ms = ev.ts ? Date.parse(ev.ts) : NaN;
+    if (!Number.isNaN(ms)) last.append(el("div", { class: "cmd-meta" }, fmtAgo(ms / 1000)));
+  } else {
+    last.append(el("p", { class: "cmd-lastmsg dim" }, "No activity yet."));
+  }
+  // real telemetry when a live job is running (never for fixtures)
+  const id = view.identity || {};
+  if (view.is_live && (id.job || id.tool || id.provider)) {
+    const chips = el("div", { class: "cmd-idchips" });
+    if (id.tool) chips.append(el("span", { class: "idchip" }, id.tool));
+    if (id.provider) chips.append(el("span", { class: "idchip" }, id.provider));
+    if (id.job) chips.append(el("span", { class: "idchip mono" }, "job " + id.job));
+    last.append(chips);
+  }
+  if (view.is_fixture) last.append(el("div", { class: "cmd-fixture" }, "◐ Demo data — no live run"));
+  grid.append(last);
+
+  wrap.append(grid);
+
+  // --- 11-stage stepper ---------------------------------------------------
+  wrap.append(renderStepper(view));
+
+  // --- render availability note (when relevant) ---------------------------
+  const r = view.render || {};
+  if (!r.renderable && r.reason && ["ready_to_produce", "producing", "awaiting_plan_approval"].includes(view.overall_state)) {
+    wrap.append(el("div", { class: "cmd-rendernote" }, "▤ " + r.reason));
+  }
+}
+
+function renderStepper(view) {
+  const nav = el("nav", { class: "cmd-stepper", "aria-label": "Production stages" });
+  for (const st of (view.stages || [])) {
+    const node = el("div", { class: `cmd-step ${st.status}`, title: `${st.label} — ${st.status}` });
+    node.append(el("span", { class: "cmd-step-dot" }, STEP_GLYPH[st.status] || String(st.index + 1)));
+    node.append(el("span", { class: "cmd-step-label" }, st.label));
+    if (st.status === "current" && typeof st.progress === "number" && st.progress > 0) {
+      node.append(el("span", { class: "cmd-step-pct" }, Math.round(st.progress * 100) + "%"));
+    }
+    nav.append(node);
+  }
+  return nav;
+}
+
+function renderConnectionBanner(view) {
+  const conn = view.connection || {};
+  const banner = el("div", { class: `cmd-conn ${conn.status}`, role: "status" });
+  banner.append(el("div", { class: "cmd-conn-text" },
+    el("b", {}, conn.headline || "Hermes connection"),
+    conn.detail ? el("div", { class: "cmd-conn-detail" }, conn.detail) : null));
+  const act = el("button", { class: "cmd-btn small", type: "button" },
+    conn.status === "unreachable" ? "Retry connection" : "Connect Hermes");
+  act.onclick = () => openConnectModal(view);
+  banner.append(act);
+  return banner;
+}
+
+// ---- action wiring ---------------------------------------------------------
+function _statusRepaint(wrap) {
+  lastStatusSig = null;
+  const w = wrap || document.querySelector(".cmd-center");
+  if (w) refreshStatus(w, true);
+}
+
+function renderPrimaryAction(view, pa) {
+  const passive = pa.advances_production === false && ["status", "deliverable"].includes(pa.kind);
+  if (passive && pa.kind === "status") {
+    return el("div", { class: "cmd-primary passive", role: "status" },
+      el("span", { class: "spinner" }), pa.label);
+  }
+  const btn = el("button", { class: "cmd-primary", type: "button" }, pa.label);
+  btn.onclick = () => runStatusAction(view, pa, btn);
+  return btn;
+}
+
+function renderSecondaryAction(view, a) {
+  const btn = el("button", { class: "cmd-btn ghost", type: "button" }, a.label);
+  btn.onclick = () => runStatusAction(view, a, btn);
+  return btn;
+}
+
+function renderStopAction(view) {
+  const btn = el("button", { class: "cmd-btn danger", type: "button" }, "■ Stop production");
+  btn.onclick = () => {
+    if (!window.confirm("Stop this production run? Completed work is preserved.")) return;
+    const brain = !!view.sources.brain_run_id;
+    const url = brain
+      ? `/api/project/${encodedProjectId}/brain/cancel`
+      : `/api/project/${encodedProjectId}/run/cancel`;
+    _doStatusPost(url, { run_id: view.run_id }, btn);
+  };
+  return btn;
+}
+
+async function runStatusAction(view, a, btn) {
+  const P = `/api/project/${encodedProjectId}`;
+  switch (a.id) {
+    case "connect_hermes":
+    case "retry_connect":
+      return openConnectModal(view);
+    case "start":
+    case "continue_hermes":
+    case "restart":
+      return _doStatusPost(`${P}/brain/start`, {}, btn);
+    case "approve_plan":
+      return _doStatusPost(`${P}/run/approve`, { run_id: view.run_id }, btn);
+    case "request_changes":
+      return _doStatusPost(`${P}/run/cancel`, { run_id: view.run_id }, btn,
+        "Send the plan back for changes? The current run stops; nothing is lost.");
+    case "approve":
+      return _doStatusPost(`${P}/brain/approve`,
+        { run_id: view.run_id, approval_id: a.approval_id, stage: a.stage }, btn);
+    case "reject":
+      return _doStatusPost(`${P}/brain/reject`,
+        { run_id: view.run_id, approval_id: a.approval_id, stage: a.stage }, btn);
+    case "retry_stage":
+    case "retry_control":
+      return _doStatusPost(`${P}/brain/retry`, { run_id: view.run_id, stage: a.stage }, btn);
+    case "preview":
+      return _doPreview(btn);
+    case "view_deliverable":
+      { const el0 = document.querySelector(".renders, .render-card"); if (el0) el0.scrollIntoView({ behavior: "smooth" }); return; }
+    default:
+      return _statusRepaint();
+  }
+}
+
+async function _doStatusPost(url, body, btn, confirmMsg) {
+  if (confirmMsg && !window.confirm(confirmMsg)) return;
+  if (btn) { btn.disabled = true; }
+  try {
+    await mpost(url, body || {});
+  } catch (e) {
+    const wrap = document.querySelector(".cmd-center");
+    if (wrap) wrap.append(el("div", { class: "cmd-diag conflict" }, "⚠ " + (e.message || "Action failed.")));
+    if (btn) btn.disabled = false;
+    return;
+  }
+  _statusRepaint();
+}
+
+async function _doPreview(btn) {
+  if (btn) btn.disabled = true;
+  const wrap = document.querySelector(".cmd-center");
+  const note = el("div", { class: "cmd-diag stale" }, "Rendering a free local preview animatic (~20–40s)…");
+  if (wrap) wrap.append(note);
+  try {
+    await mpost(`/api/project/${encodedProjectId}/run/preview`, {});
+  } catch (e) {
+    note.className = "cmd-diag conflict";
+    note.textContent = "⚠ " + (e.message || "Preview render failed.");
+    if (btn) btn.disabled = false;
+    return;
+  }
+  _statusRepaint();
+}
+
+// ---- Connect Hermes guided modal ------------------------------------------
+function openConnectModal(view) {
+  const conn = view.connection || {};
+  modal.textContent = "";
+  modal.classList.add("open");
+  const card = el("div", { class: "cmd-modal" });
+  card.append(el("h3", {}, "Connect Hermes"));
+  card.append(el("p", { class: "hint" },
+    "OpenMontage runs production through the Hermes brain. Point it at your local "
+    + "Mochlet orchestrator (recommended) or an approved endpoint. Your token is stored "
+    + "only in the OS keychain — never printed or written to disk."));
+  const urlIn = el("input", { class: "cmd-input", type: "text",
+    value: conn.suggested_endpoint || conn.endpoint || "http://127.0.0.1:9235",
+    placeholder: "http://127.0.0.1:9235" });
+  const tokIn = el("input", { class: "cmd-input", type: "password", autocomplete: "off",
+    placeholder: "Access token (optional for a local Mochlet)" });
+  card.append(el("label", { class: "cmd-label" }, "Orchestrator endpoint"), urlIn);
+  card.append(el("label", { class: "cmd-label" }, "Token (kept in the OS keychain)"), tokIn);
+  const status = el("div", { class: "cmd-modal-status" });
+  const connectBtn = el("button", { class: "cmd-primary", type: "button" }, "Connect & verify");
+  const cancelBtn = el("button", { class: "cmd-btn ghost", type: "button" }, "Cancel");
+  cancelBtn.onclick = () => modal.classList.remove("open");
+  connectBtn.onclick = async () => {
+    connectBtn.disabled = true;
+    status.className = "cmd-modal-status";
+    status.textContent = "Verifying local Hermes…";
+    try {
+      const res = await mpost(`/api/hermes/connect`,
+        { url: urlIn.value.trim(), token: tokIn.value || undefined });
+      if (res.available) {
+        status.className = "cmd-modal-status ok";
+        status.textContent = "✓ " + (res.headline || "Connected");
+        setTimeout(() => { modal.classList.remove("open"); _statusRepaint(); }, 700);
+      } else {
+        status.className = "cmd-modal-status err";
+        status.textContent = (res.headline || "Couldn't connect") + (res.detail ? " — " + res.detail : "");
+        connectBtn.disabled = false;
+      }
+    } catch (e) {
+      status.className = "cmd-modal-status err";
+      status.textContent = e.message || "Connection failed.";
+      connectBtn.disabled = false;
+    }
+  };
+  card.append(status, el("div", { class: "cmd-modal-actions" }, connectBtn, cancelBtn));
+  modal.append(card);
+}
+
+function _fmtSecs(secs) {
+  if (secs == null) return "";
+  const s = Math.max(0, Math.round(secs));
+  const m = Math.floor(s / 60), r = s % 60;
+  return m ? `${m}:${String(r).padStart(2, "0")}` : `${r}s`;
 }
 
 // ---------------------------------------------------------------------------
@@ -889,26 +1242,6 @@ function renderFoundMedia(s) {
     grid);
 }
 
-function renderNoState(s) {
-  if (s.has_pipeline_state) return null;
-  return el("div", { class: "notice", style: "border-color:#2b2b33;background:var(--surface-2);color:var(--text-3)" },
-    el("span", { style: "font-size:calc(15px * var(--fs-scale))" }, "◌"),
-    el("span", {},
-      el("b", { style: "color:var(--text-2)" }, "No pipeline state. "),
-      "This project has no checkpoints — Backlot is showing what it found on disk. ",
-      "Runs that follow the checkpoint protocol get the full board."));
-}
-
-function renderAwaitingNotice(s) {
-  const awaiting = s.stages.find((x) => x.status === "awaiting_human");
-  if (!awaiting) return null;
-  return el("div", { class: "notice" },
-    el("span", { style: "font-size:calc(16px * var(--fs-scale))" }, "◈"),
-    el("span", {},
-      el("b", {}, `The ${awaiting.name} stage is waiting for your review. `),
-      "The agent is paused at this gate — reply ", el("b", {}, "in chat"), " to approve or request changes."));
-}
-
 // ---------------------------------------------------------------------------
 // replay — scrub a completed run from its timestamps
 // ---------------------------------------------------------------------------
@@ -1080,18 +1413,25 @@ function render() {
   document.body.classList.toggle("first", firstPaint);
   firstPaint = false;
   if (runPollTimer) { clearTimeout(runPollTimer); runPollTimer = null; }
+  if (statusPollTimer) { clearTimeout(statusPollTimer); statusPollTimer = null; }
   app.innerHTML = "";
   app.append(renderSlate(s));
-  app.append(renderRail(s));
-  app.append(renderRunPanel(s));
+  // PRIMARY: the single, dominant command-center card (canonical /status).
+  app.append(renderCommandCenter(s));
+
+  // SECONDARY: the pipeline checkpoint rail + coarse run controls + manual
+  // handoff, collapsed under an expandable "details" section — never the
+  // primary hierarchy. (Open timeline / Agent Queue / manual prompt live here.)
+  const tech = el("details", { class: "tech-details" });
+  tech.append(el("summary", {}, "Production details, checkpoints & tools"));
+  tech.append(renderRail(s));
+  tech.append(renderRunPanel(s));
+  app.append(tech);
+
   const replayBar = renderReplayBar(state);
   if (replayBar) app.append(replayBar);
   const drawer = renderDrawer(s);
   if (drawer) app.append(drawer);
-  const awaitingNotice = renderAwaitingNotice(s);
-  if (awaitingNotice) app.append(awaitingNotice);
-  const noState = renderNoState(s);
-  if (noState) app.append(noState);
 
   const main = el("div", { class: "main-col" });
   const script = renderScriptCard(s);

@@ -107,3 +107,6 @@ venv/
 # dirs; ignore it and the on-demand browser skill so worktrees stay clean.
 .claude/skills/.gitignore
 .claude/skills/browser/
+
+# Local QA scratch (screenshots + harness)
+/qa/
