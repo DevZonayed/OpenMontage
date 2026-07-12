@@ -57,9 +57,14 @@ REQUIRED_TOOLS = (
     "listProjects", "listJobPage", "getJob",
 )
 
-# Job statuses that mean the job is not (re)runnable — retry/dedup fail closed.
+# Job statuses that mean the job is not (re)runnable — dedup fails closed on them.
 _TERMINAL_JOB_STATUSES = frozenset(
     {"cancelled", "canceled", "failed", "error", "done", "completed"})
+
+# A retry is confirmed ONLY when getJob reports one of these KNOWN runnable states
+# (an unknown/empty status is treated as unconfirmed — fail closed).
+_RUNNABLE_JOB_STATUSES = frozenset(
+    {"pending", "running", "queued", "active", "in_progress", "started", "working"})
 
 # Non-secret Mochlet server identity — verify_mcp refuses to mark a foreign MCP
 # server (that merely happens to expose these tool names) as connected.
@@ -295,15 +300,25 @@ class MochletMcpOrchestratorClient:
             raise OrchestratorUnavailable(
                 "Mochlet runJob returned a different job id than requested; retry is "
                 "unconfirmed (refusing to mis-correlate the handle).")
-        # Confirm the job actually moved to a runnable state (not terminal).
+        # Confirm via getJob: the EXACT job must exist AND report a known runnable
+        # state. An unknown/empty status, a missing job, or a different id is
+        # treated as unconfirmed — fail closed.
         job = client.call_tool("getJob", {"id": job_id})
-        status = str((job.get("status") if isinstance(job, dict) else "") or "").lower()
-        if status in _TERMINAL_JOB_STATUSES:
+        if not isinstance(job, dict) or _job_id_of(job) != job_id:
             raise OrchestratorUnavailable(
-                f"Mochlet did not re-run job {job_id} (status '{status}'); retry unconfirmed.")
+                f"getJob did not return the exact job {job_id}; retry unconfirmed.")
+        status = str(job.get("status") or "").lower()
+        if status not in _RUNNABLE_JOB_STATUSES:
+            raise OrchestratorUnavailable(
+                f"Mochlet did not re-run job {job_id} (status '{status or 'unknown'}'); "
+                "retry unconfirmed.")
         session_id = _session_of(job)
+        if not is_uuid(session_id):
+            # Never substitute the job id for the session — fail closed instead.
+            raise OrchestratorUnavailable(
+                f"Could not resolve the re-run job {job_id}'s session; retry unconfirmed.")
         return OrchestratorHandle(
-            session_id=session_id if is_uuid(session_id) else job_id, job_id=job_id,
+            session_id=session_id, job_id=job_id,
             engine=self.engine, detail="Mochlet job re-run (same id)")
 
     def _resume_via_send_chat(self, client: MochletMcpClient, job_id: str) -> OrchestratorHandle:
@@ -325,15 +340,18 @@ class MochletMcpOrchestratorClient:
         if new is None or not is_uuid(new.job_id):
             raise OrchestratorUnavailable(
                 "Mochlet sendChat (resume) returned no successor job handle; resume unconfirmed.")
-        new_session = _session_of(result) or new.session_id
-        if is_uuid(new_session) and new_session != session_id:
-            # Wrong session — compensate the mis-created job and fail closed.
+        # The returned session must EXACTLY equal the requested session. A missing /
+        # malformed / different session breaks handle correlation → fail closed and
+        # cancel the mis-created job (we know its id).
+        new_session = _session_of(result)
+        if new_session != session_id:
             try:
                 self.cancel_job(job_id=new.job_id)
             except Exception:
                 pass
             raise OrchestratorUnavailable(
-                "Resume created a job in a different session; it was cancelled — resume refused.")
+                "Resume did not correlate to the requested session; the created job was "
+                "cancelled — resume refused.")
         if new.job_id == job_id:
             raise OrchestratorUnavailable(
                 "Resume did not produce a successor job on the session; resume unconfirmed.")

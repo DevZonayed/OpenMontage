@@ -118,6 +118,48 @@ def test_retry_refuses_when_job_stays_terminal(tmp_path, monkeypatch):
         c.control_job(job_id=h.job_id, action="retry", idempotency_key="k:retry")
 
 
+@pytest.mark.parametrize("getjob_return", [
+    {"id": "12312312-1231-4231-8231-123123123123", "status": "running"},  # different id
+    {"id": "11111111-1111-4111-8111-111111111111", "status": "unknown"},   # unknown status
+    {"id": "11111111-1111-4111-8111-111111111111"},                        # empty status
+    {"id": "11111111-1111-4111-8111-111111111111", "status": "running"},   # no session
+])
+def test_retry_fails_closed_on_unconfirmed_getjob(tmp_path, monkeypatch, getjob_return):
+    fake = FakeMochletMcp()
+    c = _client(fake, tmp_path)
+    h = c.create_job(project_id="p", run_id="r", requested_duration_seconds=60, idempotency_key="k")
+    # normalize the "different id" case to a real non-matching id
+    from lib.production_brain import mcp_client as mc
+    orig = mc.MochletMcpClient.call_tool
+
+    def patched(self, name, arguments=None):
+        if name == "getJob":
+            return getjob_return
+        return orig(self, name, arguments)
+
+    monkeypatch.setattr(mc.MochletMcpClient, "call_tool", patched)
+    with pytest.raises(OrchestratorUnavailable):
+        c.control_job(job_id=h.job_id, action="retry", idempotency_key="k:retry")
+
+
+def test_resume_fails_closed_on_missing_response_session(tmp_path, monkeypatch):
+    fake = FakeMochletMcp()
+    c = _client(fake, tmp_path)
+    h = c.create_job(project_id="p", run_id="r", requested_duration_seconds=60, idempotency_key="k")
+    from lib.production_brain import mcp_client as mc
+    orig = mc.MochletMcpClient.call_tool
+
+    def patched(self, name, arguments=None):
+        if name == "sendChat" and arguments.get("agentContext", {}).get("control") == "resume":
+            return {"job": {"id": "88888888-8888-4888-8888-888888888888"}}  # NO session
+        return orig(self, name, arguments)
+
+    monkeypatch.setattr(mc.MochletMcpClient, "call_tool", patched)
+    with pytest.raises(OrchestratorUnavailable):
+        c.control_job(job_id=h.job_id, action="resume", idempotency_key="k:resume")
+    assert "88888888-8888-4888-8888-888888888888" in fake.cancelled  # compensated
+
+
 def test_resume_creates_successor_via_sendchat_same_session(tmp_path):
     # Resume = sendChat on the exact session → NEW job, SAME session (not continueSession).
     fake = FakeMochletMcp()
