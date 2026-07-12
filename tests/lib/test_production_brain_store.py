@@ -190,13 +190,18 @@ class TestCancel:
 
 
 class TestTerminalStickiness:
-    def test_events_after_completion_do_not_reanimate(self, tmp_path):
+    def test_events_after_completion_are_rejected(self, tmp_path):
         s = _started(tmp_path)
         s.complete_run("run_1", actual_duration_seconds=60)
-        # A stray stage event must not un-terminalize a completed run.
-        s.event("stage_entered", stage="assets", message="late")
+        n_before = len(s.read_events_raw())
+        # A stray stage event on a terminal run is REJECTED (not silently
+        # persisted) so the authoritative log can't contain impossible events.
+        with pytest.raises(BrainStoreError) as ei:
+            s.event("stage_entered", stage="assets", message="late")
+        assert ei.value.status == 409
         st = s.read_state()
         assert st["state"] == "completed" and st["terminal"] is True
+        assert len(s.read_events_raw()) == n_before  # nothing appended
 
     def test_strict_reduce_rejects_illegal_transition(self, tmp_path):
         st = S.materialize("p", [
@@ -211,6 +216,62 @@ class TestTerminalStickiness:
         with pytest.raises(S.InvalidTransition):
             S.reduce_event(st, {"v": "1.0", "seq": 3, "ts": "t", "type": "stage_entered",
                                 "stage": "assets"}, strict=True)
+
+
+class TestNoImpossibleEvents:
+    def test_event_before_start_is_rejected(self, tmp_path):
+        s = _store(tmp_path)
+        with pytest.raises(BrainStoreError) as ei:
+            s.enter_stage("research")
+        assert ei.value.status == 409
+        assert s.read_events_raw() == []  # log stays empty
+
+    def test_event_with_mismatched_run_id_rejected(self, tmp_path):
+        s = _started(tmp_path)
+        with pytest.raises(BrainStoreError) as ei:
+            s.event("stage_entered", stage="research", run_id="run_WRONG")
+        assert ei.value.status == 409
+
+    def test_lifecycle_after_cancel_is_rejected(self, tmp_path):
+        s = _started(tmp_path)
+        s.cancel("run_1")
+        n = len(s.read_events_raw())
+        for call in (lambda: s.complete_run("run_1"),
+                     lambda: s.fail_run("run_1", error="x"),
+                     lambda: s.retry_stage("render", run_id="run_1"),
+                     lambda: s.grant_approval("run_1")):
+            with pytest.raises(BrainStoreError):
+                call()
+        assert len(s.read_events_raw()) == n  # nothing appended after terminal
+
+
+class TestConcurrentStart:
+    def test_parallel_starts_append_exactly_one_run_started(self, tmp_path):
+        import threading
+
+        d = tmp_path / "proj"
+        d.mkdir()
+        results = []
+
+        def go(i):
+            # Each thread uses its own store instance + unique run id; the shared
+            # file lock must let exactly ONE win the run_started append.
+            st = ProductionBrainStore(d, gen_id=(lambda i=i: f"run_{i}")).start(
+                requested_duration_seconds=60)
+            results.append(st)
+
+        threads = [threading.Thread(target=go, args=(i,)) for i in range(8)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+
+        store = ProductionBrainStore(d)
+        started = [e for e in store.read_events_raw() if e["type"] == "run_started"]
+        assert len(started) == 1, f"expected exactly one run_started, got {len(started)}"
+        winners = [r for r in results if not r.get("already_active")]
+        assert len(winners) == 1
+        assert sum(1 for r in results if r.get("already_active")) == 7
 
 
 class TestCrashRecovery:

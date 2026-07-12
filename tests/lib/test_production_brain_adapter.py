@@ -63,11 +63,35 @@ class TestHermesFailClosed:
         assert st["brain"]["engine"] == "claude"
         assert st["brain"]["agent_id"] == "hermes:claude"
         assert st["brain"]["session_id"] == "sess-abc"
+        # A real session + job identity is attached, and orchestration is honestly
+        # labelled agent-driven (not a background orchestrator claim).
+        assert st["brain"]["orchestration"] == "agent_driven"
+        assert st["brain"]["job_id"]
+        # The run_started event carries the same session + job identity.
+        started = [e for e in s.read_events_raw() if e["type"] == "run_started"][0]
+        assert started["session_id"] == "sess-abc" and started["job_id"] == st["brain"]["job_id"]
+
+    def test_session_is_attached_even_without_caller_id(self, tmp_path):
+        s = _store(tmp_path)
+        h = HermesBrainAdapter(probe=lambda: {"available": True, "engine": "claude"})
+        st = h.start(s, requested_duration_seconds=60)
+        # A genuine (non-None) session id is minted + attached to the run.
+        assert st["brain"]["session_id"]
+        assert st["brain"]["session_id"].startswith("hermes-session_")
+
+    def test_start_message_does_not_claim_online_orchestrator(self, tmp_path):
+        s = _store(tmp_path)
+        h = HermesBrainAdapter(probe=lambda: {"available": True, "engine": "claude"})
+        st = h.start(s, requested_duration_seconds=60)
+        act = (st.get("activity") or "").lower()
+        assert "online" not in act
+        assert "agent-driven" in act
 
     def test_identity_carries_no_secret(self, tmp_path):
         h = HermesBrainAdapter(probe=lambda: {"available": True, "engine": "claude"})
         block = h.identity().to_brain_block()
-        assert set(block) == {"name", "adapter", "available", "agent_id", "session_id", "engine"}
+        assert set(block) == {"name", "adapter", "available", "agent_id",
+                              "session_id", "engine", "orchestration"}
 
 
 class TestFakeBrainDrive:

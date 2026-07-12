@@ -169,29 +169,62 @@ class ProductionBrainStore:
 
     # ---- write path --------------------------------------------------------
     def _append(self, event_fields: dict, *, strict: bool = False) -> dict:
+        """Append one event atomically (acquires the writer lock)."""
         with self._locked():
-            events = self.read_events_raw()
-            seq = self._max_seq(events) + 1
-            ev = {
-                "v": S.SCHEMA_VERSION,
-                "seq": seq,
-                "ts": self._now(),
-            }
-            ev.update({k: v for k, v in event_fields.items() if v is not None})
-            ev = S.redact_event(ev)
-            # Recompute prior state consistently with the log, then fold.
-            prior = self._consistent_state(events, self._max_seq(events))
-            new_state = S.reduce_event(prior, ev, strict=strict)
-            # Append the durable event first, then refresh the cache.
-            with open(self.events_path, "a", encoding="utf-8") as f:
-                f.write(json.dumps(ev, default=str) + "\n")
-                f.flush()
-                try:
-                    os.fsync(f.fileno())
-                except OSError:
-                    pass
-            self._atomic_write_json(self.state_path, new_state)
-            return ev
+            return self._append_locked(event_fields, strict=strict)
+
+    def _append_locked(self, event_fields: dict, *, strict: bool = False) -> dict:
+        """Append one event. CALLER MUST HOLD ``self._locked()`` — this exists so
+        a compound critical section (check-active-then-append) can seq-assign and
+        write without releasing the lock in between (the idempotent-start +
+        no-impossible-event guarantees depend on this atomicity)."""
+        events = self.read_events_raw()
+        seq = self._max_seq(events) + 1
+        ev = {
+            "v": S.SCHEMA_VERSION,
+            "seq": seq,
+            "ts": self._now(),
+        }
+        ev.update({k: v for k, v in event_fields.items() if v is not None})
+        ev = S.redact_event(ev)
+        # Recompute prior state consistently with the log, then fold. A strict
+        # fold raises InvalidTransition BEFORE anything is persisted, so an
+        # impossible event never reaches the durable log.
+        prior = self._consistent_state(events, self._max_seq(events))
+        new_state = S.reduce_event(prior, ev, strict=strict)
+        # Append the durable event first, then refresh the cache.
+        with open(self.events_path, "a", encoding="utf-8") as f:
+            f.write(json.dumps(ev, default=str) + "\n")
+            f.flush()
+            try:
+                os.fsync(f.fileno())
+            except OSError:
+                pass
+        self._atomic_write_json(self.state_path, new_state)
+        return ev
+
+    def _guarded_append(self, event_fields: dict, *, run_id: Optional[str] = None,
+                        require_active: bool = True, strict: bool = True) -> dict:
+        """Validate the run under the SAME lock hold as the append, then append.
+
+        This closes the check-then-act race: two callers can no longer both pass
+        an active-run / pending-approval check and then each append. ``strict``
+        also makes an impossible coarse-state transition raise instead of being
+        silently persisted."""
+        with self._locked():
+            st = self.read_state()
+            if require_active:
+                if st.get("state") not in S.ACTIVE_RUN_STATES:
+                    raise BrainStoreError("There is no active run for this event.", status=409)
+                if run_id is not None and st.get("run_id") != run_id:
+                    raise BrainStoreError("Run id does not match the active run.", status=409)
+            fields = dict(event_fields)
+            fields.setdefault("run_id", st.get("run_id"))
+            fields.setdefault("project_id", self.project_dir.name)
+            try:
+                return self._append_locked(fields, strict=strict)
+            except S.InvalidTransition as exc:
+                raise BrainStoreError(f"invalid transition for this run ({exc})", status=409)
 
     def _consistent_state(self, events: list[dict], max_seq: int) -> dict:
         cached = None
@@ -217,16 +250,16 @@ class ProductionBrainStore:
         requested_duration_seconds: Optional[int] = None,
         agent_id: Optional[str] = None,
         session_id: Optional[str] = None,
+        job_id: Optional[str] = None,
         message: Optional[str] = None,
     ) -> dict:
         """Begin a run. Idempotent: if one is already active, return it with
-        ``already_active=True`` and DO NOT append a second run_started."""
-        with self._locked():
-            st = self.read_state()
-            if st.get("state") in S.ACTIVE_RUN_STATES:
-                out = dict(st)
-                out["already_active"] = True
-                return out
+        ``already_active=True`` and DO NOT append a second run_started.
+
+        The active-run check and the ``run_started`` append happen under a SINGLE
+        lock hold, so two concurrent starts cannot both pass the check and each
+        append — exactly one wins; the other returns ``already_active``."""
+        # Duration validation is pure — do it outside the lock.
         rid = run_id or self._gen_id()
         data: dict = {"brain": brain or {}}
         if requested_duration_seconds is not None:
@@ -239,26 +272,26 @@ class ProductionBrainStore:
             except _dur.DurationError as exc:
                 raise BrainStoreError(str(exc), status=400)
             data["requested_duration_seconds"] = int(requested_duration_seconds)
-        self._append(
-            {
-                "type": "run_started",
-                "run_id": rid,
-                "project_id": self.project_dir.name,
-                "agent_id": agent_id or (brain or {}).get("agent_id"),
-                "session_id": session_id or (brain or {}).get("session_id"),
-                "message": message or "Production run started.",
-                "data": data,
-            }
-        )
+        with self._locked():
+            st = self.read_state()
+            if st.get("state") in S.ACTIVE_RUN_STATES:
+                out = dict(st)
+                out["already_active"] = True
+                return out
+            self._append_locked(
+                {
+                    "type": "run_started",
+                    "run_id": rid,
+                    "project_id": self.project_dir.name,
+                    "agent_id": agent_id or (brain or {}).get("agent_id"),
+                    "session_id": session_id or (brain or {}).get("session_id"),
+                    "job_id": job_id or (brain or {}).get("job_id"),
+                    "message": message or "Production run started.",
+                    "data": data,
+                },
+                strict=True,
+            )
         return self.read_state()
-
-    def _require_active(self, run_id: str) -> dict:
-        st = self.read_state()
-        if st.get("state") not in S.ACTIVE_RUN_STATES:
-            raise BrainStoreError("There is no active run.", status=409)
-        if st.get("run_id") != run_id:
-            raise BrainStoreError("Run id does not match the active run.", status=409)
-        return st
 
     # ---- generic event helpers (used by the adapter/brain) -----------------
     def event(
@@ -274,15 +307,20 @@ class ProductionBrainStore:
         message: Optional[str] = None,
         level: str = "info",
         data: Optional[dict] = None,
+        run_id: Optional[str] = None,
     ) -> dict:
+        """Emit an event for the CURRENT active run.
+
+        Refuses (409) when there is no active run, or when ``run_id`` is given and
+        does not match the active run — so the authoritative log can never contain
+        an event before a run starts or after it is terminal. Uses a strict fold,
+        so an impossible coarse-state transition raises instead of being persisted.
+        """
         if etype not in S.EVENT_TYPES:
             raise BrainStoreError(f"unknown event type: {etype}")
-        st = self.read_state()
-        return self._append(
+        return self._guarded_append(
             {
                 "type": etype,
-                "run_id": st.get("run_id"),
-                "project_id": self.project_dir.name,
                 "stage": stage,
                 "tool": tool,
                 "provider": provider,
@@ -292,7 +330,10 @@ class ProductionBrainStore:
                 "message": message,
                 "level": level,
                 "data": data,
-            }
+            },
+            run_id=run_id,
+            require_active=True,
+            strict=True,
         )
 
     # thin, self-documenting wrappers -------------------------------------------------
@@ -351,31 +392,38 @@ class ProductionBrainStore:
     def grant_approval(self, run_id: str, *, approval_id: Optional[str] = None,
                        stage: Optional[str] = None, by: Optional[str] = None,
                        note: Optional[str] = None) -> dict:
-        st = self._require_active(run_id)
-        target = self._resolve_pending_approval(st, approval_id, stage)
-        if target is None:
-            raise BrainStoreError("There is no pending approval to grant.", status=409)
-        self._append({
-            "type": "approval_granted", "run_id": run_id, "project_id": self.project_dir.name,
-            "stage": target["stage"], "by": by,
-            "message": f"Approved: {S.STAGE_TITLES.get(target['stage'], target['stage'])}.",
-            "data": {"approval_id": target["approval_id"], "by": by, "note": note},
-        })
-        return self.read_state()
+        return self._decide_approval(run_id, granted=True, approval_id=approval_id,
+                                    stage=stage, by=by, note=note)
 
     def reject_approval(self, run_id: str, *, approval_id: Optional[str] = None,
                         stage: Optional[str] = None, by: Optional[str] = None,
                         note: Optional[str] = None) -> dict:
-        st = self._require_active(run_id)
-        target = self._resolve_pending_approval(st, approval_id, stage)
-        if target is None:
-            raise BrainStoreError("There is no pending approval to reject.", status=409)
-        self._append({
-            "type": "approval_rejected", "run_id": run_id, "project_id": self.project_dir.name,
-            "stage": target["stage"], "by": by,
-            "message": f"Rejected: {S.STAGE_TITLES.get(target['stage'], target['stage'])}.",
-            "data": {"approval_id": target["approval_id"], "by": by, "note": note},
-        })
+        return self._decide_approval(run_id, granted=False, approval_id=approval_id,
+                                    stage=stage, by=by, note=note)
+
+    def _decide_approval(self, run_id: str, *, granted: bool, approval_id: Optional[str],
+                         stage: Optional[str], by: Optional[str], note: Optional[str]) -> dict:
+        # Resolve the pending approval + append the decision under ONE lock hold,
+        # so a concurrent grant/reject/cancel can't race the resolution.
+        verb = "grant" if granted else "reject"
+        with self._locked():
+            st = self.read_state()
+            if st.get("state") not in S.ACTIVE_RUN_STATES:
+                raise BrainStoreError("There is no active run.", status=409)
+            if st.get("run_id") != run_id:
+                raise BrainStoreError("Run id does not match the active run.", status=409)
+            target = self._resolve_pending_approval(st, approval_id, stage)
+            if target is None:
+                raise BrainStoreError(f"There is no pending approval to {verb}.", status=409)
+            self._append_locked({
+                "type": "approval_granted" if granted else "approval_rejected",
+                "run_id": run_id, "project_id": self.project_dir.name,
+                "stage": target["stage"], "by": by,
+                "message": (f"Approved: {S.STAGE_TITLES.get(target['stage'], target['stage'])}."
+                            if granted else
+                            f"Rejected: {S.STAGE_TITLES.get(target['stage'], target['stage'])}."),
+                "data": {"approval_id": target["approval_id"], "by": by, "note": note},
+            }, strict=True)
         return self.read_state()
 
     @staticmethod
@@ -395,58 +443,52 @@ class ProductionBrainStore:
 
     def retry_stage(self, stage: str, *, run_id: Optional[str] = None,
                     message: Optional[str] = None) -> dict:
-        st = self.read_state()
-        if st.get("state") not in S.ACTIVE_RUN_STATES:
-            raise BrainStoreError("There is no active run to retry.", status=409)
-        if run_id is not None and st.get("run_id") != run_id:
-            raise BrainStoreError("Run id does not match the active run.", status=409)
         if stage not in S.STAGES:
             raise BrainStoreError(f"unknown stage: {stage}")
-        self._append({
-            "type": "retry", "run_id": st.get("run_id"), "project_id": self.project_dir.name,
-            "stage": stage, "message": message or f"Retrying {S.STAGE_TITLES.get(stage, stage)}.",
-        })
+        self._guarded_append({
+            "type": "retry", "stage": stage,
+            "message": message or f"Retrying {S.STAGE_TITLES.get(stage, stage)}.",
+        }, run_id=run_id, require_active=True, strict=True)
         return self.read_state()
 
     def resume(self, *, message: Optional[str] = None) -> dict:
         """Reconcile + continue a run after a restart. Recomputes the state from
         the durable log (crash recovery) and records a resume marker if active."""
-        st = self.read_state()
-        if st.get("state") in S.ACTIVE_RUN_STATES:
-            self._append({
-                "type": "resume", "run_id": st.get("run_id"), "project_id": self.project_dir.name,
-                "message": message or "Run resumed after restart.",
-            })
+        with self._locked():
+            st = self.read_state()
+            if st.get("state") in S.ACTIVE_RUN_STATES:
+                self._append_locked({
+                    "type": "resume", "run_id": st.get("run_id"),
+                    "project_id": self.project_dir.name,
+                    "message": message or "Run resumed after restart.",
+                }, strict=True)
         return self.read_state()
 
     def complete_run(self, run_id: str, *, actual_duration_seconds: Optional[float] = None,
                      message: Optional[str] = None) -> dict:
-        self._require_active(run_id)
         data = {}
         if actual_duration_seconds is not None:
             data["actual_duration_seconds"] = actual_duration_seconds
-        self._append({
+        self._guarded_append({
             "type": "run_completed", "run_id": run_id, "project_id": self.project_dir.name,
             "message": message or "Production run completed.", "data": data,
-        })
+        }, run_id=run_id, require_active=True, strict=True)
         return self.read_state()
 
     def fail_run(self, run_id: str, *, error: str, message: Optional[str] = None) -> dict:
-        self._require_active(run_id)
-        self._append({
+        self._guarded_append({
             "type": "run_failed", "run_id": run_id, "project_id": self.project_dir.name,
             "level": "error", "message": message or "Production run failed.",
             "data": {"error": error},
-        })
+        }, run_id=run_id, require_active=True, strict=True)
         return self.read_state()
 
     def cancel(self, run_id: str, *, message: Optional[str] = None) -> dict:
         """Cancel the EXACT active run. Project-scoped; touches nothing else."""
-        self._require_active(run_id)
-        self._append({
+        self._guarded_append({
             "type": "run_cancelled", "run_id": run_id, "project_id": self.project_dir.name,
             "message": message or "Production run cancelled. Completed work is preserved.",
-        })
+        }, run_id=run_id, require_active=True, strict=True)
         return self.read_state()
 
     # ---- read payload (enriched with live elapsed) ------------------------

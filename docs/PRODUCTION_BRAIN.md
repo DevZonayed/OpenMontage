@@ -98,7 +98,8 @@ is exactly how crash/restart recovery works.
 |---|---|
 | Atomic, durable writes | events appended + fsync'd, then `state.json` written via temp+`os.replace`, all under an advisory file lock |
 | Monotonic ordering | `seq` assigned under the lock from the max seq in the log |
-| Idempotent start | one active run per project; a duplicate `start` returns the active run with `already_active=true` and appends nothing |
+| Idempotent start | one active run per project; the active-run check and the `run_started` append happen under a **single lock hold**, so two concurrent starts cannot both append — exactly one wins, the rest get `already_active=true` |
+| No impossible events | every event is validated against the current run **under the same lock** as its append: an event before a run starts, after it is terminal, or with a mismatched `run_id` is **rejected (409), not persisted**. Strict folding also rejects an impossible coarse-state transition before it reaches the log |
 | Project-scoped cancel | validates the **exact** `run_id`; touches only this project |
 | Retry / resume | `retry` reopens a failed/blocked stage; `resume` recomputes state from the log and continues |
 | Crash recovery | `state.json` is always rebuildable from `run_events.jsonl`; a torn trailing line is skipped |
@@ -169,11 +170,19 @@ scene_density, editing_patterns`. Every preference records provenance
 `lib/production_brain/adapter.py` defines the **secure, explicit** brain contract:
 
 - `HermesBrainAdapter` — the real brain. Availability is probed from the
-  subscription-engine layer (`lib.engines`): it is available only when a
-  consumer-plan engine is actually signed in. If not, `.start()` raises
-  `BrainUnavailable` and **no run is opened** — the API returns `409` instead of
-  fabricating progress. Identity (`name, adapter, available, agent_id,
-  session_id, engine`) is non-secret and stamped onto every event.
+  subscription-engine layer (`lib.engines`): a signed-in consumer-plan engine is
+  the **precondition** for the brain — `available` is *not* a claim that an
+  orchestrator is running. If no engine is signed in, `.start()` raises
+  `BrainUnavailable` and **no run is opened** (API `409`). When it opens a run it
+  attaches a **real, non-secret session + job identity** (a session id is minted
+  if the caller supplies none) and stamps `orchestration: "agent_driven"` into
+  the brain block. **Honesty:** opening a run does not run an LLM or drive stages —
+  OpenMontage has no internal LLM layer; the Hermes *agent* (this session)
+  advances stages as it works. The start activity says so explicitly ("agent-driven
+  … no autonomous background orchestrator is running") — the API never implies a
+  green "brain online" without work actually happening. Identity fields
+  (`name, adapter, available, agent_id, session_id, engine, orchestration`) are
+  non-secret and stamped onto every event.
 - `FakeBrain` — deterministic, offline, **never calls a paid service**. Its
   `.drive(store, requested_duration_seconds, approver=…, stop_after=…)` walks the
   whole stage machine, emitting ordered stage/tool/decision/output/approval

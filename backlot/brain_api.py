@@ -92,8 +92,10 @@ def start_run(project_dir: Path, body: dict, *, adapter=None) -> dict:
     store = _store(project_dir)
     target = _intake_target(project_dir)
     try:
-        state = adapter.start(store, requested_duration_seconds=target,
-                             message="Start Production — Hermes brain online.")
+        # No message override: the adapter emits the HONEST default — the run is
+        # opened + a real session/job attached, but stages advance only as the
+        # agent-driven brain works (no "online orchestrator" claim).
+        state = adapter.start(store, requested_duration_seconds=target)
     except BrainUnavailable as exc:
         # Honest, structured blocker instead of a fabricated run.
         raise BrainApiError(str(exc), status=409)

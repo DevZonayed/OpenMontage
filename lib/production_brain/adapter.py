@@ -35,6 +35,12 @@ class BrainUnavailable(RuntimeError):
     """Raised when the brain cannot orchestrate — the run must NOT proceed."""
 
 
+def _mint_id(prefix: str) -> str:
+    import secrets
+
+    return f"{prefix}_" + secrets.token_hex(4)
+
+
 @dataclass
 class BrainIdentity:
     name: str = "hermes"
@@ -44,6 +50,14 @@ class BrainIdentity:
     session_id: Optional[str] = None
     engine: Optional[str] = None
     detail: Optional[str] = None
+    # How this run is actually driven. Truthful, non-secret:
+    #   "agent_driven" — OpenMontage has no internal LLM; the Hermes AGENT (this
+    #                    session) advances stages as it works — NOT a background
+    #                    autonomous process. ``available`` is only the precondition
+    #                    (a subscription engine is signed in), never a claim that
+    #                    an orchestrator is running unattended.
+    #   "fake_driver"  — the deterministic offline brain genuinely drives the run.
+    orchestration: str = "agent_driven"
 
     def to_brain_block(self) -> dict:
         # Only non-secret identity fields ever leave this method.
@@ -54,6 +68,7 @@ class BrainIdentity:
             "agent_id": self.agent_id,
             "session_id": self.session_id,
             "engine": self.engine,
+            "orchestration": self.orchestration,
         }
 
 
@@ -81,11 +96,18 @@ class BrainAdapter:
         run_id: Optional[str] = None,
         requested_duration_seconds: Optional[int] = None,
         message: Optional[str] = None,
+        job_id: Optional[str] = None,
     ) -> dict:
-        """Start a run on ``store`` under this brain's identity — or fail closed.
+        """Open a run on ``store`` under this brain's identity — or fail closed.
 
-        If the brain is unavailable this raises :class:`BrainUnavailable` and
-        does NOT start a run (no fabricated progress).
+        Fail-closed: if the brain is unavailable this raises
+        :class:`BrainUnavailable` and does NOT open a run.
+
+        Honesty: opening a run attaches a real, non-secret session + job identity,
+        but it does NOT itself run an LLM or drive stages. The default message and
+        the ``orchestration`` field make explicit that stages advance only as the
+        (agent-driven) brain does the work — the API never implies a background
+        orchestrator is running unattended.
         """
         if not self.available():
             raise BrainUnavailable(
@@ -93,14 +115,28 @@ class BrainAdapter:
                 "orchestrated. Sign in to the brain engine and retry."
             )
         ident = self.identity()
+        job = job_id or _mint_id("job")
+        brain_block = {**ident.to_brain_block(), "job_id": job}
+        default_msg = self._start_message(ident, job)
         return store.start(
             run_id=run_id,
-            brain=ident.to_brain_block(),
+            brain=brain_block,
             requested_duration_seconds=requested_duration_seconds,
             agent_id=ident.agent_id,
             session_id=ident.session_id,
-            message=message,
+            job_id=job,
+            message=message or default_msg,
         )
+
+    def _start_message(self, ident: "BrainIdentity", job: str) -> str:
+        if ident.orchestration == "agent_driven":
+            eng = f" (engine {ident.engine})" if ident.engine else ""
+            return (
+                f"Production run opened under the {ident.name} brain{eng}. "
+                "Orchestration is agent-driven (Rule Zero): stages advance as the "
+                "agent works — no autonomous background orchestrator is running."
+            )
+        return f"{ident.name} brain (offline driver) starting production."
 
 
 # --------------------------------------------------------------------------- #
@@ -116,11 +152,14 @@ def _default_probe() -> dict:
         return {"available": False, "engine": None, "detail": f"engine probe failed: {exc.__class__.__name__}"}
     ready = list(summary.get("subscription_ready") or [])
     # Hermes prefers the Claude engine but any ready subscription engine can back it.
+    # NOTE: this is only the PRECONDITION for the brain (an engine is signed in) —
+    # it is not, and must not be reported as, proof that an orchestrator is running.
     engine = "claude" if "claude" in ready else (ready[0] if ready else None)
     return {
         "available": bool(ready),
         "engine": engine,
-        "detail": (f"brain backed by '{engine}' subscription engine"
+        "detail": (f"'{engine}' subscription engine signed in — Hermes brain "
+                   "precondition met; orchestration is agent-driven"
                    if engine else "no subscription-ready brain engine is signed in"),
     }
 
@@ -144,9 +183,10 @@ class HermesBrainAdapter(BrainAdapter):
         agent_id: Optional[str] = None,
     ) -> None:
         self._probe = probe
-        self._session_id = session_id
+        self._session_id = session_id  # caller-supplied stable id, if any
         self._agent_id = agent_id
         self._cache: Optional[dict] = None
+        self._minted_session: Optional[str] = None
 
     def _probed(self) -> dict:
         if self._cache is None:
@@ -159,6 +199,18 @@ class HermesBrainAdapter(BrainAdapter):
     def available(self) -> bool:
         return bool(self._probed().get("available"))
 
+    def _session(self) -> Optional[str]:
+        # A caller-supplied session wins (reproducible). Otherwise, once the brain
+        # is available, attach a real (non-secret) session id and cache it so the
+        # run carries a genuine orchestrator session identity rather than None.
+        if self._session_id:
+            return self._session_id
+        if not self.available():
+            return None
+        if self._minted_session is None:
+            self._minted_session = _mint_id("hermes-session")
+        return self._minted_session
+
     def identity(self) -> BrainIdentity:
         p = self._probed()
         engine = p.get("engine")
@@ -167,9 +219,10 @@ class HermesBrainAdapter(BrainAdapter):
             adapter="hermes",
             available=bool(p.get("available")),
             agent_id=self._agent_id or (f"hermes:{engine}" if engine else None),
-            session_id=self._session_id,
+            session_id=self._session(),
             engine=engine,
             detail=p.get("detail"),
+            orchestration="agent_driven",
         )
 
 
@@ -210,6 +263,7 @@ class FakeBrain(BrainAdapter):
         return BrainIdentity(
             name="hermes", adapter="fake", available=True,
             agent_id=self._agent_id, session_id=self._session_id, engine="fake",
+            orchestration="fake_driver",
             detail="deterministic offline brain (no paid services)",
         )
 
@@ -264,9 +318,10 @@ class FakeBrain(BrainAdapter):
             import time as _time
 
             sleep = _time.sleep
+        # The fake brain genuinely drives the run, so its honest default message
+        # ("offline driver starting production") applies — no message override.
         state = self.start(store, run_id=run_id,
-                           requested_duration_seconds=requested_duration_seconds,
-                           message="Hermes brain online — starting production.")
+                           requested_duration_seconds=requested_duration_seconds)
         rid = state["run_id"]
         ident = self.identity()
         ev_kw = {"agent_id": ident.agent_id, "session_id": ident.session_id}
