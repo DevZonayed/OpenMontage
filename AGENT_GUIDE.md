@@ -226,6 +226,16 @@ At pipeline initialization, before any stage runs:
 
 All tools and agents must write outputs to these paths — **always pass an explicit `output_path` under `projects/<project-id>/`**. Assets written to the repo root, cwd, or temp dirs are invisible to the user's board and violate the workspace contract.
 
+### Project Intake (`intake.json`)
+
+When a project is created from the Backlot **New project** UI (or `lib.project_intake.create_project`), the workspace also gets a small **`projects/<id>/intake.json`** — the user's raw request captured *before* any stage runs. It is the minimal, documented intake contract (v1.0):
+
+```json
+{ "version": "1.0", "project_id": "...", "title": "...", "brief": "<the user's topic/brief>", "pipeline_type": "...", "created_at": "<ISO-8601>" }
+```
+
+**If `intake.json` is present, start there:** read the `brief`, then run the mandatory preflight and the pipeline stages against it (idea/research → proposal → …). Creating the workspace is *operational* and does NOT start production — production is agent-driven per Rule Zero. The board's new-project empty state surfaces a "Copy production prompt" built from this brief. Read it with `lib.project_intake.read_intake(project_dir)`.
+
 **This applies to atelier and HyperFrames-skill runs too**: hand-authored compositions still write the canonical artifacts they have (script or beats-plan, scene_plan-equivalent, asset manifest) plus checkpoints into `projects/<project-id>/`. The board is runtime-agnostic; only runs that skip the artifacts get a degraded board.
 
 ## Music Library
@@ -297,6 +307,17 @@ Then:
 3. Check `fallback_tools` for unavailable tools.
 4. Report one of: `passed`, `degraded`, or `blocked`.
 5. Do not start production until the user understands the real capability envelope.
+
+### Engine & Provider Preferences (Honor at Preflight)
+
+`provider_menu_summary()` includes a `provider_preferences` block — the user's saved choices from the Backlot settings page (`/settings`). **These are binding preferences you MUST honor**, not suggestions:
+
+- `subscription_first` — when true, prefer the user's consumer-subscription engines (Claude Code / Codex OAuth) over paid per-call APIs for text/reasoning work.
+- `purposes.{master,reviewer,script,code}` — the preferred engine (+ optional model + fallback order) for each kind of work. When you delegate or shell out to a coding engine, use the effective engine for that purpose.
+- `image` / `video` — the preferred generation provider (+ fallback). **The `image_selector` and `video_selector` already consume these automatically** — when you call a selector without an explicit `preferred_provider`, it routes to the saved provider and records `preference_source: "saved_preference"`. Do not override a saved provider without telling the user.
+- `preferred_render_runtime` / `authoring_mode` — the user's default composition runtime + authoring mode. This is a *global default preference*, an input to the per-project `render_runtime` lock at proposal — it is **not** the lock itself (the lock still records explicit approval and all considered runtimes; see "Present Both Composition Runtimes").
+
+For **live engine auth state** (which subscription is actually logged in right now), read `lib.engines.engines_summary()` and compute the effective per-purpose engine with `lib.provider_prefs.effective_text_engines(prefs, engines)`. OpenMontage has no internal LLM-calling layer by design — honoring text-engine preferences is instruction-driven: you read the effective routing and act on it.
 
 ### Provider Menu (Mandatory at Preflight)
 

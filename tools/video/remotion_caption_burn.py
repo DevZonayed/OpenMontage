@@ -7,7 +7,7 @@ burning if Remotion is not available.
 The tool:
 1. Converts word-level transcript segments to Remotion WordCaption JSON
 2. Writes a props file for the TalkingHead composition
-3. Renders via ``npx remotion render``
+3. Renders via the pinned local Remotion CLI (``node_modules/.bin/remotion``)
 4. Returns the captioned video path
 
 Fallback: if Remotion is unavailable, burns subtitles at the bottom of
@@ -170,10 +170,13 @@ class RemotionCaptionBurn(BaseTool):
         return None
 
     def _remotion_available(self) -> bool:
-        return (
-            shutil.which("npx") is not None
-            and self._find_remotion_root() is not None
-        )
+        # Render-ready check via the shared runtime doctor (pinned local CLI +
+        # browser), not global npx.
+        try:
+            from lib import remotion_runtime as _rr
+            return _rr.is_available()
+        except Exception:
+            return False
 
     # ------------------------------------------------------------------ #
     #  Word caption conversion
@@ -324,11 +327,11 @@ class RemotionCaptionBurn(BaseTool):
         props_file = props_dir / f"caption-burn-{Path(input_path).stem}.json"
         props_file.write_text(json.dumps(props, indent=2), encoding="utf-8")
 
-        # Render (use npx.cmd on Windows for subprocess compatibility)
-        import sys
-        npx_bin = "npx.cmd" if sys.platform == "win32" else "npx"
+        # Render via the PINNED local Remotion CLI (never `npx`, which can hit the
+        # network when local resolution breaks), pointed at the resolved browser.
+        from lib import remotion_runtime as _rr
         render_cmd = [
-            npx_bin, "remotion", "render",
+            str(_rr.cli_bin_path()), "render",
             "TalkingHead",
             f"--props={props_file.relative_to(root)}",
             f"--width={width}", f"--height={height}", "--fps=30",
@@ -336,6 +339,9 @@ class RemotionCaptionBurn(BaseTool):
             "--codec=h264", "--crf=18",
             f"--output={str(Path(output_path).resolve())}",
         ]
+        _be = _rr.browser_executable()
+        if _be:
+            render_cmd.append(f"--browser-executable={_be}")
         self.run_command(render_cmd, cwd=str(root))
 
         if not Path(output_path).exists():

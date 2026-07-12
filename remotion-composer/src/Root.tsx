@@ -16,6 +16,8 @@ import { ProductReveal, ProductRevealProps } from "./components/ProductReveal";
 import { CaptionOverlay, WordCaption } from "./components/CaptionOverlay";
 import { CollageBurst, CollageBurstProps } from "./CollageBurst";
 import { LyricOverlay, LyricOverlayProps } from "./LyricOverlay";
+import { PreviewAnimatic, previewAnimaticDefaults } from "./PreviewAnimatic";
+import { TimelineFrame, TimelineFrameProps, timelineFrameDefaults } from "./TimelineComposition";
 
 // ---------------------------------------------------------------------------
 // Theme System — prevents every video from looking like dark fintech
@@ -295,6 +297,35 @@ export const Root: React.FC = () => {
           lyrics: [],
           bottomY: 0.88,
         } as LyricOverlayProps}
+      />
+      <Composition
+        id="PreviewAnimatic"
+        component={PreviewAnimatic}
+        durationInFrames={360}
+        fps={30}
+        width={1920}
+        height={1080}
+        defaultProps={previewAnimaticDefaults}
+      />
+      <Composition
+        id="TimelineFrame"
+        component={TimelineFrame}
+        // Dimensions/duration come from the timeline props via calculateMetadata;
+        // these are only fallbacks for the Studio default preview.
+        durationInFrames={300}
+        fps={30}
+        width={1920}
+        height={1080}
+        defaultProps={timelineFrameDefaults}
+        calculateMetadata={({ props }) => {
+          const t = (props as TimelineFrameProps).timeline || {};
+          return {
+            durationInFrames: Math.max(1, Math.round(t.total_frames || 300)),
+            fps: t.fps || 30,
+            width: Math.round(t.width || 1920),
+            height: Math.round(t.height || 1080),
+          };
+        }}
       />
       <Composition
         id="EndTag"

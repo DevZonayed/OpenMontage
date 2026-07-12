@@ -654,20 +654,41 @@ class HyperFramesCompose(BaseTool):
             )
 
         workspace = self._require_workspace(inputs)
-        output_path = Path(inputs.get("output_path") or (workspace / "renders" / "final.mp4"))
+        # Resolve to an ABSOLUTE path: the CLI runs with cwd=workspace, so a
+        # relative --output would land inside the workspace instead of where the
+        # caller intended (repo-relative). Resolve against the caller's cwd.
+        output_path = Path(inputs.get("output_path") or (workspace / "renders" / "final.mp4")).resolve()
         output_path.parent.mkdir(parents=True, exist_ok=True)
 
         steps: dict[str, Any] = {}
 
-        # 1. Scaffold — generate HTML/CSS/assets.
-        scaffold = self._scaffold(inputs)
-        steps["scaffold"] = scaffold.data
-        if not scaffold.success:
-            return ToolResult(
-                success=False,
-                error=f"Scaffold failed: {scaffold.error}",
-                data={"steps": steps},
-            )
+        # 1. Author the composition. Two modes:
+        #    - templated (default): scaffold HTML/CSS from edit_decisions cuts.
+        #    - prebuilt/atelier: the agent hand-authored index.html already (the
+        #      bespoke HyperFrames path). Skip scaffolding entirely — closing the
+        #      documented gap (bespoke-composition.md "Known gap (F13)") where the
+        #      tool used to require cuts[] and errored on hand-authored compositions.
+        if inputs.get("prebuilt"):
+            index = workspace / "index.html"
+            if not index.is_file():
+                return ToolResult(
+                    success=False,
+                    error=(
+                        f"prebuilt=True but no hand-authored composition at {index}. "
+                        "Author index.html (HyperFrames data-* contract) in the workspace "
+                        "before rendering the atelier path."
+                    ),
+                )
+            steps["scaffold"] = {"mode": "prebuilt", "index_html": str(index)}
+        else:
+            scaffold = self._scaffold(inputs)
+            steps["scaffold"] = scaffold.data
+            if not scaffold.success:
+                return ToolResult(
+                    success=False,
+                    error=f"Scaffold failed: {scaffold.error}",
+                    data={"steps": steps},
+                )
 
         # 2. Lint — static contract checks.
         lint = self._lint({"workspace_path": str(workspace)})
@@ -1102,13 +1123,25 @@ class HyperFramesCompose(BaseTool):
             )
             return html, None
 
-        placeholder = self._escape_text(text or cut.get("reason") or f"Scene {index + 1}")
+        # Text-card fallback: a cut with no recognizable media source (no image/
+        # video/html extension) renders as a text card. Display copy comes ONLY
+        # from explicit display fields (`text`/`title`, read into `text` above) —
+        # never from `cut.reason`, which is internal editorial rationale and must
+        # not leak on screen. With no explicit copy we render a neutral numbered
+        # placeholder (clearly not content). A gentle GSAP entrance (fade + lift)
+        # matches the explicit text_card so caption-driven compositions animate.
+        display = text or f"Scene {index + 1}"
+        placeholder = self._escape_text(display)
         html = (
             f'<div id="{cut_id}" class="clip text-card" '
             f'data-start="{self._f(in_s)}" data-duration="{self._f(duration)}" '
             f'data-track-index="1"><h1>{placeholder}</h1></div>'
         )
-        return html, None
+        tween = (
+            f'tl.from("#{cut_id} h1", {{ y: 40, opacity: 0, duration: 0.6, '
+            f'ease: "power3.out" }}, {self._f(in_s + 0.1)});'
+        )
+        return html, tween
 
     # ------------------------------------------------------------------
     # Utilities

@@ -6,7 +6,8 @@ at proposal stage.
 
 Routing is driven by `edit_decisions.render_runtime` (locked at proposal):
 
-- `remotion`   → React-based frame-accurate render via `npx remotion render`.
+- `remotion`   → React-based frame-accurate render via the pinned local
+  Remotion CLI (`remotion-composer/node_modules/.bin/remotion`), never `npx`.
                  Handles the existing scene-component stack, word-level captions,
                  TalkingHead/CinematicRenderer. Current default.
 - `hyperframes` → HTML/CSS/GSAP render via `hyperframes_compose`.
@@ -227,19 +228,14 @@ class VideoCompose(BaseTool):
     ]
 
     def _remotion_available(self) -> bool:
-        """Check if Remotion rendering is available (requires npx + composer project + node_modules)."""
-        import shutil as _shutil
-
-        if not _shutil.which("npx"):
+        """Genuinely render-ready? Delegates to the runtime doctor (node + local
+        package parity + entry + a usable browser). NOT a bare directory stat, and
+        NOT dependent on global npx (render uses the pinned local CLI)."""
+        try:
+            from lib import remotion_runtime as _rr
+            return _rr.is_available()
+        except Exception:
             return False
-        composer_dir = Path(__file__).resolve().parent.parent.parent / "remotion-composer"
-        if not composer_dir.exists() or not (composer_dir / "package.json").exists():
-            return False
-        # Check that node_modules are actually installed — without this,
-        # npx remotion render will fail even though the project exists.
-        if not (composer_dir / "node_modules").exists():
-            return False
-        return True
 
     def _ffmpeg_available(self) -> bool:
         """Check if the ffmpeg binary is actually resolvable on PATH."""
@@ -804,7 +800,10 @@ class VideoCompose(BaseTool):
         output_path = Path(inputs.get("output_path", "renders/output.mp4")).resolve()
         output_path.parent.mkdir(parents=True, exist_ok=True)
 
-        cmd = ["npx", "remotion", "render", str(effective_entry), str(comp_id), str(output_path)]
+        # Pinned local CLI (never `npx`, which can fetch from the network when
+        # local resolution breaks).
+        from lib import remotion_runtime as _rr
+        cmd = [str(_rr.cli_bin_path()), "render", str(effective_entry), str(comp_id), str(output_path)]
 
         props_path = bespoke.get("props_path")
         if props_path:
@@ -827,9 +826,11 @@ class VideoCompose(BaseTool):
         if bespoke.get("concurrency"):
             cmd.append(f"--concurrency={bespoke['concurrency']}")
 
+        _be = _rr.browser_executable()
+        if _be:
+            cmd.append(f"--browser-executable={_be}")
         try:
-            # Run from inside the composer dir so npx resolves the local
-            # remotion binary (mirrors _remotion_render).
+            # Runs the pinned local remotion binary from inside the composer dir.
             self.run_command(cmd, timeout=1800, cwd=composer_dir)
         except Exception as e:
             return ToolResult(success=False, error=f"Atelier (bespoke) Remotion render failed: {e}")
@@ -1356,6 +1357,18 @@ class VideoCompose(BaseTool):
         if render_runtime == "remotion" and remotion_atelier_requested:
             return self._render_via_atelier(inputs, edit_decisions)
 
+        # HyperFrames atelier: the agent hand-authored index.html (bespoke path).
+        # No cuts[]/asset_manifest required — the composition owns its assets.
+        # Closes the documented gap in skills/meta/bespoke-composition.md ("Known
+        # gap (F13)") so hand-authored HF compositions render through the governed
+        # video_compose router, not a raw npx call.
+        hyperframes_atelier_requested = (
+            edit_decisions.get("composition_mode") == "atelier"
+            or edit_decisions.get("renderer_family") == "bespoke"
+        )
+        if render_runtime == "hyperframes" and hyperframes_atelier_requested:
+            return self._render_via_hyperframes_atelier(inputs, edit_decisions)
+
         if not asset_manifest:
             return ToolResult(success=False, error="asset_manifest required for render")
 
@@ -1490,6 +1503,77 @@ class VideoCompose(BaseTool):
                     data=render_result.data,
                 )
 
+        return render_result
+
+    def _render_via_hyperframes_atelier(
+        self, inputs: dict[str, Any], edit_decisions: dict[str, Any]
+    ) -> ToolResult:
+        """Render a HAND-AUTHORED HyperFrames composition (bespoke/atelier path).
+
+        The agent authored ``<workspace>/index.html`` to the HyperFrames data-*
+        contract; we render it as-is (no scaffold from cuts). Governance is
+        identical to the templated HF path: an unavailable/failed runtime is a
+        structured blocker, never a silent swap.
+        """
+        if not self._hyperframes_available():
+            return ToolResult(
+                success=False,
+                error=(
+                    "render_runtime='hyperframes' + composition_mode='atelier' was "
+                    "locked, but the HyperFrames runtime is not available on this "
+                    "machine. Per governance this is a BLOCKER — surface it and get "
+                    "approval before switching runtime (needs Node >= 22, ffmpeg, npx)."
+                ),
+            )
+        try:
+            from tools.video.hyperframes_compose import HyperFramesCompose
+        except Exception as e:
+            return ToolResult(success=False, error=f"Could not import hyperframes_compose: {e}")
+
+        output_path = Path(inputs.get("output_path", "renders/output.mp4"))
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        workspace_path = inputs.get("workspace_path") or str(output_path.parent.parent / "hyperframes")
+
+        hf_inputs: dict[str, Any] = {
+            "operation": "render",
+            "prebuilt": True,  # hand-authored composition; skip scaffold
+            "workspace_path": workspace_path,
+            "output_path": str(output_path),
+        }
+        for k in ("profile", "quality", "fps", "strict", "skip_contrast"):
+            if k in inputs:
+                hf_inputs[k] = inputs[k]
+
+        render_result = HyperFramesCompose().execute(hf_inputs)
+        if not render_result.success:
+            return ToolResult(
+                success=False,
+                error=(
+                    f"HyperFrames atelier render failed: {render_result.error}. Per "
+                    "governance: do NOT silently fall back to Remotion or FFmpeg."
+                ),
+                data=render_result.data,
+            )
+
+        if output_path.exists():
+            final_review = self._run_final_review(
+                output_path, edit_decisions, inputs.get("proposal_packet"),
+                narration_transcript_path=inputs.get("narration_transcript_path"),
+                script_text=inputs.get("script_text"),
+            )
+            if render_result.data is None:
+                render_result.data = {}
+            render_result.data["final_review"] = final_review
+            render_result.data["final_review_status"] = final_review["status"]
+            if final_review["status"] == "fail":
+                return ToolResult(
+                    success=False,
+                    error=(
+                        "Post-render self-review FAILED (HyperFrames atelier). The output is not presentable.\n"
+                        + "\n".join(f"  • {i}" for i in final_review.get("issues_found", []))
+                    ),
+                    data=render_result.data,
+                )
         return render_result
 
     def _render_via_hyperframes(
@@ -1671,18 +1755,19 @@ class VideoCompose(BaseTool):
         return render_result
 
     def _remotion_render(self, inputs: dict[str, Any]) -> ToolResult:
-        """Render via Remotion (requires Node.js + npx).
+        """Render via Remotion (requires Node.js + the installed local Remotion CLI + a browser).
 
         Handles compositions with still images, animated scenes, component
         types, and transitions using React-based frame-accurate rendering.
         Accepts edit_decisions (with resolved file paths) or raw composition_data.
         """
-        import shutil
+        from lib import remotion_runtime as _rr
 
-        if not shutil.which("npx"):
+        _doc = _rr.doctor()
+        if not _doc["available"]:
             return ToolResult(
                 success=False,
-                error="npx not found. Install Node.js to use Remotion rendering.",
+                error=f"Remotion is not render-ready: {_doc['reason']}",
             )
 
         composition_data = inputs.get("edit_decisions") or inputs.get("composition_data")
@@ -1742,7 +1827,7 @@ class VideoCompose(BaseTool):
         composition_id = self._get_composition_id(renderer_family)
 
         cmd = [
-            "npx", "remotion", "render",
+            str(_rr.cli_bin_path()), "render",
             str(composer_dir / "src" / "index.tsx"),
             composition_id,
             str(output_path),
@@ -1779,11 +1864,13 @@ class VideoCompose(BaseTool):
             except (TypeError, ValueError):
                 pass
 
+        _be = _rr.browser_executable()
+        if _be:
+            cmd.append(f"--browser-executable={_be}")
         try:
-            # Invoke from inside the composer dir so npx can resolve the
-            # local remotion binary via node_modules/.bin. Without this,
-            # Windows npx cannot locate the CLI and returns "could not
-            # determine executable to run".
+            # Invoke the PINNED local remotion binary from inside the composer
+            # dir, pointed at the resolved browser so the render never tries to
+            # download its own browser mid-render.
             self.run_command(cmd, timeout=subprocess_timeout, cwd=composer_dir)
         except subprocess.CalledProcessError as e:
             # run_command uses check=True + capture_output, so the useful

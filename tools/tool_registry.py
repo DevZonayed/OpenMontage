@@ -456,11 +456,23 @@ class ToolRegistry:
                         f"{entry.get('name')}: {entry.get('resource_profile_note')}"
                     )
 
+        # Saved provider/engine preferences (F1): surface them in the canonical
+        # preflight so the agent reads and HONORS them — which engine serves each
+        # text purpose, subscription-first policy, and the preferred image/video
+        # provider. Pure file read (no subprocess); live auth state is available
+        # via the Backlot settings page / lib.engines.engines_summary().
+        try:
+            from lib.provider_prefs import ProviderPreferences
+            provider_preferences = ProviderPreferences.load().model_dump()
+        except Exception:
+            provider_preferences = None
+
         result = {
             "composition_runtimes": comp_runtimes,
             "capabilities": capabilities,
             "setup_offers": setup_offers,
             "runtime_warnings": runtime_warnings,
+            "provider_preferences": provider_preferences,
         }
         # Normalize em-dashes and en-dashes to ASCII so preflight output prints
         # cleanly on Windows cp1252 stdout (the default on Git Bash / PowerShell

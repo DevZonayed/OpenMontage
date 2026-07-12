@@ -16,10 +16,15 @@
     </div>
     <span class="chip" id="count"></span>
     <div class="spacer"></div>
+    <button class="chip nav-chip primary" type="button" data-new-project>+ NEW PROJECT</button>
+    <a class="chip nav-chip" href="/settings">⚙ SETTINGS</a>
     <span class="live idle" id="liveBadge"><span class="dot"></span><span id="liveText">IDLE</span></span>
   </header>
   <div class="lib-grid" id="grid"></div>
-  <p class="hint" id="empty" style="display:none">No projects yet — run a production and it will appear here.</p>
+  <div class="empty-cta" id="empty" style="display:none">
+    <p class="hint">No projects yet — create one to initialize a workspace.</p>
+    <button class="set-btn" type="button" data-new-project>+ New project</button>
+  </div>
 </div>
 <script type="module" src="/ui/library.js"></script>
 </body>

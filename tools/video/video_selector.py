@@ -231,9 +231,34 @@ class VideoSelector(BaseTool):
                 },
             )
 
-        # Normal generation — use scored selection
+        # Normal generation — deterministic provider resolution (same policy as
+        # image_selector): explicit -> STRICT when selectable; else saved primary
+        # (if selectable) -> ordered fallback -> else auto.
+        from lib.provider_prefs import (apply_saved_model, find_provider_tool,
+                                         media_preference_for, pick_saved_media_tool)
+        sel = media_preference_for(self.capability)
+        explicit = inputs.get("preferred_provider", "auto")
         task_context = self._prepare_task_context(inputs)
-        tool, score = self._select_best_tool(inputs, candidates, task_context)
+        selectable = lambda t: self._tool_selectable(t, inputs)
+        filtered = self._filter_candidates(inputs, candidates)
+        score = None
+        requested_provider_unavailable = None
+        if explicit and explicit != "auto":
+            tool = find_provider_tool(filtered, explicit, selectable=selectable)
+            if tool is not None:
+                pref_source = "explicit"  # strict: selected provider IS the explicit one
+            else:
+                requested_provider_unavailable = explicit
+                tool, score = self._select_best_tool(inputs, candidates, task_context)
+                pref_source = "auto"
+        elif sel and (sel.provider or sel.fallback):
+            tool, pref_source = pick_saved_media_tool(filtered, sel, selectable=selectable)
+            if tool is None:  # saved primary + all fallbacks unavailable -> honest auto
+                tool, score = self._select_best_tool(inputs, candidates, task_context)
+                pref_source = "auto"
+        else:
+            tool, score = self._select_best_tool(inputs, candidates, task_context)
+            pref_source = "auto"
         if tool is None:
             return ToolResult(success=False, error="No video generation provider available.")
 
@@ -243,6 +268,10 @@ class VideoSelector(BaseTool):
             required = tool.input_schema.get("properties", {})
             if "query" in required and "query" not in adapted:
                 adapted["query"] = adapted.get("prompt", "")
+
+        # Apply the SAVED model only when the saved PRIMARY was selected (B/review-4).
+        selected_model, model_unsupported, model_not_applicable = apply_saved_model(
+            inputs, adapted, sel, tool, pref_source)
 
         # Auto-resolve reference_image_path to a URL for providers that need it
         if adapted.get("operation") == "image_to_video" and adapted.get("reference_image_path"):
@@ -259,9 +288,25 @@ class VideoSelector(BaseTool):
         if result.success:
             result.data.setdefault("selected_tool", tool.name)
             result.data["selected_provider"] = tool.provider
-            result.data["selection_reason"] = score.explain() if score else f"Selected {tool.provider} ({tool.name})"
+            result.data["selection_reason"] = score.explain() if score else f"Selected {tool.provider} ({tool.name}) via {pref_source}"
             if score:
                 result.data["provider_score"] = score.to_dict()
+            # Auditable + ACCURATE: preference_source reflects reality.
+            result.data["preference_source"] = pref_source
+            if requested_provider_unavailable:
+                result.data["requested_provider_unavailable"] = requested_provider_unavailable
+            if selected_model:
+                result.data["selected_model"] = selected_model
+            if model_unsupported:
+                result.data["model_preference_unsupported"] = True
+                result.data["model_preference_note"] = (
+                    f"{tool.provider} accepts no model parameter; saved model "
+                    f"{sel.model!r} was NOT applied.")
+            if model_not_applicable:
+                result.data["saved_model_not_applied"] = True
+                result.data["saved_model_note"] = (
+                    f"saved model {sel.model!r} is scoped to the saved primary provider; "
+                    f"{tool.provider} was selected via {pref_source}, so it was NOT applied.")
             result.data.update(self._tool_context_payload(tool))
             result.data["alternatives_considered"] = [
                 t.name for t in candidates
