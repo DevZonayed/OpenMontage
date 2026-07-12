@@ -31,6 +31,12 @@ function fmtSecs(secs?: number | null): string {
   return m ? `${m}:${String(r).padStart(2, "0")}` : `${r}s`;
 }
 
+// Sanitized short id — never leak a full raw job/session handle in the UI.
+function shortId(id?: string | null): string {
+  if (!id) return "";
+  return id.length > 10 ? id.slice(0, 8) : id;
+}
+
 export interface CommandCenterProps {
   status: StatusController;
   client: BacklotClient;
@@ -130,7 +136,7 @@ export const CommandCenter: React.FC<CommandCenterProps> = ({ status, client }) 
             <div style={s.idChips}>
               {view.identity.tool ? <span style={s.idChip}>{view.identity.tool}</span> : null}
               {view.identity.provider ? <span style={s.idChip}>{view.identity.provider}</span> : null}
-              {view.identity.job ? <span style={s.idChip}>job {view.identity.job}</span> : null}
+              {view.identity.job ? <span style={s.idChip} title={view.identity.job}>job {shortId(view.identity.job)}</span> : null}
             </div>
           ) : null}
           {view.is_fixture ? <div style={s.fixture} data-testid="cc-fixture">◐ Demo data — no live run</div> : null}

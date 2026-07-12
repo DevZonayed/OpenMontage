@@ -552,7 +552,7 @@ function renderStatusCard(wrap, view) {
     const chips = el("div", { class: "cmd-idchips" });
     if (id.tool) chips.append(el("span", { class: "idchip" }, id.tool));
     if (id.provider) chips.append(el("span", { class: "idchip" }, id.provider));
-    if (id.job) chips.append(el("span", { class: "idchip mono" }, "job " + id.job));
+    if (id.job) chips.append(el("span", { class: "idchip mono", title: id.job }, "job " + _shortId(id.job)));
     last.append(chips);
   }
   if (view.is_fixture) last.append(el("div", { class: "cmd-fixture" }, "◐ Demo data — no live run"));
@@ -766,6 +766,12 @@ function openConnectModal(view) {
   card.append(projectWrap, status,
     el("div", { class: "cmd-modal-actions" }, connectBtn, testBtn, cancelBtn));
   modal.append(card);
+}
+
+// Sanitized short id — never leak a full raw job/session handle in the UI.
+function _shortId(id) {
+  if (!id) return "";
+  return String(id).length > 10 ? String(id).slice(0, 8) : String(id);
 }
 
 function _fmtSecs(secs) {
