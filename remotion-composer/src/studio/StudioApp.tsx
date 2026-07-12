@@ -9,6 +9,7 @@ import { Player, PlayerRef } from "@remotion/player";
 import { TimelineFrame, TimelineFrameProps } from "../TimelineComposition";
 import {
   CanonicalComposition,
+  CompositionAsset,
   Layer,
   LayerType,
   makeId,
@@ -27,6 +28,8 @@ import {
   muteTrack,
   removeLayer,
   resizeLayer,
+  revertAsset,
+  setAssetApproval,
   setVolume,
   splitLayer,
   trimLayer,
@@ -444,11 +447,14 @@ export const StudioApp: React.FC<StudioAppProps> = ({ client }) => {
             <Inspector
               key={selectedLayer.id}
               layer={selectedLayer}
+              asset={model.assets.find((a) => a.id === selectedLayer.assetId) ?? null}
               onEdit={(edit) => apply((c) => trimLayer(c, selectedLayer.id, edit))}
               onMove={(f) => apply((c) => moveLayer(c, selectedLayer.id, f))}
               onResize={(d) => apply((c) => resizeLayer(c, selectedLayer.id, d))}
               onVolume={(v) => apply((c) => setVolume(c, selectedLayer.id, v))}
               onSplit={() => apply((c) => splitLayer(c, selectedLayer.id, frame).composition)}
+              onRevert={(assetId, v) => apply((c) => revertAsset(c, assetId, v))}
+              onApprove={(assetId, ap) => apply((c) => setAssetApproval(c, assetId, ap))}
               onDelete={() => {
                 apply((c) => removeLayer(c, selectedLayer.id));
                 setSelected(null);
@@ -638,20 +644,24 @@ const TimelineLanes: React.FC<{
 
 const Inspector: React.FC<{
   layer: Layer;
+  asset: CompositionAsset | null;
   onEdit: (edit: { startFrame?: number; durationFrames?: number }) => void;
   onMove: (f: number) => void;
   onResize: (d: number) => void;
   onVolume: (v: number) => void;
   onSplit: () => void;
+  onRevert: (assetId: string, version: number) => void;
+  onApprove: (assetId: string, approved: boolean) => void;
   onDelete: () => void;
   onRegen: (instr: string) => void;
-}> = ({ layer, onEdit, onMove, onResize, onVolume, onSplit, onDelete, onRegen }) => {
+}> = ({ layer, asset, onEdit, onMove, onResize, onVolume, onSplit, onRevert, onApprove, onDelete, onRegen }) => {
   const [instr, setInstr] = useState("");
   return (
     <div>
       <div style={{ fontSize: 12, color: "#a0a0a9", marginBottom: 8 }}>
         LAYER · {layer.type} · {layer.id}
       </div>
+      <AssetPanel asset={asset} onRevert={onRevert} onApprove={onApprove} />
       <Field label="Start frame">
         <input
           type="number"
@@ -705,6 +715,64 @@ const Inspector: React.FC<{
         >
           Queue regeneration
         </button>
+      </div>
+    </div>
+  );
+};
+
+const STATUS_COLOR: Record<string, string> = {
+  placeholder: "#8a93a3",
+  generating: "#e8c07d",
+  ready: "#6aa1ff",
+  approved: "#4fc283",
+  failed: "#e5544b",
+};
+
+// Visualizes an asset's generation status/provenance and its version history so
+// placeholders → replacements are visible and a prior version can be reverted to.
+const AssetPanel: React.FC<{
+  asset: CompositionAsset | null;
+  onRevert: (assetId: string, version: number) => void;
+  onApprove: (assetId: string, approved: boolean) => void;
+}> = ({ asset, onRevert, onApprove }) => {
+  if (!asset) {
+    return (
+      <div style={{ fontSize: 11, color: "#5f5f68", marginBottom: 10 }}>
+        Designed layer — no external asset.
+      </div>
+    );
+  }
+  const prev = (asset as unknown as { previousVersions?: Array<{ version: number }> }).previousVersions ?? [];
+  return (
+    <div style={{ marginBottom: 12, padding: 8, border: "1px solid #232329", borderRadius: 6 }}>
+      <div style={{ display: "flex", alignItems: "center", gap: 6, marginBottom: 4 }}>
+        <span style={{ width: 8, height: 8, borderRadius: 8, background: STATUS_COLOR[asset.status] || "#8a93a3" }} />
+        <span style={{ fontSize: 11, color: "#ececef" }} data-testid="asset-status">
+          {asset.status.toUpperCase()} · v{asset.version}
+        </span>
+        <span style={{ marginLeft: "auto", fontSize: 10, color: asset.approved ? "#4fc283" : "#5f5f68" }}>
+          {asset.approved ? "approved" : "unapproved"}
+        </span>
+      </div>
+      <div style={{ fontSize: 10, color: "#5f5f68", wordBreak: "break-all" }}>
+        {asset.url ? asset.url : asset.status === "placeholder" ? "placeholder (no media yet)" : "—"}
+      </div>
+      {asset.provenance ? (
+        <div style={{ fontSize: 10, color: "#8a93a3", marginTop: 3 }}>
+          {[asset.provenance.provider, asset.provenance.model, asset.provenance.tool]
+            .filter(Boolean)
+            .join(" · ") || "no provenance"}
+        </div>
+      ) : null}
+      <div style={{ display: "flex", gap: 6, marginTop: 6, flexWrap: "wrap" }}>
+        <button style={miniBtn} onClick={() => onApprove(asset.id, !asset.approved)}>
+          {asset.approved ? "Unapprove" : "Approve"}
+        </button>
+        {prev.map((p) => (
+          <button key={p.version} style={miniBtn} onClick={() => onRevert(asset.id, p.version)}>
+            Revert v{p.version}
+          </button>
+        ))}
       </div>
     </div>
   );

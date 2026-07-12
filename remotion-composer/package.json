@@ -3,9 +3,9 @@
   "version": "1.0.0",
   "description": "Remotion composition renderer for OpenMontage animated explainer videos",
   "scripts": {
-    "start": "npx remotion studio",
-    "build": "npx remotion render src/index.tsx Explainer out/video.mp4",
-    "upgrade": "npx remotion upgrade",
+    "remotion": "node scripts/remotion-cli.mjs",
+    "start": "node scripts/remotion-cli.mjs studio",
+    "build": "node scripts/remotion-cli.mjs render src/index.tsx Explainer out/video.mp4",
     "typecheck": "tsc --noEmit",
     "test": "vitest run",
     "test:watch": "vitest",

@@ -1,0 +1,76 @@
+{
+  "timeline": {
+    "version": "1.0",
+    "fps": 30,
+    "target_duration_seconds": 8,
+    "total_frames": 240,
+    "width": 1920,
+    "height": 1080,
+    "layers": [
+      {
+        "id": "bg1",
+        "type": "image",
+        "track": 0,
+        "start_frame": 0,
+        "duration_frames": 240,
+        "z": 0,
+        "enabled": true,
+        "opacity": 1,
+        "source": "http://127.0.0.1:4760/qa-photo.png",
+        "text": "Real media"
+      },
+      {
+        "id": "title1",
+        "type": "text",
+        "track": 1,
+        "start_frame": 12,
+        "duration_frames": 110,
+        "z": 3,
+        "enabled": true,
+        "opacity": 1,
+        "title": "PREVIEW = RENDER",
+        "subtitle": "pinned local cli",
+        "transitionIn": {
+          "kind": "fade",
+          "durationFrames": 10
+        },
+        "transitionOut": {
+          "kind": "fade",
+          "durationFrames": 10
+        }
+      },
+      {
+        "id": "cap1",
+        "type": "caption",
+        "track": 1,
+        "start_frame": 130,
+        "duration_frames": 100,
+        "z": 3,
+        "enabled": true,
+        "opacity": 1,
+        "text": "Real image + audible audio, one canonical composition."
+      },
+      {
+        "id": "music1",
+        "type": "music",
+        "track": 2,
+        "start_frame": 0,
+        "duration_frames": 240,
+        "z": 0,
+        "enabled": true,
+        "opacity": 1,
+        "volume": 0.8,
+        "fade": {
+          "inFrames": 15,
+          "outFrames": 20
+        },
+        "source": "http://127.0.0.1:4760/qa-tone.mp3"
+      }
+    ]
+  },
+  "meta": {
+    "title": "QA Render",
+    "pipeline": "animation",
+    "targetFormatted": "0:08"
+  }
+}
