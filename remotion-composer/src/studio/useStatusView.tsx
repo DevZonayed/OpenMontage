@@ -26,7 +26,6 @@ export interface StatusController {
   setConnectOpen: (b: boolean) => void;
   refresh: () => void;
   runAction: (a: StatusAction) => void;
-  focusPrimary: () => void;
 }
 
 export function useStatusView(client: BacklotClient): StatusController {
@@ -76,15 +75,6 @@ export function useStatusView(client: BacklotClient): StatusController {
   }, [tick]);
 
   const refresh = useCallback(() => { void tick(); }, [tick]);
-
-  const focusPrimary = useCallback(() => {
-    if (typeof document === "undefined") return;
-    const el = document.querySelector('[data-testid="cc-primary"]') as HTMLElement | null;
-    if (el) {
-      el.scrollIntoView({ behavior: "smooth", block: "center" });
-      el.focus();
-    }
-  }, []);
 
   const runAction = useCallback(async (a: StatusAction) => {
     setActionError(null);
@@ -147,5 +137,5 @@ export function useStatusView(client: BacklotClient): StatusController {
     }
   }, [client, tick, view]);
 
-  return { view, coldError, busy, actionError, connectOpen, setConnectOpen, refresh, runAction, focusPrimary };
+  return { view, coldError, busy, actionError, connectOpen, setConnectOpen, refresh, runAction };
 }

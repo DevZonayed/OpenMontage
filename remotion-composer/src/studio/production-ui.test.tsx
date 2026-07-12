@@ -55,7 +55,7 @@ function fixtureView(over: Partial<StatusView> = {}): StatusView {
 function controller(view: StatusView | null): StatusController {
   return {
     view, coldError: false, busy: false, actionError: null, connectOpen: false,
-    setConnectOpen: () => {}, refresh: () => {}, runAction: () => {}, focusPrimary: () => {},
+    setConnectOpen: () => {}, refresh: () => {}, runAction: () => {},
   };
 }
 
@@ -69,9 +69,9 @@ describe("Production inspector — canonical, no legacy leakage", () => {
     expect(html).toContain("Owner: You");
     expect(html).toContain("target 2:30 · 4500 target frames");
     for (const bad of FORBIDDEN) expect(html).not.toContain(bad);
-    // No second Start/Connect PRIMARY button — only a plain "go to next step" link.
-    expect(html).not.toMatch(/<button[^>]*>[^<]*Start production/i);
-    expect(html).toContain("Go to the next step");
+    // The inspector is STATUS-ONLY: no buttons at all (no second Start/Connect/goto).
+    expect(html).not.toMatch(/<button/i);
+    expect(html).toContain("Next step:");           // static reference, not a button
   });
 
   it("does not render a live badge or handles when there is no live run", () => {

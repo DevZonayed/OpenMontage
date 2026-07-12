@@ -128,17 +128,25 @@ describe("shipped studio.bundle.js — real mount, canonical UI, no legacy leaka
     expect(text).toContain("Asset generation");
     expect(text).toContain("Waiting for Hermes to begin asset generation");
     expect(text).toContain("Owner: You");
-    // truthful target duration, never the composer default 1:00
+    // truthful target duration, never the composer default 1:00/1800 — ANYWHERE
+    // in the full document (header, empty card, AND the transport scrubber).
     expect(text).toContain("target 2:30 · 4500 target frames");
-    expect(text).not.toContain("1800 frames");
-    expect(text).not.toMatch(/·\s*1:00/);
+    expect(text).toContain("f0/4500");                 // scrubber agrees with the target
+    expect(text).not.toMatch(/\b1800\b/);              // no internal composer frame count
+    expect(text).not.toMatch(/\b1:00\b/);
     // NO legacy leakage anywhere in the served document
     for (const bad of FORBIDDEN) expect(text).not.toContain(bad);
-    // exactly ONE prominent primary action; no enabled Start production
+    // exactly ONE production-next action across the whole page (the cc-primary);
+    // no enabled Start, no duplicate Connect, no "go to next step" button.
     expect(container.querySelectorAll('[data-testid="cc-primary"]').length).toBe(1);
-    const startBtns = [...container.querySelectorAll("button")].filter(
-      (b) => /start production/i.test(b.textContent || "") && !(b as HTMLButtonElement).disabled);
-    expect(startBtns.length).toBe(0);
+    const buttons = [...container.querySelectorAll("button")] as HTMLButtonElement[];
+    const enabledText = buttons.filter((b) => !b.disabled).map((b) => (b.textContent || "").trim());
+    expect(enabledText.filter((t) => /start production/i.test(t)).length).toBe(0);
+    expect(enabledText.filter((t) => /go to the next step/i.test(t)).length).toBe(0);
+    expect(enabledText.filter((t) => /connect hermes/i.test(t)).length).toBe(1); // exactly one Connect
+    // the inspector references the next step as static text, not a button
+    expect(container.querySelector('[data-testid="pi-next-ref"]')).toBeTruthy();
+    expect(container.querySelector('[data-testid="pi-goto-action"]')).toBeNull();
     // empty-timeline card present (no misleading blank preview)
     expect(container.querySelector('[data-testid="empty-timeline"]')).toBeTruthy();
     // connection banner is status text only (no button inside)

@@ -16,7 +16,7 @@ function shortId(id?: string | null): string {
 }
 
 export const ProductionInspector: React.FC<{ status: StatusController }> = ({ status }) => {
-  const { view, coldError, focusPrimary } = status;
+  const { view, coldError } = status;
   if (!view) {
     return <div style={{ color: C.faint, fontSize: 12 }}>{coldError ? "⟳ Reconnecting to production…" : "Loading production…"}</div>;
   }
@@ -79,18 +79,13 @@ export const ProductionInspector: React.FC<{ status: StatusController }> = ({ st
         </>
       ) : null}
 
-      {/* Link (not a button) to the page's ONE primary action in the command
-          center — never a second Start/Connect primary. */}
+      {/* Static reference to the page's ONE action (in the command center above).
+          NOT a button — the inspector is status-only, exactly one production-next
+          action exists across the page. */}
       {pa && pa.advances_production !== false ? (
-        <button
-          type="button"
-          onClick={focusPrimary}
-          data-testid="pi-goto-action"
-          style={{ marginTop: 12, alignSelf: "flex-start", background: "transparent", border: "none",
-                   color: C.blue, cursor: "pointer", fontSize: 12, padding: 0, textDecoration: "underline" }}
-        >
-          → Go to the next step
-        </button>
+        <div style={{ marginTop: 12, color: C.faint, fontSize: 11 }} data-testid="pi-next-ref">
+          Next step: “{pa.label}” — use the action in the production status above.
+        </div>
       ) : null}
 
       {/* diagnostics behind an explicit disclosure, sanitized */}

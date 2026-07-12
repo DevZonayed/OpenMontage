@@ -306,6 +306,12 @@ export const StudioApp: React.FC<StudioAppProps> = ({ client }) => {
   const validation = validateComposition(model);
   const selectedLayer = model.layers.find((l) => l.id === selected) ?? null;
   const hasLayers = model.layers.length > 0;
+  // For an EMPTY timeline the composer's internal frame count (a 60s default) must
+  // never surface in the scrub UI. Use the canonical TARGET frames so the scrubber
+  // agrees with the header (2:30 · 4500). A real timeline with layers is authoritative.
+  const displayTotalFrames = hasLayers
+    ? model.totalFrames
+    : (status.view?.target?.frames || model.totalFrames);
 
   return (
     <div style={{ display: "flex", flexDirection: "column", height: "100%", color: "#ececef" }}>
@@ -426,7 +432,7 @@ export const StudioApp: React.FC<StudioAppProps> = ({ client }) => {
 
           <Transport
             frame={frame}
-            totalFrames={model.totalFrames}
+            totalFrames={displayTotalFrames}
             fps={model.fps}
             playing={playing}
             previewZoom={previewZoom}

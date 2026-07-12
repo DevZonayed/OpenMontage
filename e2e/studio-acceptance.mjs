@@ -63,12 +63,20 @@ try {
     const studioHeadline = await grab(st, '[data-testid="cc-headline"]');
     const piHeadline = await grab(st, '[data-testid="pi-headline"]');
     const primaries = await st.$$eval('[data-testid="cc-primary"]', (n) => n.filter((e) => !e.disabled).length);
-    const enabledStart = await st.$$eval("button", (els) => els.filter((e) => /start production/i.test(e.textContent || "") && !e.disabled).length);
     const renderEnabled = await st.$$eval("button", (els) => {
       const b = els.find((e) => /render final film/i.test(e.textContent || ""));
       return b ? !b.disabled : false;
     });
     const tlMeta = await grab(st, '[data-testid="tl-meta"]');
+    // Enumerate EVERY enabled button; classify production-next actions.
+    const enabledBtns = await st.$$eval("button", (els) =>
+      els.filter((e) => !e.disabled).map((e) => (e.textContent || "").trim()));
+    // Production-next = an ADVANCING primary action (anchored to the real labels so
+    // the secondary "Preview approved plan locally" is NOT miscounted).
+    const nextRe = /^(connect hermes|continue production|start production|review & approve|approve |resume |retry |go to the next step)/i;
+    const nextActions = enabledBtns.filter((t) => nextRe.test(t));
+    const gotoBtns = enabledBtns.filter((t) => /go to the next step/i.test(t));
+    const connectBtns = enabledBtns.filter((t) => /connect hermes/i.test(t));
 
     // ---- assertions ----
     for (const bad of FORBIDDEN) {
@@ -77,14 +85,22 @@ try {
     }
     ok(boardConnect === 1, `[${tag}] board Connect buttons = ${boardConnect} (want 1)`);
     ok(primaries === 1, `[${tag}] studio enabled primaries = ${primaries} (want 1)`);
-    ok(enabledStart === 0, `[${tag}] studio enabled Start production = ${enabledStart} (want 0)`);
+    // Exactly ONE production-next action across the whole studio page; the single
+    // Connect is it; no duplicate Connect, no "go to next step" button.
+    ok(nextActions.length === 1, `[${tag}] studio production-next actions = ${nextActions.length} (want 1): ${JSON.stringify(nextActions)}`);
+    ok(gotoBtns.length === 0, `[${tag}] studio has a "go to next step" button (want 0)`);
+    ok(connectBtns.length === 1, `[${tag}] studio Connect buttons = ${connectBtns.length} (want 1)`);
     ok(renderEnabled === false, `[${tag}] render final film enabled (want disabled)`);
     ok((tlMeta || "").includes("2:30"), `[${tag}] timeline meta lacks 2:30: ${tlMeta}`);
-    ok(!(tlMeta || "").includes("1:00") && !(tlMeta || "").includes("1800 frames"), `[${tag}] timeline meta shows composer default: ${tlMeta}`);
+    // No internal composer frame count / 1:00 ANYWHERE in the served document
+    // (header, empty card, OR the transport scrubber like "f0/1800").
+    ok(!/\b1800\b/.test(studioText), `[${tag}] studio document contains 1800`);
+    ok(!/\b1:00\b/.test(studioText), `[${tag}] studio document contains 1:00`);
+    ok(/f0\/4500/.test(studioText) || !/f0\//.test(studioText), `[${tag}] scrubber denominator not 4500`);
     ok(boardHeadline === studioHeadline && studioHeadline === piHeadline, `[${tag}] headline parity mismatch: board=${boardHeadline} cc=${studioHeadline} pi=${piHeadline}`);
     ok(errors.length === 0, `[${tag}] console/page errors: ${JSON.stringify(errors.slice(0, 5))}`);
 
-    console.log(`[${tag}] board="${boardHeadline}" primaries=${primaries} start=${enabledStart} render=${renderEnabled} tlMeta="${tlMeta}" errors=${errors.length}`);
+    console.log(`[${tag}] board="${boardHeadline}" primaries=${primaries} nextActions=${nextActions.length} goto=${gotoBtns.length} connect=${connectBtns.length} render=${renderEnabled} tlMeta="${tlMeta}" has1800=${/\b1800\b/.test(studioText)} errors=${errors.length}`);
     await ctx.close();
   }
 } finally {
