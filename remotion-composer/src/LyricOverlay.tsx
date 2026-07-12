@@ -30,7 +30,7 @@ export interface Lyric {
   outSeconds: number;
 }
 
-export interface LyricOverlayProps {
+export type LyricOverlayProps = {
   videoSrc: string;
   lyrics: Lyric[];
   bottomY?: number; // 0..1, vertical center of subtitle band

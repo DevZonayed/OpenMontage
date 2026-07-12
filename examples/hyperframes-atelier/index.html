@@ -1,0 +1,306 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>OpenMontage — Code Into Film</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@500;700&family=JetBrains+Mono:wght@500;700&display=swap" rel="stylesheet">
+<script src="https://cdn.jsdelivr.net/npm/gsap@3.14.2/dist/gsap.min.js"></script>
+<style>
+  :root {
+    --bg: #0B0D12; --panel: #12151C; --bone: #EDEBE3; --dim: #9AA6B4; --muted: #5B6472;
+    --amber: #F2A900; --cyan: #37E0C8; --line: #232A36;
+    --disp: 'Space Grotesk', -apple-system, system-ui, sans-serif;
+    --mono: 'JetBrains Mono', ui-monospace, monospace;
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--bg); color: var(--bone); font-family: var(--disp); }
+  [data-composition-id="root"] {
+    position: relative; width: 1920px; height: 1080px; overflow: hidden;
+    background:
+      radial-gradient(1200px 700px at 50% -10%, rgba(55,224,200,0.06), transparent 60%),
+      radial-gradient(900px 600px at 90% 120%, rgba(242,169,0,0.05), transparent 60%),
+      var(--bg);
+  }
+  [data-composition-id="root"]::before {
+    content: ""; position: absolute; inset: 0; opacity: 0.5;
+    background-image: linear-gradient(var(--line) 1px, transparent 1px),
+                      linear-gradient(90deg, var(--line) 1px, transparent 1px);
+    background-size: 96px 96px; mask-image: radial-gradient(circle at 50% 45%, #000 30%, transparent 78%);
+  }
+  .clip { position: absolute; inset: 0; }
+  .center { display: flex; flex-direction: column; align-items: center; justify-content: center; }
+
+  /* -------- Persistent HUD (visible the whole 18s — no frame is ever bare) -------- */
+  .hud-brand { position: absolute; top: 54px; left: 64px; display: flex; align-items: center; gap: 14px; }
+  .hud-chip { display: flex; width: 46px; height: 30px; border-radius: 4px; overflow: hidden; }
+  .hud-chip i { flex: 1; }
+  .hud-om { font-family: var(--mono); font-size: 20px; letter-spacing: 0.22em; text-transform: uppercase; color: var(--dim); }
+  .hud-track { position: absolute; left: 64px; right: 64px; bottom: 56px; height: 3px; background: var(--line); border-radius: 3px; overflow: hidden; }
+  .hud-fill { height: 100%; width: 100%; transform-origin: 0 50%; transform: scaleX(0);
+    background: linear-gradient(90deg, var(--amber), var(--cyan)); }
+  .hud-dot { position: absolute; bottom: 51px; width: 9px; height: 9px; margin-left: -4px; border-radius: 50%; background: var(--line); }
+
+  /* -------- Transition bridge — a branded slate-stripe band that wipes across
+     center at each scene boundary, so boundary frames read as designed beats. -------- */
+  .bridge-wrap { position: absolute; left: 50%; top: 50%; transform: translate(-50%, -50%); width: 1180px; height: 132px; }
+  .bridge-bar { width: 100%; height: 100%; display: flex; border-radius: 12px; overflow: hidden;
+    transform: scaleX(0); box-shadow: 0 30px 90px rgba(0,0,0,0.55); }
+  .bridge-bar i { flex: 1; }
+  .bridge-seam { position: absolute; left: 0; right: 0; top: calc(50% - 1px); height: 2px; background: var(--cyan); opacity: 0.9; }
+
+  /* -------- Scene 1: clapperboard slate -------- */
+  .slate { position: relative; width: 640px; }
+  .slate-arm { height: 84px; border-radius: 8px 8px 0 0; overflow: hidden; display: flex; transform-origin: 0 100%; }
+  .slate-arm .st { flex: 1; }
+  .slate-body { height: 200px; background: #171B24; border: 3px solid #0A0C10; border-top: none;
+    border-radius: 0 0 10px 10px; padding: 26px 30px; display: flex; flex-direction: column; gap: 14px; }
+  .slate-row { height: 22px; border-radius: 4px; background: #2C3543; }
+  .slate-row.a { width: 78%; } .slate-row.b { width: 54%; } .slate-row.c { width: 66%; }
+  .s1-wm { margin-top: 44px; font-weight: 700; font-size: 92px; letter-spacing: -0.02em; color: var(--bone); }
+  .s1-wm b { color: var(--amber); }
+  .s1-sub { margin-top: 10px; font-family: var(--mono); font-size: 22px; letter-spacing: 0.42em;
+    text-transform: uppercase; color: var(--dim); }
+
+  /* -------- Scene 2: code -> motion (split) -------- */
+  .s2-wrap { display: grid; grid-template-columns: 1fr 1fr; align-items: center; height: 100%; padding: 0 140px; gap: 80px; }
+  .code { background: var(--panel); border: 1px solid var(--line); border-radius: 14px; padding: 34px 36px;
+    box-shadow: 0 40px 120px rgba(0,0,0,0.5); }
+  .code .tab { font-family: var(--mono); font-size: 18px; color: var(--dim); margin-bottom: 18px; letter-spacing: 0.1em; }
+  .code .ln { font-family: var(--mono); font-size: 27px; line-height: 1.7; white-space: pre; color: #CDD6E2; }
+  .code .k { color: var(--cyan); } .code .s { color: var(--amber); } .code .p { color: #97A0AF; }
+  .bars { position: relative; height: 420px; display: flex; align-items: flex-end; gap: 26px; justify-content: center; }
+  .bar { width: 62px; border-radius: 8px 8px 3px 3px; transform-origin: 50% 100%;
+    background: linear-gradient(180deg, var(--cyan), #1f9c8b); }
+  .bar:nth-child(2){ background: linear-gradient(180deg, var(--amber), #b97f00); }
+  .beam { position: absolute; top: 50%; left: 0; width: 60px; height: 3px; border-radius: 3px;
+    transform: translateX(-80px); background: linear-gradient(90deg, transparent, var(--cyan)); box-shadow: 0 0 24px var(--cyan); }
+  .s2-cap { position: absolute; bottom: 96px; width: 100%; text-align: center; font-family: var(--mono);
+    font-size: 22px; letter-spacing: 0.28em; text-transform: uppercase; color: var(--dim); }
+
+  /* -------- Scene 3: pipeline rail -------- */
+  .rail-wrap { position: absolute; top: 46%; left: 0; width: 100%; }
+  .rail { position: relative; height: 4px; margin: 0 160px; background: var(--line); transform-origin: 0 50%; border-radius: 4px; }
+  .node { position: absolute; top: -13px; width: 30px; height: 30px; margin-left: -15px; border-radius: 50%;
+    background: #10141C; border: 3px solid var(--dim); }
+  .node .lbl { position: absolute; top: 42px; left: 50%; transform: translateX(-50%); white-space: nowrap;
+    font-family: var(--mono); font-size: 19px; letter-spacing: 0.04em; color: var(--dim); }
+  .pulse { position: absolute; top: -8px; left: 0; width: 20px; height: 20px; border-radius: 50%;
+    background: var(--cyan); box-shadow: 0 0 30px 6px rgba(55,224,200,0.6); }
+  .s3-title { position: absolute; top: 20%; width: 100%; text-align: center; font-weight: 700; font-size: 48px; letter-spacing: -0.01em; }
+  .s3-title b { color: var(--cyan); }
+
+  /* -------- Scene 4: runtime choice -------- */
+  .chips { display: flex; gap: 40px; align-items: center; justify-content: center; height: 100%; }
+  .chip { position: relative; width: 300px; height: 200px; border-radius: 18px; background: var(--panel);
+    border: 1px solid var(--line); display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 14px; }
+  .chip .nm { font-weight: 700; font-size: 34px; letter-spacing: 0.02em; }
+  .chip .sub { font-family: var(--mono); font-size: 18px; color: var(--dim); letter-spacing: 0.08em; }
+  .chip.hero { border-color: var(--cyan); }
+  .ring { position: absolute; inset: -10px; border-radius: 22px; border: 2px solid var(--cyan); box-shadow: 0 0 60px rgba(55,224,200,0.35); }
+  .locked { position: absolute; top: -18px; right: -14px; background: var(--cyan); color: #05221D;
+    font-family: var(--mono); font-weight: 700; font-size: 15px; letter-spacing: 0.14em; padding: 6px 12px; border-radius: 999px; }
+  .s4-title { position: absolute; top: 15%; width: 100%; text-align: center; font-weight: 700; font-size: 44px; }
+  .s4-title b { color: var(--amber); }
+
+  /* -------- Scene 5: closing lockup -------- */
+  .lock-wm { font-weight: 700; font-size: 118px; letter-spacing: -0.03em; }
+  .lock-wm b { color: var(--amber); }
+  .lock-underline { display: flex; width: 560px; height: 16px; margin: 26px 0 30px; border-radius: 6px; overflow: hidden; }
+  .lock-underline .st { flex: 1; }
+  .lock-tag { font-family: var(--mono); font-size: 30px; letter-spacing: 0.12em; color: var(--cyan); }
+  .lock-foot { margin-top: 40px; font-family: var(--mono); font-size: 18px; letter-spacing: 0.34em; text-transform: uppercase; color: var(--dim); }
+</style>
+</head>
+<body>
+<!-- Scenes alternate tracks (1/2/1/2/1) so their crossfade overlaps are legal
+     on distinct HyperFrames tracks. -->
+<div data-composition-id="root" data-start="0" data-duration="18" data-width="1920" data-height="1080">
+
+  <!-- Persistent HUD — a branded anchor on its own track, present the entire 18s
+       so no transition frame is ever bare. A slate-stripe monogram + wordmark +
+       a progress bar that fills across the piece. -->
+  <div id="persist" class="clip" data-start="0" data-duration="18" data-track-index="0">
+    <div class="hud-brand">
+      <span class="hud-chip"><i style="background:#171B24"></i><i style="background:var(--amber)"></i><i style="background:#171B24"></i><i style="background:var(--amber)"></i></span>
+      <span class="hud-om">OpenMontage</span>
+    </div>
+    <div class="hud-track"><div class="hud-fill" id="hudfill"></div></div>
+    <div class="hud-dot" style="left:16.6%"></div><div class="hud-dot" style="left:38.9%"></div>
+    <div class="hud-dot" style="left:61.1%"></div><div class="hud-dot" style="left:80%"></div>
+  </div>
+
+  <!-- Transition bridge — occupies the central field at each boundary (a slate-
+       stripe wipe), so 3.5s/7.5s/11.5s/14.7s read as designed transition beats. -->
+  <div id="bridge" class="clip" data-start="0" data-duration="18" data-track-index="3">
+    <div class="bridge-wrap">
+      <div class="bridge-bar" id="bridgebar">
+        <i style="background:#171B24"></i><i style="background:var(--amber)"></i>
+        <i style="background:#12151C"></i><i style="background:var(--amber)"></i>
+        <i style="background:#171B24"></i><i style="background:var(--amber)"></i>
+        <i style="background:#12151C"></i><i style="background:var(--amber)"></i>
+        <div class="bridge-seam"></div>
+      </div>
+    </div>
+  </div>
+
+  <!-- Scene 1 — clapperboard slate (signature device) -->
+  <div id="s1" class="clip center" data-start="0" data-duration="3.6" data-track-index="1">
+    <div class="slate">
+      <div class="slate-arm" id="s1arm">
+        <div class="st" style="background:#171B24"></div><div class="st" style="background:var(--amber)"></div>
+        <div class="st" style="background:#171B24"></div><div class="st" style="background:var(--amber)"></div>
+        <div class="st" style="background:#171B24"></div><div class="st" style="background:var(--amber)"></div>
+        <div class="st" style="background:#171B24"></div>
+      </div>
+      <div class="slate-body">
+        <div class="slate-row a"></div><div class="slate-row b"></div><div class="slate-row c"></div>
+      </div>
+    </div>
+    <div class="s1-wm">Open<b>Montage</b></div>
+    <div class="s1-sub">instruction &rarr; film</div>
+  </div>
+
+  <!-- Scene 2 — code becomes motion (split) -->
+  <div id="s2" class="clip" data-start="3.4" data-duration="4.2" data-track-index="2">
+    <div class="s2-wrap">
+      <div class="code" id="s2code">
+        <div class="tab">edit_decisions.json</div>
+        <div class="ln"><span class="p">{</span></div>
+        <div class="ln">  <span class="k">"render_runtime"</span>: <span class="s">"hyperframes"</span>,</div>
+        <div class="ln">  <span class="k">"composition_mode"</span>: <span class="s">"atelier"</span>,</div>
+        <div class="ln">  <span class="k">"cuts"</span>: <span class="p">[ &hellip; ]</span></div>
+        <div class="ln"><span class="p">}</span></div>
+      </div>
+      <div class="bars" id="s2bars">
+        <div class="bar" style="height:38%"></div><div class="bar" style="height:70%"></div>
+        <div class="bar" style="height:52%"></div><div class="bar" style="height:88%"></div>
+        <div class="bar" style="height:60%"></div>
+        <div class="beam" id="s2beam"></div>
+      </div>
+    </div>
+    <div class="s2-cap" id="s2cap">code &rarr; motion, rendered deterministically</div>
+  </div>
+
+  <!-- Scene 3 — the pipeline rail -->
+  <div id="s3" class="clip" data-start="7.4" data-duration="4.2" data-track-index="1">
+    <div class="s3-title" id="s3title">seven stages, one <b>pipeline</b></div>
+    <div class="rail-wrap">
+      <div class="rail" id="s3rail">
+        <div class="node" style="left:0%"><span class="lbl">research</span></div>
+        <div class="node" style="left:16.6%"><span class="lbl">proposal</span></div>
+        <div class="node" style="left:33.3%"><span class="lbl">script</span></div>
+        <div class="node" style="left:50%"><span class="lbl">scene_plan</span></div>
+        <div class="node" style="left:66.6%"><span class="lbl">assets</span></div>
+        <div class="node" style="left:83.3%"><span class="lbl">edit</span></div>
+        <div class="node" style="left:100%"><span class="lbl">compose</span></div>
+        <div class="pulse" id="s3pulse"></div>
+      </div>
+    </div>
+  </div>
+
+  <!-- Scene 4 — runtime choice (accent choreography) -->
+  <div id="s4" class="clip" data-start="11.4" data-duration="3.4" data-track-index="2">
+    <div class="s4-title" id="s4title">you pick the <b>runtime</b></div>
+    <div class="chips">
+      <div class="chip" id="s4a"><div class="nm">FFmpeg</div><div class="sub">cuts · concat</div></div>
+      <div class="chip" id="s4b"><div class="nm">Remotion</div><div class="sub">react · scenes</div></div>
+      <div class="chip hero" id="s4c">
+        <div class="ring" id="s4ring"></div>
+        <div class="locked" id="s4lock">LOCKED</div>
+        <div class="nm">HyperFrames</div><div class="sub">html · css · gsap</div>
+      </div>
+    </div>
+  </div>
+
+  <!-- Scene 5 — closing lockup (signature returns) -->
+  <div id="s5" class="clip center" data-start="14.6" data-duration="3.4" data-track-index="1">
+    <div class="lock-wm" id="s5wm">Open<b>Montage</b></div>
+    <div class="lock-underline" id="s5line">
+      <div class="st" style="background:#171B24"></div><div class="st" style="background:var(--amber)"></div>
+      <div class="st" style="background:#171B24"></div><div class="st" style="background:var(--amber)"></div>
+      <div class="st" style="background:#171B24"></div><div class="st" style="background:var(--amber)"></div>
+    </div>
+    <div class="lock-tag" id="s5tag">code &rarr; video, on your machine</div>
+    <div class="lock-foot" id="s5foot">zero keys &middot; deterministic &middot; local</div>
+  </div>
+
+  <script>
+    window.__timelines = window.__timelines || {};
+    const tl = gsap.timeline({ paused: true });
+
+    /* ---- Persistent HUD: brand fades up once, progress fills the whole piece ---- */
+    tl.from(".hud-brand", { opacity: 0, x: -14, duration: 0.6, ease: "power2.out" }, 0.2);
+    tl.from(".hud-track, .hud-dot", { opacity: 0, duration: 0.6, ease: "power2.out" }, 0.3);
+    tl.fromTo("#hudfill", { scaleX: 0 }, { scaleX: 1, duration: 18, ease: "none" }, 0);
+
+    /* ---- Transition bridge: a central slate-stripe band wipes in-then-out across
+       each scene boundary. At the exact boundary the band is at full width, giving
+       a meaningful central transition composition instead of an empty field. ---- */
+    [3.5, 7.5, 11.5, 14.7].forEach(function (b) {
+      tl.fromTo("#bridgebar", { scaleX: 0 }, { scaleX: 1, transformOrigin: "0% 50%", duration: 0.22, ease: "power3.in" }, b - 0.22);
+      tl.to("#bridgebar", { scaleX: 0, transformOrigin: "100% 50%", duration: 0.24, ease: "power3.out" }, b);
+      tl.set("#bridgebar", { scaleX: 0 }, b + 0.26);
+    });
+
+    /* ---- Scene 1 (0 – 3.6): slate assembles, claps, wordmark ---- */
+    tl.from("#s1arm .st", { scaleX: 0, transformOrigin: "0 50%", stagger: 0.05, duration: 0.5, ease: "power4.out" }, 0.15);
+    tl.from("#s1arm", { rotation: -24, transformOrigin: "0% 100%", duration: 0.5, ease: "back.out(2)" }, 0.7);
+    tl.from(".slate-body", { scaleY: 0, transformOrigin: "50% 0", opacity: 0, duration: 0.45, ease: "power3.out" }, 0.85);
+    tl.from(".slate-row", { scaleX: 0, transformOrigin: "0 50%", stagger: 0.08, duration: 0.4, ease: "power2.out" }, 1.05);
+    tl.from(".s1-wm", { y: 46, opacity: 0, duration: 0.6, ease: "power4.out" }, 1.35);
+    tl.from(".s1-sub", { y: 20, opacity: 0, duration: 0.5, ease: "power2.out" }, 1.65);
+    /* exit + hard kill so a non-linear seek past 3.6 leaves nothing stale */
+    tl.to(["#s1 .slate", "#s1 .s1-wm", "#s1 .s1-sub"], { y: -28, opacity: 0, duration: 0.5, ease: "power2.in" }, 3.0);
+    tl.set(["#s1 .slate", "#s1 .s1-wm", "#s1 .s1-sub"], { opacity: 0 }, 3.55);
+
+    /* ---- Scene 2 (3.4 – 7.6): code types, beam sweeps (x), bars grow ---- */
+    tl.from("#s2code", { x: -60, opacity: 0, duration: 0.55, ease: "power3.out" }, 3.42);
+    tl.from("#s2code .ln", { opacity: 0, x: -18, stagger: 0.12, duration: 0.3, ease: "sine.out" }, 3.6);
+    tl.fromTo("#s2beam", { x: -80, opacity: 0 }, { x: 640, opacity: 1, duration: 0.7, ease: "expo.inOut" }, 4.5);
+    tl.from("#s2bars .bar", { scaleY: 0, opacity: 0, stagger: 0.09, duration: 0.5, ease: "power4.out" }, 4.75);
+    tl.to("#s2bars .bar", { scaleY: "+=0.06", transformOrigin: "50% 100%", duration: 0.7, yoyo: true, repeat: 1, stagger: 0.05, ease: "sine.inOut" }, 5.5);
+    tl.from("#s2cap", { y: 18, opacity: 0, duration: 0.5, ease: "power2.out" }, 5.2);
+    /* exit completes before the 7.40 s3 boundary, then a hard kill AT the
+       boundary so a non-linear seek can't leave a stale bar visible */
+    tl.to(["#s2code", "#s2cap", "#s2beam"], { opacity: 0, y: -20, duration: 0.3, ease: "power2.in" }, 7.0);
+    tl.to("#s2bars .bar", { scaleY: 0, opacity: 0, transformOrigin: "50% 100%", duration: 0.3, ease: "power2.in" }, 7.0);
+    tl.set(["#s2code", "#s2cap", "#s2beam", "#s2bars .bar"], { opacity: 0 }, 7.4);
+
+    /* ---- Scene 3 (7.4 – 11.6): rail draws, nodes ignite, pulse travels (x) ---- */
+    tl.from("#s3title", { y: 26, opacity: 0, duration: 0.45, ease: "power3.out" }, 7.4);
+    tl.from("#s3rail", { scaleX: 0, duration: 0.55, ease: "power2.inOut" }, 7.45);
+    tl.from("#s3 .node", { scale: 0, opacity: 0, transformOrigin: "50% 50%", stagger: 0.11, duration: 0.4, ease: "back.out(2.2)" }, 8.1);
+    tl.from("#s3 .node .lbl", { y: 12, opacity: 0, stagger: 0.11, duration: 0.35, ease: "power2.out" }, 8.25);
+    tl.fromTo("#s3pulse", { x: 0, opacity: 0 }, { opacity: 1, duration: 0.2, ease: "none" }, 8.7);
+    tl.to("#s3pulse", { x: 1600, duration: 1.7, ease: "power2.inOut" }, 8.9);
+    tl.to("#s3 .node", { borderColor: "#37E0C8", color: "#37E0C8", stagger: 0.24, duration: 0.2 }, 8.95);
+    /* exit + hard kill */
+    tl.to(["#s3title", "#s3rail", "#s3pulse"], { opacity: 0, duration: 0.45, ease: "power2.in" }, 11.05);
+    tl.to("#s3 .node", { opacity: 0, y: -14, stagger: 0.03, duration: 0.4, ease: "power2.in" }, 11.05);
+    tl.set(["#s3title", "#s3rail", "#s3pulse", "#s3 .node"], { opacity: 0 }, 11.55);
+
+    /* ---- Scene 4 (11.4 – 14.8): runtime chips, HyperFrames accent ---- */
+    tl.from("#s4title", { y: 22, opacity: 0, duration: 0.45, ease: "power3.out" }, 11.42);
+    tl.from(["#s4a", "#s4b", "#s4c"], { y: 60, opacity: 0, stagger: 0.12, duration: 0.55, ease: "power4.out" }, 11.6);
+    tl.to(["#s4a", "#s4b"], { opacity: 0.42, filter: "saturate(0.4)", duration: 0.5, ease: "power2.inOut" }, 12.7);
+    tl.to("#s4c", { scale: 1.08, transformOrigin: "50% 50%", duration: 0.5, ease: "back.out(1.7)" }, 12.7);
+    tl.from("#s4ring", { scale: 1.25, opacity: 0, transformOrigin: "50% 50%", duration: 0.5, ease: "power3.out" }, 12.8);
+    tl.from("#s4lock", { scale: 0, opacity: 0, transformOrigin: "50% 50%", duration: 0.45, ease: "back.out(2.4)" }, 13.05);
+    /* exit + hard kill */
+    tl.to(["#s4 .chips", "#s4title"], { y: -24, opacity: 0, duration: 0.5, ease: "power2.in" }, 14.25);
+    tl.set(["#s4 .chips", "#s4title"], { opacity: 0 }, 14.75);
+
+    /* ---- Scene 5 (14.6 – 18): lockup, signature underline, exit ---- */
+    tl.from("#s5wm", { y: 40, opacity: 0, duration: 0.6, ease: "power4.out" }, 14.62);
+    tl.from("#s5line .st", { scaleX: 0, transformOrigin: "0 50%", stagger: 0.06, duration: 0.4, ease: "power3.out" }, 14.95);
+    tl.from("#s5tag", { y: 22, opacity: 0, duration: 0.5, ease: "power2.out" }, 15.35);
+    tl.from("#s5foot", { opacity: 0, duration: 0.5, ease: "power1.out" }, 15.65);
+    tl.to(["#s5wm", "#s5line", "#s5tag", "#s5foot"], { y: -26, opacity: 0, stagger: 0.05, duration: 0.6, ease: "power2.in" }, 17.2);
+
+    window.__timelines["root"] = tl;
+  </script>
+</div>
+</body>
+</html>

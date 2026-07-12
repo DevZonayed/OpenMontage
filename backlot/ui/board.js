@@ -2,8 +2,18 @@
 
 import {
   STAGE_ICONS, el, fmtAgo, fmtClock, fmtDuration, fmtMoney,
-  getJSON, mediaURL, subscribe, thumbURL, waveBars,
+  getJSON, postJSON, mediaURL, subscribe, thumbURL, waveBars,
 } from "/ui/lib.js";
+import { wireNewProjectButtons } from "/ui/newproject.js";
+
+// CSRF-guarded POST for run lifecycle actions.
+let _CSRF = null;
+async function mpost(url, body) {
+  if (!_CSRF) _CSRF = (await getJSON("/api/csrf")).csrf;
+  return postJSON(url, body || {}, { "X-OpenMontage-CSRF": _CSRF });
+}
+let runPollTimer = null;
+let lastRunSig = null;   // only re-render the run panel when the run materially changes
 
 const rawProjectPath = location.pathname.split("/p/")[1] || "";
 const projectId = decodeURIComponent(rawProjectPath);
@@ -72,9 +82,321 @@ function renderSlate(s) {
     ),
     ...chips,
     el("div", { class: "spacer" }),
+    el("a", { class: "chip nav-chip primary", href: `/p/${encodedProjectId}/editor` }, "◫ OPEN TIMELINE"),
+    el("button", { class: "chip nav-chip", type: "button", "data-new-project": "" }, "+ NEW PROJECT"),
     liveEl,
     cost,
   );
+}
+
+// ---- Production run lifecycle panel -----------------------------------------
+// Replaces the old copy-prompt dead-end. Shows the REAL run state (from
+// /api/project/<id>/run), a prominent START PRODUCTION action that launches a
+// real local preflight/planning worker, live status, and STOP. The manual
+// copy-prompt survives only inside a collapsed Advanced section.
+const _ACTIVE_RUN_STATES = new Set(["starting", "running", "waiting_for_approval", "cancelling"]);
+
+function _elapsed(startedAt) {
+  if (!startedAt) return "";
+  const secs = Math.max(0, Math.round((Date.now() - Date.parse(startedAt)) / 1000));
+  const m = Math.floor(secs / 60), sVal = secs % 60;
+  return `${m}:${String(sVal).padStart(2, "0")}`;
+}
+
+function _setBadge(run) {
+  const badge = document.querySelector(".slate .live");
+  if (!badge) return;
+  const st = (run && run.state) || "not_started";
+  const map = {
+    not_started: "NOT STARTED", starting: "STARTING", running: "RUNNING",
+    waiting_for_approval: "AWAITING APPROVAL", cancelling: "CANCELLING",
+    cancelled: "CANCELLED", failed: "FAILED", completed: "COMPLETED",
+  };
+  // Keep the badge consistent with the panel: once approved, it's no longer
+  // "awaiting approval" — it's approved and awaiting the agent.
+  let txt = map[st];
+  if (st === "waiting_for_approval" && run && run.plan_approved) txt = "APPROVED · AWAITING AGENT";
+  if (!txt) return;
+  badge.textContent = "";
+  badge.append(el("span", { class: "dot" }), txt);
+  badge.classList.toggle("idle", st === "not_started" || st === "cancelled");
+}
+
+function advancedPrompt(s) {
+  const box = el("pre", { class: "prompt-box", style: "margin-top:8px" }, "Loading your brief…");
+  const copyBtn = el("button", { class: "set-mini", type: "button" }, "Copy production prompt");
+  getJSON(`/api/project/${encodedProjectId}/intake`).then((intake) => {
+    const brief = (intake && intake.brief) || "";
+    const pipeline = (intake && intake.pipeline_type) || s.pipeline.pipeline_type;
+    const prompt =
+      `Produce the OpenMontage project "${s.title}" (id: ${projectId}, pipeline: ${pipeline}).\n\n` +
+      `Brief:\n${brief || "(no brief provided — ask me)"}\n\n` +
+      `Follow AGENT_GUIDE.md: read the project's intake.json, run the mandatory preflight ` +
+      `(provider_menu_summary), present concepts + the tool/cost plan, and PRESENT BOTH available ` +
+      `composition runtimes for my approval before producing anything. Do not skip proposal/checkpoints.`;
+    box.textContent = prompt;
+    copyBtn.onclick = async () => {
+      try { await navigator.clipboard.writeText(prompt); copyBtn.textContent = "Copied ✓"; }
+      catch { copyBtn.textContent = "Copy failed — select the text"; }
+    };
+  }).catch(() => { box.textContent = "(brief unavailable)"; });
+  const det = el("details", { class: "run-advanced", style: "margin-top:16px" });
+  det.append(el("summary", { style: "cursor:pointer;color:var(--dim)" }, "Advanced — run it manually with your own agent"));
+  det.append(box, el("div", { class: "np-actions", style: "justify-content:flex-start" }, copyBtn));
+  return det;
+}
+
+function _timelineLink() {
+  return el("a", { class: "set-mini", href: `/p/${encodedProjectId}/editor` }, "◫ Open timeline");
+}
+
+// The plan the preflight/planning worker actually produced (run_plan.json).
+function renderPlanCard(plan) {
+  const card = el("div", { class: "run-plan-card",
+    style: "margin:12px 0;padding:14px 16px;background:var(--panel,#12151c);border:1px solid var(--line,#232a36);border-radius:8px" });
+  card.append(el("div", { style: "font-family:var(--mono,monospace);font-size:11px;letter-spacing:0.14em;text-transform:uppercase;color:var(--dim,#8a93a3);margin-bottom:10px" }, "Production plan"));
+  const row = el("div", { style: "display:flex;gap:28px;flex-wrap:wrap;margin-bottom:12px" });
+  const stat = (label, value) => row.append(el("div", { style: "display:flex;flex-direction:column;gap:2px" },
+    el("span", { style: "font-size:11px;color:var(--dim,#8a93a3)" }, label),
+    el("b", { style: "font-size:15px;color:var(--bone,#e9e4d6)" }, value)));
+  stat("Target length", plan.target_formatted || "—");
+  stat("Total frames", `${plan.total_frames ?? "—"} @ ${plan.fps ?? 30}fps`);
+  stat("Narration budget", `≈ ${plan.word_budget ?? "—"} words`);
+  const pr = plan.provider_readiness || {};
+  stat("Providers configured", `${pr.capabilities_configured ?? "?"} of ${pr.capabilities_total ?? "?"}`);
+  card.append(row);
+  // composition runtimes available
+  const rts = pr.composition_runtimes || {};
+  const chips = el("div", { style: "display:flex;gap:8px;flex-wrap:wrap;align-items:center" });
+  chips.append(el("span", { style: "font-size:12px;color:var(--dim,#8a93a3)" }, "Composition runtimes:"));
+  for (const [name, ok] of Object.entries(rts)) {
+    chips.append(el("span", {
+      style: `font-size:12px;padding:3px 10px;border-radius:999px;border:1px solid ${ok ? "var(--ok,#5ec27a)" : "var(--line,#232a36)"};color:${ok ? "var(--ok,#5ec27a)" : "var(--dim,#8a93a3)"}`,
+    }, `${name} ${ok ? "✓" : "✗"}`));
+  }
+  card.append(chips);
+  return card;
+}
+
+// Live activity feed — the real steps the run took (from run.log). Always visible
+// (not a <details>) so you can see exactly what the preflight/planning did.
+function renderActivityLog(run) {
+  const log = run.log || [];
+  if (!log.length) return null;
+  const box = el("div", { class: "run-log",
+    style: "margin:12px 0;max-height:150px;overflow:auto;background:var(--night-2,#0c1224);border:1px solid var(--line,#232a36);border-radius:8px;padding:10px 12px" });
+  box.append(el("div", { style: "font-family:var(--mono,monospace);font-size:11px;letter-spacing:0.14em;text-transform:uppercase;color:var(--dim,#8a93a3);margin-bottom:6px" }, "Activity — what the run did"));
+  for (const e of log.slice(-40)) {
+    const line = el("div", { class: "mono", style: "font-size:12px;color:var(--cond,#93a0b4);padding:2px 0;display:flex;gap:8px" });
+    line.append(el("span", { style: "color:var(--dim,#8a93a3);flex:0 0 auto" }, (e.ts || "").slice(11, 19)));
+    line.append(el("span", {}, e.message || ""));
+    box.append(line);
+  }
+  box.scrollTop = 1e6;
+  return box;
+}
+
+// Expandable "what the models can do" — per-capability provider readiness.
+function renderProviderDetail(plan) {
+  const media = ((plan.provider_readiness || {}).media_capabilities) || [];
+  if (!media.length) return null;
+  const det = el("details", { class: "run-providers", style: "margin:12px 0" });
+  det.append(el("summary", { style: "cursor:pointer;color:var(--dim,#8a93a3);font-size:13px" },
+    "Providers & models — what this run can and can't generate"));
+  const grid = el("div", { style: "margin-top:10px;display:grid;grid-template-columns:1fr;gap:6px" });
+  for (const m of media) {
+    const ok = m.configured > 0;
+    const row = el("div", { style: "display:flex;align-items:center;gap:10px;font-size:13px" });
+    row.append(el("span", { style: `flex:0 0 150px;color:${ok ? "var(--bone,#e9e4d6)" : "var(--dim,#8a93a3)"}` }, m.capability));
+    row.append(el("span", { style: `flex:0 0 64px;color:${ok ? "var(--ok,#5ec27a)" : "var(--warn,#e8c07d)"}` }, `${m.configured}/${m.total}`));
+    row.append(el("span", { style: "color:var(--cond,#93a0b4)" },
+      (m.available_providers && m.available_providers.length) ? m.available_providers.join(", ") : "none configured — add a key in Settings"));
+    grid.append(row);
+  }
+  det.append(grid);
+  return det;
+}
+
+// Inline player for the free preview animatic once it exists.
+function previewSection(run) {
+  if (!run.preview || !run.preview.url) return null;
+  const wrap = el("div", { style: "margin:14px 0" });
+  wrap.append(el("div", { style: "font-family:var(--mono,monospace);font-size:11px;letter-spacing:0.14em;text-transform:uppercase;color:var(--amber,#e8c07d);margin-bottom:8px" },
+    `▶ Preview animatic · ${run.preview.measured_seconds != null ? run.preview.measured_seconds + "s" : "ready"} · free`));
+  wrap.append(el("video", { controls: "true", preload: "metadata", src: run.preview.url,
+    style: "width:100%;max-width:680px;border-radius:8px;border:1px solid var(--line,#232a36);background:#000" }));
+  return wrap;
+}
+
+function _inboxSig(inbox) {
+  if (!inbox) return "";
+  return [inbox.count, inbox.replan ? 1 : 0, (inbox.approval && inbox.approval.needs) || "",
+    (inbox.revisions || []).map((r) => r.id).join(",")].join("~");
+}
+
+function _runSig(run) {
+  const st = run.state || "not_started";
+  return [st, !!run.plan_approved, run.phase || "", run.activity || "",
+    (run.log || []).length, run.error || "", (run.preview && run.preview.at) || "",
+    _inboxSig(run._inbox),
+    boardHasProduction(currentState()) ? 1 : 0].join("|");
+}
+
+function currentState() { return replay ? stateAt(state, replay.t) : state; }
+
+function renderRunPanel(s) {
+  const wrap = el("div", { class: "board-empty run-panel" });
+  const body = el("div", {});
+  wrap.append(body);
+  lastRunSig = null;               // fresh panel → force first render
+  refreshRun(s, body, wrap, true);
+  return wrap;
+}
+
+// Fetch the run; only rebuild the DOM when it MATERIALLY changed (prevents the
+// every-poll flicker + collapse of expanded sections). Always updates the badge.
+async function refreshRun(s, body, wrap, force) {
+  let run;
+  try { run = await getJSON(`/api/project/${encodedProjectId}/run`); }
+  catch {
+    if (force) { body.textContent = ""; body.append(el("p", { class: "hint" }, "Could not load run status.")); }
+    _scheduleRunPoll(s, body, wrap, "running");
+    return;
+  }
+  // Best-effort: what's queued for the agent (revisions / re-plan / approval).
+  try { run._inbox = await getJSON(`/api/project/${encodedProjectId}/agent-inbox`); }
+  catch { run._inbox = null; }
+  const st = run.state || "not_started";
+  _setBadge(run);
+  if (boardHasProduction(s) && st === "not_started") { wrap.style.display = "none"; return; }
+  wrap.style.display = "";
+
+  const sig = _runSig(run);
+  if (force || sig !== lastRunSig) {
+    lastRunSig = sig;
+    renderRunBody(s, body, wrap, run);
+  }
+  _scheduleRunPoll(s, body, wrap, st);
+}
+
+function _scheduleRunPoll(s, body, wrap, st) {
+  if (runPollTimer) { clearTimeout(runPollTimer); runPollTimer = null; }
+  if (_ACTIVE_RUN_STATES.has(st)) {
+    // slower cadence for the durable waiting state; snappier while working
+    const ms = st === "waiting_for_approval" ? 4000 : 2000;
+    runPollTimer = setTimeout(() => refreshRun(s, body, wrap, false), ms);
+  }
+}
+
+function renderRunBody(s, body, wrap, run) {
+  const st = run.state || "not_started";
+  body.textContent = "";
+  const repaint = () => { lastRunSig = null; refreshRun(s, body, wrap, true); };
+  const disableBtns = () => [...wrap.querySelectorAll("button")].forEach((b) => { b.disabled = true; });
+  const act = async (url, msg) => {
+    disableBtns();
+    try { await mpost(url, msg || {}); }
+    catch (e) { body.append(el("p", { class: "hint", style: "color:var(--red)" }, e.message || "Action failed.")); }
+    repaint();
+  };
+  const start = () => act(`/api/project/${encodedProjectId}/run`);
+  const stop = () => { if (window.confirm("Stop this production run? Completed artifacts and checkpoints are preserved.")) act(`/api/project/${encodedProjectId}/run/cancel`, { run_id: run.run_id }); };
+  const startBtn = (label) => { const b = el("button", { class: "set-btn", type: "button" }, label); b.onclick = start; return b; };
+  const stopBtn = () => { const b = el("button", { class: "set-mini", type: "button", style: "border-color:var(--red);color:var(--red)" }, "■ Stop production"); b.onclick = stop; return b; };
+  const previewBtn = () => {
+    const b = el("button", { class: "set-mini", type: "button" }, run.preview ? "↻ Re-render preview" : "▶ Generate preview animatic (free)");
+    b.onclick = async () => {
+      disableBtns();
+      const note = el("p", { class: "hint", style: "color:var(--amber,#e8c07d)" }, "Rendering a free preview animatic locally (~20–40s)…");
+      body.append(note);
+      try { await mpost(`/api/project/${encodedProjectId}/run/preview`, {}); }
+      catch (e) { note.textContent = e.message || "Preview render failed."; note.style.color = "var(--red)"; setTimeout(repaint, 1800); return; }
+      repaint();
+    };
+    return b;
+  };
+
+  if (st === "not_started") {
+    body.append(el("h3", {}, "Production not started"));
+    body.append(el("p", { class: "hint" },
+      `Your workspace, brief and ${s.target_formatted || "target"} duration are saved — nothing is generating yet. ` +
+      "Start the local preflight & planning run: it validates your intake, reads the provider menu, and plans a " +
+      "frame-accurate timeline, then stops at the first approval point. No paid generation runs automatically."));
+    body.append(el("div", { class: "np-actions", style: "justify-content:flex-start" }, startBtn("▶ START PRODUCTION")));
+    body.append(advancedPrompt(s));
+  } else if (st === "starting" || st === "running" || st === "cancelling") {
+    body.append(el("h3", {}, st === "cancelling" ? "Cancelling…" : "Production running"));
+    body.append(el("p", { class: "run-activity" }, run.activity || ""));
+    const meta = el("p", { class: "hint mono" });
+    meta.textContent = `state: ${st}${run.phase ? " · phase: " + run.phase : ""}${run.started_at ? " · elapsed " + _elapsed(run.started_at) : ""}`;
+    body.append(meta);
+    const log = renderActivityLog(run); if (log) body.append(log);
+    if (st !== "cancelling") body.append(el("div", { class: "np-actions", style: "justify-content:flex-start" }, stopBtn()));
+  } else if (st === "waiting_for_approval") {
+    const approved = !!run.plan_approved;
+    body.append(el("h3", {}, approved ? "✓ Plan approved — awaiting your agent" : "◈ Review & approve the plan"));
+    body.append(el("p", { class: "run-activity" }, run.activity || ""));
+    if (run.plan) body.append(renderPlanCard(run.plan));
+    if (run.plan) { const pd = renderProviderDetail(run.plan); if (pd) body.append(pd); }
+    const pvs = previewSection(run); if (pvs) body.append(pvs);
+    const log = renderActivityLog(run); if (log) body.append(log);
+    if (!approved) {
+      body.append(el("p", { class: "hint" },
+        "This is the provider + proposal approval point. Review the plan above, then Approve to give your go-ahead. " +
+        "You can also render a free preview animatic of the plan now. Generating the full film's assets is agent-driven " +
+        "(Backlot never auto-runs paid generation)."));
+      const approveBtn = el("button", { class: "set-btn", type: "button" }, "✓ Approve plan");
+      approveBtn.onclick = () => act(`/api/project/${encodedProjectId}/run/approve`, { run_id: run.run_id });
+      body.append(el("div", { class: "np-actions", style: "justify-content:flex-start;gap:10px;flex-wrap:wrap" }, approveBtn, previewBtn(), _timelineLink(), stopBtn()));
+    } else {
+      body.append(el("p", { class: "hint" },
+        "✓ Approved. Nothing is generating automatically right now — that's by design: Backlot never runs paid " +
+        "generation on its own (Rule Zero). Producing the full film's assets happens through your agent, using the " +
+        "handoff shown in the Agent Queue below. The run stays here (cancellable) until the agent takes over."));
+      body.append(el("p", { class: "hint", style: "color:var(--amber,#e8c07d)" },
+        "To SEE real output now — for free, locally — open the timeline and hit “▶ Render preview film” for a complete " +
+        "Remotion render you can play, or render a quick preview animatic here."));
+      body.append(el("div", { class: "np-actions", style: "justify-content:flex-start;gap:10px;flex-wrap:wrap" }, _timelineLink(), previewBtn(), stopBtn()));
+      body.append(advancedPrompt(s));
+    }
+  } else if (st === "cancelled" || st === "failed" || st === "completed") {
+    const titleMap = { cancelled: "Run cancelled", failed: "Run failed", completed: "Production complete" };
+    body.append(el("h3", {}, titleMap[st]));
+    if (st === "failed" && run.error) body.append(el("p", { class: "hint", style: "color:var(--red)" }, run.error));
+    else body.append(el("p", { class: "hint" }, run.activity || ""));
+    const log = renderActivityLog(run); if (log) body.append(log);
+    body.append(el("div", { class: "np-actions", style: "justify-content:flex-start;gap:10px" }, startBtn("▶ Start again"), _timelineLink()));
+    if (st !== "completed") body.append(advancedPrompt(s));
+  }
+  if (run._inbox && run._inbox.count) body.append(renderAgentQueueBoard(run._inbox));
+}
+
+// Consolidated, honest view of what's queued for the agent (Rule Zero) — the
+// production hub shows exactly what the agent will pick up next.
+function renderAgentQueueBoard(inbox) {
+  const card = el("div", { style: "margin-top:14px;border:1px solid var(--amber,#e8c07d);border-radius:8px;padding:10px 12px;background:#1a1710" });
+  card.append(el("div", { style: "display:flex;justify-content:space-between;align-items:center;margin-bottom:6px" },
+    el("b", { style: "color:var(--amber,#e8c07d);font-size:12px;letter-spacing:0.1em" }, "AGENT QUEUE"),
+    el("span", { class: "mono", style: "font-size:11px;color:var(--amber,#e8c07d)" }, `${inbox.count} queued`)));
+  card.append(el("p", { class: "hint", style: "margin:0 0 6px" }, inbox.summary));
+  for (const r of (inbox.revisions || [])) {
+    card.append(el("div", { style: "font-size:12px;color:var(--bone,#e9e4d6)" },
+      `✦ ${r.layer_type || "layer"} ${r.layer_id} — “${String(r.prompt || "").slice(0, 80)}”`));
+  }
+  if (inbox.replan) card.append(el("div", { style: "font-size:12px;color:var(--bone,#e9e4d6)" },
+    "⟳ Duration re-plan requested — the agent will rebuild the timeline to the new length."));
+  if (inbox.approval && inbox.approval.needs === "agent") card.append(el("div", { style: "font-size:12px;color:var(--bone,#e9e4d6)" },
+    "▶ Plan approved — awaiting the agent to produce."));
+  card.append(el("p", { class: "hint", style: "margin:8px 0 0" },
+    "Honest, machine-readable requests the agent consumes — Backlot never generates media itself (Rule Zero)."));
+  card.append(el("div", { style: "margin-top:8px" }, _timelineLink()));
+  return card;
+}
+
+function boardHasProduction(s) {
+  return (s.stages || []).some((x) => x.status === "completed" || x.status === "in_progress")
+    || (s.storyboard && (s.storyboard.scenes || []).length)
+    || (s.renders && s.renders.length);
 }
 
 // ---------------------------------------------------------------------------
@@ -757,9 +1079,11 @@ function render() {
   document.title = `Backlot — ${s.title}`;
   document.body.classList.toggle("first", firstPaint);
   firstPaint = false;
+  if (runPollTimer) { clearTimeout(runPollTimer); runPollTimer = null; }
   app.innerHTML = "";
   app.append(renderSlate(s));
   app.append(renderRail(s));
+  app.append(renderRunPanel(s));
   const replayBar = renderReplayBar(state);
   if (replayBar) app.append(replayBar);
   const drawer = renderDrawer(s);
@@ -788,6 +1112,8 @@ function render() {
   if (found) app.append(found);
   const renders = renderRenders(s);
   if (renders) app.append(renders);
+
+  wireNewProjectButtons();
 }
 
 // Defensive normalization (F-02): the server contract guarantees these

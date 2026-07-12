@@ -6,7 +6,7 @@ PIP = $(RUN_PYTHON) -m pip
 
 .DEFAULT_GOAL := setup
 
-.PHONY: setup install install-dev install-gpu test test-contracts lint clean preflight demo demo-list hyperframes-doctor hyperframes-warm venv ensure-venv
+.PHONY: setup install install-dev install-gpu test test-contracts lint clean preflight demo demo-list hyperframes-doctor hyperframes-warm remotion-install remotion-doctor venv ensure-venv
 
 # ---- Virtual environment ----
 
@@ -109,6 +109,17 @@ hyperframes-warm:
 	@echo "    Uses --prefer-online so npx picks up new releases since your last run."
 	npx --yes --prefer-online hyperframes --version
 	@echo "==> Cache warm complete."
+
+# ---- Remotion runtime (deterministic, lockfile-based) ----
+
+remotion-install:
+	@echo "==> Installing Remotion dependencies from the lockfile (npm ci)..."
+	cd remotion-composer && npm ci --no-audit --no-fund
+	@echo "==> Done. Run 'make remotion-doctor' to verify render-readiness."
+
+remotion-doctor: ensure-venv
+	@echo "==> Probing Remotion runtime (node + local CLI/package parity + entry + browser)..."
+	$(RUN_PYTHON) -c "from lib import remotion_runtime as r; import json; d=r.doctor(); print(json.dumps(d, indent=2)); print('RENDER-READY' if d['available'] else ('INSTALLED (no browser)' if d['installed'] else 'NOT INSTALLED') + ': ' + d['reason'])"
 
 demo: ensure-venv
 	@echo "==> Rendering zero-key demo videos (no API keys needed)..."

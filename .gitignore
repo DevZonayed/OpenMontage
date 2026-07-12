@@ -43,6 +43,10 @@ music_library/
 .env.local
 *.env
 .youtube-token.json
+
+# Provider/engine UI preferences (per-machine; written by the Backlot settings
+# page). Contains only provider NAMES — never secrets — but is user-local state.
+providers.yaml
 # Google service-account / Vertex AI keys — never commit
 gcp-*.json
 *-service-account.json

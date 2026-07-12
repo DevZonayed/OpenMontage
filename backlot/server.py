@@ -2,13 +2,20 @@
 
 The watcher observes ``projects/`` with watchfiles; on any change it bumps a
 per-project version and wakes SSE subscribers, who tell the browser to
-refetch state. The server never writes to project directories.
+refetch state.
+
+Board reads are read-only. The only writes the server performs are through the
+narrow, CSRF-guarded ``POST /api/projects`` endpoint, which initializes a NEW
+project workspace + intake artifact via ``lib.project_intake.create_project``
+(canonical ``init_project``). Production itself remains agent-driven; the server
+never edits an existing project's pipeline artifacts.
 """
 
 from __future__ import annotations
 
 import asyncio
 import json
+import secrets
 import time
 from pathlib import Path
 from typing import Optional
@@ -23,8 +30,126 @@ UI_DIR = Path(__file__).resolve().parent / "ui"
 THUMB_CACHE_DIR = REPO_ROOT / ".backlot" / "thumbs"
 THUMB_WIDTHS = (320, 640, 960)
 
+# Provider/engine preferences file (module-level so tests can redirect it).
+PREFS_PATH = REPO_ROOT / "providers.yaml"
+
+# Process-scoped CSRF token: minted once per server process, handed to the
+# same-origin page via GET /api/csrf, and required (in a custom header) on EVERY
+# state-changing request. A cross-site page can't read it (same-origin policy)
+# and the custom header forces a CORS preflight we never permit — so a
+# cross-site POST cannot forge a mutation. Regenerated per process (per restart).
+_CSRF_TOKEN = secrets.token_urlsafe(32)
+_CSRF_HEADER = "x-openmontage-csrf"
+_MAX_MUTATION_BYTES = 16 * 1024  # generous for a key + small JSON; blocks abuse
+
+# ---------------------------------------------------------------------------
+# In-process per-client rate limiting for expensive/sensitive mutations.
+#
+# Dependency-free sliding-window limiter. Applies ONLY to costly or
+# security-sensitive POSTs (Z.AI credential lifecycle, engine OAuth actions,
+# project creation) — NEVER to safe GETs or the SSE feed. Keyed by the DIRECT
+# socket peer (``request.client.host``); we deliberately do NOT trust
+# ``X-Forwarded-For`` / ``X-Real-IP`` by default (Backlot binds loopback, and
+# honoring arbitrary proxy headers would let a caller forge unlimited keys).
+# Buckets are memory-bounded and stale-evicted. Checked AFTER the CSRF/origin
+# guard, so an unauthenticated flood 403s without consuming a victim's budget.
+# ---------------------------------------------------------------------------
+
+# (limit, window_seconds) per bucket. Generous enough that real UI flows (a few
+# clicks) never trip; tight enough to stop an automated abuse loop.
+_RATE_LIMITS = {
+    "credential": (20, 10.0),
+    "action": (20, 10.0),
+    "projects": (12, 10.0),
+    "runtime": (6, 60.0),  # runtime install/repair/verify are expensive + rare
+    "timeline": (30, 10.0),  # editor saves — frequent but bounded
+    "run": (10, 60.0),       # start/cancel a production run — spawns a worker
+    "render": (12, 60.0),    # single-frame stills — a subprocess each, but scrub-and-render is interactive
+    "inbox": (40, 10.0),     # agent-queue READ polled ~every 2s by the board — own bucket, never drains 'projects'
+}
+_RATE_MAX_KEYS = 4096  # hard cap on tracked buckets (memory bound)
+
+
+def _rate_now() -> float:
+    """Monotonic clock indirection so tests can pin/advance time deterministically."""
+    return time.monotonic()
+
+
+class _SlidingWindowRateLimiter:
+    """Tiny fixed-memory sliding-window limiter. Single-threaded by design: the
+    check runs on the event-loop thread before any ``to_thread`` offload."""
+
+    def __init__(self) -> None:
+        self._buckets: dict[tuple, list[float]] = {}
+
+    def hit(self, key: tuple, limit: int, window: float, now: float) -> tuple[bool, float]:
+        stamps = self._buckets.get(key)
+        if stamps is None:
+            stamps = []
+            self._buckets[key] = stamps
+        cutoff = now - window
+        drop = 0
+        for t in stamps:  # list is time-ordered; drop those outside the window
+            if t > cutoff:
+                break
+            drop += 1
+        if drop:
+            del stamps[:drop]
+        if len(stamps) >= limit:
+            return False, max(0.0, window - (now - stamps[0]))
+        stamps.append(now)
+        return True, 0.0
+
+    def evict_stale(self, now: float, max_window: float) -> None:
+        if not self._buckets:
+            return
+        dead = [k for k, v in self._buckets.items() if not v or now - v[-1] > max_window]
+        for k in dead:
+            self._buckets.pop(k, None)
+        if len(self._buckets) > _RATE_MAX_KEYS:  # hard memory cap
+            ordered = sorted(self._buckets, key=lambda k: self._buckets[k][-1])
+            for k in ordered[: len(self._buckets) - _RATE_MAX_KEYS]:
+                self._buckets.pop(k, None)
+
+    def clear(self) -> None:
+        self._buckets.clear()
+
+
+_rate_limiter = _SlidingWindowRateLimiter()
+_RATE_MAX_WINDOW = max(w for _, w in _RATE_LIMITS.values())
+
+
+def reset_rate_limits() -> None:
+    """Test hook: clear all rate-limit state between cases."""
+    _rate_limiter.clear()
+
+
+def _client_key(request: Request) -> str:
+    # DIRECT peer only — do NOT trust X-Forwarded-For / X-Real-IP by default.
+    return request.client.host if request.client else "unknown"
+
+
+def _enforce_rate(request: Request, bucket: str) -> None:
+    """Raise a sanitized 429 (+Retry-After) if this client exceeded ``bucket``."""
+    limit, window = _RATE_LIMITS[bucket]
+    now = _rate_now()
+    allowed, retry_after = _rate_limiter.hit((_client_key(request), bucket), limit, window, now)
+    _rate_limiter.evict_stale(now, _RATE_MAX_WINDOW)
+    if not allowed:
+        raise HTTPException(
+            status_code=429,
+            detail="too many requests; please slow down",
+            headers={"Retry-After": str(max(1, int(retry_after) + 1))},
+        )
+
+
 # Paths inside a project whose changes are pure noise for the board.
 _IGNORE_PARTS = {"node_modules", ".git", "__pycache__", ".cache"}
+# Run/timeline state files change frequently (worker heartbeat, editor saves) and
+# are surfaced by their own polling endpoints — don't trigger a full board SSE
+# re-render (which would flicker the UI and collapse expanded sections).
+_IGNORE_FILES = {"run.json", "run.json.tmp", "run_plan.json",
+                 "timeline.json", "timeline.json.tmp"}
 
 SSE_HEARTBEAT_SECONDS = 15
 
@@ -115,6 +240,8 @@ def _project_of_change(path_str: str) -> Optional[str]:
     parts = rel.replace("\\", "/").split("/")
     if _IGNORE_PARTS.intersection(parts):
         return None
+    if parts[-1] in _IGNORE_FILES:
+        return None
     return parts[0]
 
 
@@ -140,6 +267,16 @@ async def _watch_projects() -> None:
 def create_app() -> FastAPI:
     app = FastAPI(title="Backlot", docs_url=None, redoc_url=None)
 
+    @app.middleware("http")
+    async def _no_cache_ui(request: Request, call_next):
+        # The UI is a live local tool — never let the browser serve a stale
+        # board.js/settings.js after a restart (revalidate every load).
+        resp = await call_next(request)
+        p = request.url.path
+        if p.startswith("/ui/") or p in ("/", "/settings") or p.startswith("/p/"):
+            resp.headers["Cache-Control"] = "no-cache, must-revalidate"
+        return resp
+
     @app.on_event("startup")
     async def _startup() -> None:
         app.state.watch_task = asyncio.create_task(_watch_projects())
@@ -164,6 +301,283 @@ def create_app() -> FastAPI:
     async def project_state(project_id: str) -> dict:
         project_dir = _safe_project_dir(project_id)
         return await asyncio.to_thread(load_board_state, project_dir)
+
+    # ---- Providers / engines settings ---------------------------------
+    # Read: subscription engines + auth state, composition runtimes +
+    # diagnostics, media capabilities, and current preferences. Write:
+    # validated preferences only (no secrets — enforced in providers_api).
+
+    @app.get("/api/csrf")
+    async def csrf() -> dict:
+        """Hand the same-origin page its process-scoped CSRF token. A cross-site
+        page can send this GET but cannot READ the response (no permissive CORS),
+        so it can't obtain the token to forge a mutation."""
+        return {"csrf": _CSRF_TOKEN}
+
+    @app.get("/api/providers")
+    async def providers_get(probe: int = 1) -> dict:
+        from backlot.providers_api import build_providers_payload
+        return await asyncio.to_thread(
+            build_providers_payload, probe_auth=bool(probe), prefs_path=PREFS_PATH
+        )
+
+    @app.post("/api/providers")
+    async def providers_post(request: Request) -> dict:
+        from backlot.providers_api import PreferencesSaveError, save_preferences
+        body = await _guarded_json_body(request)
+        try:
+            return await asyncio.to_thread(save_preferences, body, prefs_path=PREFS_PATH)
+        except PreferencesSaveError as exc:
+            raise HTTPException(status_code=422 if exc.is_secret else 400, detail=str(exc))
+
+    @app.post("/api/providers/action")
+    async def providers_action(request: Request) -> dict:
+        """Allowlisted engine OAuth actions (status/connect/logout). No secrets
+        or raw command output ever leave lib.engine_actions."""
+        from lib.engine_actions import EngineActionError, run_engine_action
+        body = await _guarded_json_body(request)
+        _enforce_rate(request, "action")
+        engine = body.get("engine")
+        action = body.get("action")
+        confirm = bool(body.get("confirm", False))
+        try:
+            return await asyncio.to_thread(
+                run_engine_action, engine, action, confirm=confirm
+            )
+        except EngineActionError as exc:
+            raise HTTPException(status_code=400, detail=str(exc))
+
+    @app.post("/api/providers/credential")
+    async def providers_credential(request: Request) -> dict:
+        """Z.AI API-key lifecycle: store / verify / remove / launch. The key is
+        stored ONLY in the OS keychain and is never returned, logged, or echoed."""
+        from backlot.providers_api import CredentialError, handle_credential
+        body = await _guarded_json_body(request)
+        _enforce_rate(request, "credential")
+        try:
+            return await asyncio.to_thread(handle_credential, body)
+        except CredentialError as exc:
+            raise HTTPException(status_code=exc.status, detail=str(exc))
+
+    @app.post("/api/providers/runtime")
+    async def providers_runtime(request: Request) -> dict:
+        """Fixed, allowlisted composition-runtime maintenance (Remotion
+        verify/install/repair). No arbitrary package/command/path from the
+        caller; output is sanitized (booleans + a doctor report)."""
+        from lib.runtime_actions import RuntimeActionError, run_runtime_action
+        body = await _guarded_json_body(request)
+        _enforce_rate(request, "runtime")
+        runtime = body.get("runtime")
+        action = body.get("action")
+        try:
+            return await asyncio.to_thread(run_runtime_action, runtime, action)
+        except RuntimeActionError as exc:
+            raise HTTPException(status_code=getattr(exc, "status", 400), detail=str(exc))
+
+    # ---- New project (workspace + intake only; production stays agent-driven) --
+
+    @app.get("/api/pipelines")
+    async def pipelines() -> list:
+        from lib.project_intake import list_pipelines_meta
+        return await asyncio.to_thread(list_pipelines_meta)
+
+    @app.post("/api/projects")
+    async def create_project_route(request: Request) -> dict:
+        from lib.project_intake import ProjectIntakeError, create_project
+        body = await _guarded_json_body(request)
+        _enforce_rate(request, "projects")
+        try:
+            return await asyncio.to_thread(
+                create_project, body.get("title"), body.get("brief") or "",
+                body.get("pipeline"), project_id=body.get("project_id"), base=PROJECTS_DIR,
+                target_duration_seconds=body.get("target_duration_seconds"),
+            )
+        except ProjectIntakeError as exc:
+            raise HTTPException(status_code=exc.status, detail=str(exc))
+
+    @app.get("/api/project/{project_id}/intake")
+    async def project_intake_route(project_id: str) -> dict:
+        from lib.project_intake import read_intake
+        project_dir = _safe_project_dir(project_id)
+        return (await asyncio.to_thread(read_intake, project_dir)) or {}
+
+    @app.get("/api/project/{project_id}/timeline")
+    async def project_timeline_get(project_id: str) -> dict:
+        """Canonical timeline payload the editor + Remotion render both consume."""
+        from backlot.timeline_api import build_timeline_payload
+        project_dir = _safe_project_dir(project_id)
+        return await asyncio.to_thread(build_timeline_payload, project_dir)
+
+    @app.post("/api/project/{project_id}/frame")
+    async def project_frame_still(project_id: str, request: Request) -> dict:
+        """Render ONE real frame of the canonical timeline (pinned Remotion CLI,
+        free/local) — turns the editor's schematic monitor into actual pixels."""
+        from lib.frame_render import FrameRenderError, render_still
+        project_dir = _safe_project_dir(project_id)
+        body = await _guarded_json_body(request)
+        _enforce_rate(request, "render")
+        frame = body.get("frame", 0)
+        try:
+            frame = int(frame)
+        except (TypeError, ValueError):
+            raise HTTPException(status_code=400, detail="frame must be an integer")
+        try:
+            res = await asyncio.to_thread(render_still, project_dir, frame)
+        except FrameRenderError as exc:
+            raise HTTPException(status_code=400, detail=str(exc))
+        if not res.get("ok"):
+            raise HTTPException(status_code=400, detail=res.get("reason") or "Frame render failed.")
+        return res
+
+    @app.post("/api/project/{project_id}/timeline/render")
+    async def project_timeline_render(project_id: str, request: Request) -> dict:
+        """Render the WHOLE canonical timeline to a real (capped) MP4 via the pinned
+        Remotion CLI — the editor's complete, playable render (free/local)."""
+        from lib.timeline_render import render_timeline_preview
+        project_dir = _safe_project_dir(project_id)
+        await _guarded_json_body(request)   # CSRF + origin + size guard
+        _enforce_rate(request, "render")
+        res = await asyncio.to_thread(render_timeline_preview, project_dir)
+        if not res.get("ok"):
+            raise HTTPException(status_code=400, detail=res.get("reason") or "Timeline render failed.")
+        return res
+
+    @app.get("/api/project/{project_id}/agent-inbox")
+    async def project_agent_inbox(project_id: str, request: Request) -> dict:
+        """Read-only: everything currently queued for the agent (or awaiting the
+        user) — queued layer regenerations, a pending duration re-plan, and the
+        run approval state. Honest visibility, no generation (Rule Zero)."""
+        from lib.agent_inbox import pending_agent_work
+        project_dir = _safe_project_dir(project_id)
+        _enforce_rate(request, "inbox")
+        return await asyncio.to_thread(pending_agent_work, project_dir)
+
+    @app.post("/api/project/{project_id}/timeline/revision")
+    async def project_layer_revision(project_id: str, request: Request) -> dict:
+        """Queue an honest AI-regeneration request for ONE layer (agent-driven).
+        Does NOT generate anything — appends a versioned request + marks queued."""
+        from lib.revision_requests import RevisionError, queue_revision
+        project_dir = _safe_project_dir(project_id)
+        body = await _guarded_json_body(request)
+        _enforce_rate(request, "timeline")
+        layer_id = body.get("layer_id")
+        prompt = body.get("prompt")
+        if not isinstance(layer_id, str) or not layer_id:
+            raise HTTPException(status_code=400, detail="layer_id is required")
+        try:
+            return await asyncio.to_thread(
+                queue_revision, project_dir, layer_id, prompt, constraints=body.get("constraints"))
+        except RevisionError as exc:
+            raise HTTPException(status_code=getattr(exc, "status", 400), detail=str(exc))
+
+    @app.post("/api/project/{project_id}/duration")
+    async def project_duration_set(project_id: str, request: Request) -> dict:
+        """Change the canonical target duration. Edit-safe: if a timeline has layers
+        or the plan is approved, requires an explicit strategy and returns the
+        impact (409) until one is chosen."""
+        from lib.duration import DurationError
+        from lib.duration_edit import DurationEditConflict, change_target_duration
+        from lib.project_intake import ProjectIntakeError
+        project_dir = _safe_project_dir(project_id)
+        body = await _guarded_json_body(request)
+        _enforce_rate(request, "timeline")
+        try:
+            return await asyncio.to_thread(
+                change_target_duration, project_dir, body.get("duration"),
+                strategy=body.get("strategy"))
+        except DurationEditConflict as exc:
+            raise HTTPException(status_code=exc.status,
+                                detail={"error": "strategy_required", "impact": exc.impact})
+        except DurationError as exc:
+            raise HTTPException(status_code=400, detail=str(exc))
+        except ProjectIntakeError as exc:
+            raise HTTPException(status_code=getattr(exc, "status", 400), detail=str(exc))
+
+    @app.post("/api/project/{project_id}/timeline")
+    async def project_timeline_save(project_id: str, request: Request) -> dict:
+        """Save an edited timeline (validated, path-confined, optimistic-ETag)."""
+        from backlot.timeline_api import save_timeline_payload
+        from lib.timeline import TimelineError
+        project_dir = _safe_project_dir(project_id)
+        body = await _guarded_json_body(request)
+        _enforce_rate(request, "timeline")
+        try:
+            return await asyncio.to_thread(save_timeline_payload, project_dir, body)
+        except TimelineError as exc:
+            raise HTTPException(status_code=getattr(exc, "status", 400), detail=str(exc))
+
+    # ---- Production run lifecycle (real bounded free preflight/planning worker) --
+
+    @app.get("/api/project/{project_id}/run")
+    async def project_run_get(project_id: str) -> dict:
+        """Reconciled production-run state + the free preflight plan (run_plan.json)."""
+        from lib.production_run import get_run, read_plan
+        project_dir = _safe_project_dir(project_id)
+
+        def _payload():
+            run = get_run(project_dir)
+            run["plan"] = read_plan(project_dir)
+            return run
+        return await asyncio.to_thread(_payload)
+
+    @app.post("/api/project/{project_id}/run/approve")
+    async def project_run_approve(project_id: str, request: Request) -> dict:
+        """Record human approval of the preflight plan (does NOT auto-generate)."""
+        from lib.production_run import RunError, approve_plan
+        project_dir = _safe_project_dir(project_id)
+        body = await _guarded_json_body(request)
+        _enforce_rate(request, "run")
+        run_id = body.get("run_id")
+        if not isinstance(run_id, str) or not run_id:
+            raise HTTPException(status_code=400, detail="run_id is required")
+        try:
+            return await asyncio.to_thread(approve_plan, project_dir, run_id)
+        except RunError as exc:
+            raise HTTPException(status_code=getattr(exc, "status", 400), detail=str(exc))
+
+    @app.post("/api/project/{project_id}/run")
+    async def project_run_start(project_id: str, request: Request) -> dict:
+        """Start a real production run (idempotent — returns the active run if one
+        is already in progress). Spawns a fixed argv-only worker."""
+        from lib.production_run import RunError, start_run
+        from lib.project_intake import read_intake
+        project_dir = _safe_project_dir(project_id)
+        await _guarded_json_body(request)
+        _enforce_rate(request, "run")
+        intake = await asyncio.to_thread(read_intake, project_dir)
+        target = (intake or {}).get("target_duration_seconds")
+        try:
+            return await asyncio.to_thread(
+                start_run, project_dir, project_id, target_duration_seconds=target)
+        except RunError as exc:
+            raise HTTPException(status_code=getattr(exc, "status", 400), detail=str(exc))
+
+    @app.post("/api/project/{project_id}/run/preview")
+    async def project_run_preview(project_id: str, request: Request) -> dict:
+        """Render a FREE Remotion preview animatic of the plan (no paid media)."""
+        from lib.preview_render import generate_and_record
+        project_dir = _safe_project_dir(project_id)
+        await _guarded_json_body(request)
+        _enforce_rate(request, "run")
+        res = await asyncio.to_thread(generate_and_record, project_dir)
+        if not res.get("ok"):
+            raise HTTPException(status_code=400, detail=res.get("reason") or "Preview render failed.")
+        return res
+
+    @app.post("/api/project/{project_id}/run/cancel")
+    async def project_run_cancel(project_id: str, request: Request) -> dict:
+        """Cancel the EXACT active run (by run_id) — stops only that worker."""
+        from lib.production_run import RunError, cancel_run
+        project_dir = _safe_project_dir(project_id)
+        body = await _guarded_json_body(request)
+        _enforce_rate(request, "run")
+        run_id = body.get("run_id")
+        if not isinstance(run_id, str) or not run_id:
+            raise HTTPException(status_code=400, detail="run_id is required")
+        try:
+            return await asyncio.to_thread(cancel_run, project_dir, run_id)
+        except RunError as exc:
+            raise HTTPException(status_code=getattr(exc, "status", 400), detail=str(exc))
 
     @app.get("/api/project/{project_id}/events")
     async def project_events(project_id: str, request: Request) -> StreamingResponse:
@@ -262,6 +676,10 @@ def create_app() -> FastAPI:
 
     # ---- UI ------------------------------------------------------------
 
+    @app.get("/p/{project_id}/editor")
+    async def editor_page(project_id: str) -> FileResponse:
+        return FileResponse(UI_DIR / "editor.html")
+
     @app.get("/p/{project_id}")
     async def board_page(project_id: str) -> FileResponse:
         return FileResponse(UI_DIR / "board.html")
@@ -269,6 +687,15 @@ def create_app() -> FastAPI:
     @app.get("/p/{project_path:path}")
     async def board_page_path(project_path: str) -> FileResponse:
         return FileResponse(UI_DIR / "board.html")
+
+    @app.get("/settings")
+    async def settings_page() -> FileResponse:
+        return FileResponse(UI_DIR / "settings.html")
+
+    @app.get("/favicon.ico")
+    async def favicon():
+        from fastapi.responses import Response
+        return Response(status_code=204)  # no icon — silence the console 404
 
     @app.get("/")
     async def library_page() -> FileResponse:
@@ -278,6 +705,54 @@ def create_app() -> FastAPI:
         app.mount("/ui", StaticFiles(directory=UI_DIR), name="ui")
 
     return app
+
+
+async def _guarded_json_body(request: Request, *, max_bytes: int = _MAX_MUTATION_BYTES) -> dict:
+    """Validate a state-changing JSON request and return its parsed body.
+
+    Enforces (all with generic, sanitized errors):
+      * CSRF: the process-scoped token in the ``X-OpenMontage-CSRF`` header.
+      * Same-origin: if an Origin/Referer is present its host must match Host.
+      * Content-Type: application/json.
+      * Size bound: Content-Length (and the read body) within ``max_bytes``.
+    """
+    # --- CSRF token (constant-time compare) ---
+    token = request.headers.get(_CSRF_HEADER, "")
+    if not token or not secrets.compare_digest(token, _CSRF_TOKEN):
+        raise HTTPException(status_code=403, detail="missing or invalid CSRF token")
+
+    # --- Same-origin (Origin/Referer host must equal Host when present) ---
+    host = (request.headers.get("host") or "").split(",")[0].strip().lower()
+    origin = request.headers.get("origin") or request.headers.get("referer")
+    if origin:
+        from urllib.parse import urlparse
+        oh = (urlparse(origin).netloc or "").lower()
+        if host and oh and oh != host:
+            raise HTTPException(status_code=403, detail="cross-origin request rejected")
+
+    # --- Content-Type ---
+    ctype = (request.headers.get("content-type") or "").split(";")[0].strip().lower()
+    if ctype != "application/json":
+        raise HTTPException(status_code=415, detail="content-type must be application/json")
+
+    # --- Size bound ---
+    clen = request.headers.get("content-length")
+    if clen is not None:
+        try:
+            if int(clen) > max_bytes:
+                raise HTTPException(status_code=413, detail="request body too large")
+        except ValueError:
+            raise HTTPException(status_code=400, detail="invalid content-length")
+    raw = await request.body()
+    if len(raw) > max_bytes:
+        raise HTTPException(status_code=413, detail="request body too large")
+    try:
+        body = json.loads(raw or b"{}")
+    except Exception:
+        raise HTTPException(status_code=400, detail="request body must be valid JSON")
+    if not isinstance(body, dict):
+        raise HTTPException(status_code=400, detail="request body must be a JSON object")
+    return body
 
 
 def _safe_project_dir(project_id: str) -> Path:

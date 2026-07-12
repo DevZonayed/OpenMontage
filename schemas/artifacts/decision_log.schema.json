@@ -34,6 +34,7 @@
               "fallback_decision",
               "budget_tradeoff",
               "downgrade_approval",
+              "approval_policy",
               "music_source",
               "motion_commitment",
               "concept_selection",

@@ -6,6 +6,24 @@ export async function getJSON(url) {
   return res.json();
 }
 
+// POST JSON and return the parsed response. On a non-2xx, throws an Error whose
+// message is the server's `detail` (FastAPI convention) so callers can show it.
+// `extraHeaders` carries the CSRF token on mutations.
+export async function postJSON(url, body, extraHeaders = {}) {
+  const res = await fetch(url, {
+    method: "POST",
+    headers: { "Content-Type": "application/json", ...extraHeaders },
+    body: JSON.stringify(body),
+  });
+  let data = null;
+  try { data = await res.json(); } catch { /* empty/invalid body */ }
+  if (!res.ok) {
+    const detail = data && (data.detail || data.message);
+    throw new Error(detail || `${res.status} ${url}`);
+  }
+  return data;
+}
+
 export function el(tag, attrs = {}, ...children) {
   const node = document.createElement(tag);
   for (const [k, v] of Object.entries(attrs)) {

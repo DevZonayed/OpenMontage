@@ -1,0 +1,66 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Backlot — Providers &amp; Engines</title>
+<link rel="stylesheet" href="/ui/board.css">
+</head>
+<body>
+<div class="wrap">
+  <header class="slate">
+    <div class="clapper"></div>
+    <div>
+      <span class="wordmark">Backlot</span>
+      <h1>Providers &amp; Engines</h1>
+    </div>
+    <div class="spacer"></div>
+    <a class="chip nav-chip" href="/">← LIBRARY</a>
+    <span class="chip" id="saveState"></span>
+  </header>
+
+  <p class="hint" id="loadError" style="display:none;color:var(--red)"></p>
+  <p class="hint" id="loading">Loading…</p>
+
+  <section class="set-section">
+    <h2 class="set-h2">Subscription Engines</h2>
+    <p class="hint">Prefer your existing consumer subscriptions (OAuth) over paid per-call API keys. Detected from the installed CLIs; credentials never leave their own login stores. Only explicitly verified OAuth is treated as subscription-ready.</p>
+    <div class="set-grid" id="engines" aria-live="polite"></div>
+  </section>
+
+  <section class="set-section">
+    <h2 class="set-h2">Preferred Composition Runtime</h2>
+    <p class="hint">Your <strong>default</strong> runtime for turning generated code/scenes into video. This feeds — but is not — the per-project lock: each project still records its own <code>render_runtime</code> at the proposal stage with explicit approval and all considered runtimes. Unavailable runtimes are disabled with a reason and rejected on save (no silent swap).</p>
+    <div id="runtimeOptions" class="set-runtimes" role="radiogroup" aria-label="Preferred composition runtime"></div>
+    <div id="runtimeWarnings" class="set-warnings"></div>
+    <div class="set-field">
+      <label class="set-label" for="authoringMode">Authoring mode (default)</label>
+      <select id="authoringMode" class="set-select"></select>
+    </div>
+  </section>
+
+  <section class="set-section">
+    <h2 class="set-h2">Purpose → Engine Routing</h2>
+    <label class="set-toggle" for="subscriptionFirst">
+      <input type="checkbox" id="subscriptionFirst">
+      <span>Subscription-first (prefer consumer plans; fall back to API keys)</span>
+    </label>
+    <p class="hint">The agent honors these at preflight. The "effective" line shows which engine will actually serve each purpose given current sign-in state.</p>
+    <div class="set-grid" id="purposes"></div>
+  </section>
+
+  <section class="set-section">
+    <h2 class="set-h2">Media Generation</h2>
+    <p class="hint" id="imageSubNote"></p>
+    <p class="hint">Provider + model choices here are consumed directly by the image/video selectors.</p>
+    <div class="set-grid" id="media"></div>
+  </section>
+
+  <div class="set-actions">
+    <button class="set-btn" id="saveBtn" disabled>Save preferences</button>
+    <span class="hint" id="saveMsg" aria-live="polite"></span>
+  </div>
+</div>
+<script type="module" src="/ui/settings.js"></script>
+</body>
+</html>
