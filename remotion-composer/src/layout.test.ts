@@ -1,6 +1,7 @@
 import { describe, it, expect } from "vitest";
 import {
   audioRow,
+  audioRowsPlan,
   clampPercent,
   MAX_AUDIO_ROWS,
   safeArea,
@@ -103,6 +104,27 @@ describe("audioRow — stacked, non-overlapping presence rows", () => {
     }
     // distinct slots produce distinct positions
     expect(new Set(rows.map((r) => r.top)).size).toBe(MAX_AUDIO_ROWS);
+  });
+
+  it("CLAMPS out-of-range slots (never wraps a 4th row onto slot 0)", () => {
+    const slot0 = audioRow(0, W, H);
+    const beyond = audioRow(MAX_AUDIO_ROWS, W, H); // index == cap → would wrap to 0 under modulo
+    const wayBeyond = audioRow(99, W, H);
+    // Clamped to the last slot (top-most), NOT wrapped onto slot 0.
+    expect(beyond.top).not.toBe(slot0.top);
+    expect(wayBeyond.top).toBe(audioRow(MAX_AUDIO_ROWS - 1, W, H).top);
+  });
+});
+
+describe("audioRowsPlan — cap visible rows + overflow", () => {
+  it("shows all rows up to the cap with no overflow", () => {
+    expect(audioRowsPlan(0)).toEqual({ visible: 0, overflow: 0 });
+    expect(audioRowsPlan(1)).toEqual({ visible: 1, overflow: 0 });
+    expect(audioRowsPlan(MAX_AUDIO_ROWS)).toEqual({ visible: MAX_AUDIO_ROWS, overflow: 0 });
+  });
+  it("caps visible rows and reports the overflow for extra layers", () => {
+    expect(audioRowsPlan(MAX_AUDIO_ROWS + 1)).toEqual({ visible: MAX_AUDIO_ROWS, overflow: 1 });
+    expect(audioRowsPlan(MAX_AUDIO_ROWS + 4)).toEqual({ visible: MAX_AUDIO_ROWS, overflow: 4 });
   });
 });
 

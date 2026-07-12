@@ -95,8 +95,10 @@ export interface AudioRow {
 
 /**
  * Stable, non-overlapping slot for one audio-presence row. `index` is the audio
- * layer's fixed position among the audio layers, so simultaneously-playing rows
- * stack (bottom-up) inside the audio band and never overpaint each other.
+ * layer's fixed position (0..MAX_AUDIO_ROWS-1), so simultaneously-playing rows
+ * stack (bottom-up) inside the audio band and never overpaint each other. The
+ * slot is CLAMPED (never wrapped) — a caller must cap the visible row count with
+ * `audioRowsPlan`, so out-of-range indices can never land on top of slot 0.
  */
 export function audioRow(index: number, width: number, height: number): AudioRow {
   const s = safeArea(width, height);
@@ -104,10 +106,21 @@ export function audioRow(index: number, width: number, height: number): AudioRow
   const rows = MAX_AUDIO_ROWS;
   const gap = Math.round(band.height * 0.08);
   const rowHeight = Math.floor((band.height - gap * (rows - 1)) / rows);
-  const slot = ((index % rows) + rows) % rows; // defensive wrap
+  const slot = Math.min(Math.max(0, Math.trunc(index)), rows - 1); // clamp, never wrap
   // Stack from the bottom of the band upward: slot 0 lowest.
   const top = band.top + (rows - 1 - slot) * (rowHeight + gap);
   return { top, height: rowHeight, left: s.left, width: s.width };
+}
+
+/**
+ * How many audio-presence rows to draw for `count` audio layers, and how many
+ * overflow beyond the visible cap (shown as a "+N" indicator instead of a row
+ * stacked on top of another). Guarantees visible rows fit the band without overlap.
+ */
+export function audioRowsPlan(count: number): { visible: number; overflow: number } {
+  const n = Math.max(0, Math.trunc(count));
+  const visible = Math.min(n, MAX_AUDIO_ROWS);
+  return { visible, overflow: n - visible };
 }
 
 /**

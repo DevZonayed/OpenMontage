@@ -13,7 +13,8 @@ import {
 } from "remotion";
 import {
   audioRow,
-  safeArea,
+  audioRowsPlan,
+  MAX_AUDIO_ROWS,
   truncateLabel,
   volumePercent,
   zoneRect,
@@ -138,15 +139,19 @@ function useEnvelope(dur: number, fade?: Fade) {
   return { frame, enter, appear: Math.min(enter, out, fadeIn) };
 }
 
-type TransitionStyle = { opacity: number; transform: string; clipPath?: string };
-function transitionStyle(frame: number, dur: number, tin?: Transition, tout?: Transition): TransitionStyle {
+export type TransitionStyle = { opacity: number; transform: string; clipPath?: string };
+export function transitionStyle(frame: number, dur: number, tin?: Transition, tout?: Transition): TransitionStyle {
   let opacity = 1;
   let tx = 0;
   const ty = 0;
   let scale = 1;
   let clip = "";
   const apply = (t: Transition, phase: "in" | "out", p: number) => {
-    const k = phase === "in" ? p : 1 - p;
+    // `p` already encodes direction: "in" rises 0→1; the caller passes the
+    // REMAINING progress for "out", which falls 1→0. Use it directly so an exit
+    // actually fades/zooms OUT toward the end instead of re-showing the outgoing
+    // text during the hand-off frames. (`phase` only picks the slide direction.)
+    const k = p;
     switch (t.kind) {
       case "fade":
         opacity *= k;
@@ -195,7 +200,18 @@ const ZoneBox: React.FC<{
   const { width, height } = useVideoConfig();
   const r = zoneRect(zone, width, height);
   return (
-    <div style={{ position: "absolute", left: r.left, top: r.top, width: r.width, height: r.height, ...style }}>
+    <div
+      style={{
+        position: "absolute",
+        left: r.left,
+        top: r.top,
+        width: r.width,
+        height: r.height,
+        // Hard clip: nothing in a zone can ever escape its band into another zone.
+        overflow: "hidden",
+        ...style,
+      }}
+    >
       {children}
     </div>
   );
@@ -380,9 +396,12 @@ const CaptionScene: React.FC<{ layer: TimelineLayer }> = ({ layer }) => {
           transform: `translateY(${yy}px)`,
           background: "rgba(10,12,20,0.72)",
           border: `1px solid ${accentOf(layer.type)}55`,
-          padding: "16px 34px",
+          padding: "10px 30px",
           borderRadius: 12,
-          maxWidth: "88%",
+          maxWidth: "90%",
+          maxHeight: "100%",
+          overflow: "hidden",
+          boxSizing: "border-box",
           textAlign: "center",
         }}
       >
@@ -391,17 +410,40 @@ const CaptionScene: React.FC<{ layer: TimelineLayer }> = ({ layer }) => {
             color: BONE,
             fontFamily: "system-ui, sans-serif",
             fontWeight: 600,
-            fontSize: 44,
-            lineHeight: 1.12,
+            fontSize: 34,
+            lineHeight: 1.16,
             letterSpacing: "-0.01em",
+            // Hard 2-line clamp so a long caption never grows past the band.
+            display: "-webkit-box",
+            WebkitLineClamp: 2,
+            WebkitBoxOrient: "vertical",
+            overflow: "hidden",
           }}
         >
-          {truncateLabel(layer.text || "Caption", 96)}
+          {truncateLabel(layer.text || "Caption", 88)}
         </div>
       </div>
     </ZoneBox>
   );
 };
+
+// Per-layer volume envelope (base volume × optional fade in/out), shared by the
+// visible presence row and the audio-only extras so both play identical audio.
+function audioVolumeFn(layer: TimelineLayer): (f: number) => number {
+  const vol = typeof layer.volume === "number" ? Math.min(1, Math.max(0, layer.volume)) : 1;
+  const dur = Math.max(1, layer.duration_frames);
+  return (f: number) => {
+    let v = vol;
+    if (layer.fade?.inFrames) v *= interpolate(f, [0, layer.fade.inFrames], [0, 1], { extrapolateRight: "clamp" });
+    if (layer.fade?.outFrames)
+      v *= interpolate(f, [dur - layer.fade.outFrames, dur], [1, 0], { extrapolateLeft: "clamp" });
+    return Math.min(1, Math.max(0, v));
+  };
+}
+
+// Extra audio layers beyond the visible-row cap still contribute their audio.
+const AudioOnly: React.FC<{ layer: TimelineLayer }> = ({ layer }) =>
+  isLoadableUrl(layer.source) ? <Audio src={layer.source} volume={audioVolumeFn(layer)} /> : null;
 
 // ── Consolidated audio-presence: one fixed, non-overlapping row per audio layer ─
 const AudioRowStrip: React.FC<{ layer: TimelineLayer; slot: number }> = ({ layer, slot }) => {
@@ -410,15 +452,8 @@ const AudioRowStrip: React.FC<{ layer: TimelineLayer; slot: number }> = ({ layer
   const row = audioRow(slot, width, height);
   const accent = accentOf(layer.type);
   const vol = typeof layer.volume === "number" ? Math.min(1, Math.max(0, layer.volume)) : 1;
-  const dur = Math.max(1, layer.duration_frames);
   const { appear } = useEnvelope(layer.duration_frames, layer.fade);
-  const volAt = (f: number) => {
-    let v = vol;
-    if (layer.fade?.inFrames) v *= interpolate(f, [0, layer.fade.inFrames], [0, 1], { extrapolateRight: "clamp" });
-    if (layer.fade?.outFrames)
-      v *= interpolate(f, [dur - layer.fade.outFrames, dur], [1, 0], { extrapolateLeft: "clamp" });
-    return Math.min(1, Math.max(0, v));
-  };
+  const volAt = audioVolumeFn(layer);
   const name = layer.type === "narration" ? "◗ narration" : layer.type === "music" ? "♪ music" : "♪ sfx";
   const bars = 40;
   return (
@@ -469,20 +504,64 @@ const AudioRowStrip: React.FC<{ layer: TimelineLayer; slot: number }> = ({ layer
   );
 };
 
-const AudioPresence: React.FC<{ layers: TimelineLayer[] }> = ({ layers }) => (
-  <>
-    {layers.map((l, i) => (
-      <Sequence
-        key={l.id}
-        from={Math.max(0, l.start_frame)}
-        durationInFrames={Math.max(1, l.duration_frames)}
-        name={`audio:${l.type}:${l.id}`}
-      >
-        <AudioRowStrip layer={l} slot={i} />
-      </Sequence>
-    ))}
-  </>
-);
+// Persistent "+N more audio" chip when there are more audio layers than visible rows.
+const AudioOverflowChip: React.FC<{ count: number }> = ({ count }) => {
+  const { width, height } = useVideoConfig();
+  const row = audioRow(MAX_AUDIO_ROWS - 1, width, height); // top-most visible slot
+  return (
+    <div
+      style={{
+        position: "absolute",
+        left: row.left,
+        top: Math.max(0, row.top - 30),
+        color: DIM,
+        fontFamily: "ui-monospace, monospace",
+        fontSize: 18,
+        letterSpacing: "0.06em",
+        textTransform: "uppercase",
+        background: "rgba(0,0,0,0.35)",
+        border: `1px solid ${DIM}55`,
+        borderRadius: 999,
+        padding: "3px 12px",
+      }}
+    >
+      +{count} more audio
+    </div>
+  );
+};
+
+// Cap visible presence rows at MAX_AUDIO_ROWS (never wrap a 4th row onto slot 0);
+// extras still play their audio and are counted in an overflow indicator.
+const AudioPresence: React.FC<{ layers: TimelineLayer[] }> = ({ layers }) => {
+  const { visible, overflow } = audioRowsPlan(layers.length);
+  const shown = layers.slice(0, visible);
+  const extra = layers.slice(visible);
+  return (
+    <>
+      {shown.map((l, i) => (
+        <Sequence
+          key={l.id}
+          from={Math.max(0, l.start_frame)}
+          durationInFrames={Math.max(1, l.duration_frames)}
+          name={`audio:${l.type}:${l.id}`}
+        >
+          <AudioRowStrip layer={l} slot={i} />
+        </Sequence>
+      ))}
+      {extra.map((l) => (
+        <Sequence
+          key={l.id}
+          from={Math.max(0, l.start_frame)}
+          durationInFrames={Math.max(1, l.duration_frames)}
+          name={`audio-extra:${l.type}:${l.id}`}
+        >
+          <AudioOnly layer={l} />
+        </Sequence>
+      ))}
+      {overflow > 0 ? <AudioOverflowChip count={overflow} /> : null}
+    </>
+  );
+};
 
 // Elegant title card when the timeline has no visible layers yet.
 const TitleCard: React.FC<{ meta?: TimelineMeta }> = ({ meta }) => {
