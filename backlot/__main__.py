@@ -82,7 +82,14 @@ def cmd_open(project_id: str | None) -> int:
 def cmd_serve(port: int) -> int:
     import uvicorn
 
-    uvicorn.run("backlot.server:app", host="127.0.0.1", port=port, log_level="warning")
+    from backlot.server import create_app
+
+    # Publish the ACTUAL bound port to the process env (subprocess/frame renders read
+    # it too), AND build the app with the EXACT loopback base this server binds — the
+    # render endpoints get the trusted base from the real runtime, not an inference.
+    os.environ["BACKLOT_PORT"] = str(port)
+    app = create_app(render_base_url=f"http://127.0.0.1:{port}")
+    uvicorn.run(app, host="127.0.0.1", port=port, log_level="warning")
     return 0
 
 

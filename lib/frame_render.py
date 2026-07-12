@@ -34,6 +34,8 @@ def render_still(project_dir: Path, frame: int, *,
                  runner: Optional[Callable] = None,
                  browser: Optional[str] = None,
                  timeout: int = 120,
+                 base_url: Optional[str] = None,
+                 port: Optional[int] = None,
                  doctor: Optional[Callable] = None) -> dict:
     """Render a single real frame of the timeline. Returns a sanitized result dict.
 
@@ -67,11 +69,15 @@ def render_still(project_dir: Path, frame: int, *,
     # two overlapping renders of the same frame can never serve a torn PNG.
     tmp_out = out.parent / f"frame_{frame}.{secrets.token_hex(4)}.tmp.png"
 
+    # projectId + trusted loopback assetBaseUrl → the still resolves project-local
+    # media to the same /media URL the Player uses (operational parity). NEVER fall
+    # back to empty meta: a still rendered without parity meta would silently show a
+    # placeholder for real media while reporting success. Fail closed instead.
+    from lib import render_meta as _render_meta
     try:
-        from lib.timeline_render import build_meta
-        meta = build_meta(d)
-    except Exception:
-        meta = {}
+        meta = _render_meta.build_render_meta(d, base_url=base_url, port=port)
+    except Exception as exc:
+        return {"ok": False, "reason": f"Render base is not configured or invalid: {exc}"}
     with tempfile.TemporaryDirectory() as td:
         pf = Path(td) / "timeline_props.json"
         pf.write_text(json.dumps({"timeline": timeline, "meta": meta}), encoding="utf-8")

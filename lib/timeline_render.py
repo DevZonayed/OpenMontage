@@ -20,6 +20,7 @@ from typing import Callable, Optional
 
 from lib import duration as _dur
 from lib import remotion_runtime as _rr
+from lib import render_meta as _render_meta
 from lib import timeline as _tl
 
 COMPOSITION_ID = "TimelineFrame"
@@ -61,6 +62,8 @@ def render_timeline_preview(project_dir: Path, *,
                             runner: Optional[Callable] = None,
                             browser: Optional[str] = None,
                             timeout: int = 600,
+                            base_url: Optional[str] = None,
+                            port: Optional[int] = None,
                             doctor: Optional[Callable] = None) -> dict:
     """Render the timeline to a real MP4 (capped to ``max_frames``). Sanitized result."""
     d = Path(project_dir).resolve()
@@ -84,7 +87,15 @@ def render_timeline_preview(project_dir: Path, *,
     out.parent.mkdir(parents=True, exist_ok=True)
     tmp_out = out.parent / f"timeline_preview.{secrets.token_hex(4)}.tmp.mp4"
 
-    props = {"timeline": timeline, "meta": build_meta(d)}
+    # meta carries the canonical projectId + the trusted loopback assetBaseUrl so
+    # the headless CLI render resolves project-local media to the SAME /media URL
+    # the Player uses (operational media parity) — no placeholder in the final film.
+    # Fail closed if the base can't be built rather than render without parity meta.
+    try:
+        meta = _render_meta.build_render_meta(d, base_url=base_url, port=port)
+    except Exception as exc:
+        return {"ok": False, "reason": f"Render base is not configured or invalid: {exc}"}
+    props = {"timeline": timeline, "meta": meta}
     with tempfile.TemporaryDirectory() as td:
         pf = Path(td) / "timeline_props.json"
         pf.write_text(json.dumps(props), encoding="utf-8")

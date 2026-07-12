@@ -1,0 +1,74 @@
+{
+  "timeline": {
+    "version": "1.0",
+    "fps": 30,
+    "target_duration_seconds": 8,
+    "total_frames": 240,
+    "width": 1920,
+    "height": 1080,
+    "layers": [
+      {
+        "id": "bg1",
+        "type": "image",
+        "track": 0,
+        "start_frame": 0,
+        "duration_frames": 240,
+        "z": 0,
+        "enabled": true,
+        "opacity": 1,
+        "source": "http://127.0.0.1:4760/qa-photo.png",
+        "text": "Establishing shot — real generated media"
+      },
+      {
+        "id": "title1",
+        "type": "text",
+        "track": 1,
+        "start_frame": 30,
+        "duration_frames": 190,
+        "z": 3,
+        "enabled": true,
+        "opacity": 1,
+        "title": "PREVIEW = RENDER",
+        "subtitle": "one canonical composition",
+        "transitionIn": { "kind": "fade", "durationFrames": 12 }
+      },
+      {
+        "id": "cap1",
+        "type": "caption",
+        "track": 1,
+        "start_frame": 30,
+        "duration_frames": 190,
+        "z": 4,
+        "enabled": true,
+        "opacity": 1,
+        "text": "Caption, lower-third, title and two audio tracks share the frame without colliding."
+      },
+      {
+        "id": "narr1",
+        "type": "narration",
+        "track": 2,
+        "start_frame": 0,
+        "duration_frames": 240,
+        "z": 1,
+        "enabled": true,
+        "opacity": 1,
+        "volume": 1,
+        "source": "http://127.0.0.1:4760/qa-tone.mp3"
+      },
+      {
+        "id": "music1",
+        "type": "music",
+        "track": 2,
+        "start_frame": 0,
+        "duration_frames": 240,
+        "z": 0,
+        "enabled": true,
+        "opacity": 1,
+        "volume": 0.4,
+        "fade": { "inFrames": 15, "outFrames": 20 },
+        "source": "http://127.0.0.1:4760/qa-tone.mp3"
+      }
+    ]
+  },
+  "meta": { "title": "QA Render", "pipeline": "animation", "targetFormatted": "0:08" }
+}
