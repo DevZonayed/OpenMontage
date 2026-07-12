@@ -75,6 +75,16 @@ const RUN_STATE_COLOR: Record<string, string> = {
   completed: C.green,
 };
 
+// Classify a blocker option label into the control it should invoke. `cancel`
+// MUST take precedence over `retry` so a "Retry cancellation" option re-attempts
+// the CANCEL, never a stage retry. Unknown labels → null (no automated action).
+export function blockerOptionIntent(opt: string): "cancel" | "resume" | "retry" | null {
+  if (/cancel/i.test(opt)) return "cancel";
+  if (/resume/i.test(opt)) return "resume";
+  if (/retry/i.test(opt)) return "retry";
+  return null;
+}
+
 function fmtElapsed(sec: number | null | undefined): string {
   if (typeof sec !== "number") return "—";
   const m = Math.floor(sec / 60);
@@ -250,20 +260,33 @@ export const BrainPanel: React.FC<{ client: BacklotClient }> = ({ client }) => {
               <div style={{ fontSize: 11 }}>{b.message}</div>
               {b.options?.length ? (
                 <div style={{ display: "flex", gap: 6, marginTop: 6, flexWrap: "wrap" }}>
-                  {b.options.map((opt, i) => (
-                    <button
-                      key={i}
-                      style={mini}
-                      disabled={busy}
-                      onClick={() =>
-                        /retry|cancel/i.test(opt) && b.stage
-                          ? control(() => client.retryStage(b.stage as string, runId, jobId), "Retry requested.")
-                          : undefined
-                      }
-                    >
-                      {opt}
-                    </button>
-                  ))}
+                  {b.options.map((opt, i) => {
+                    // Route by intent. `cancel` MUST win over `retry` because a
+                    // "Retry cancellation" option is a cancel re-attempt, not a
+                    // stage retry. Unsupported options are shown disabled (no-op).
+                    const runnable = runId !== null;
+                    const intent = blockerOptionIntent(opt);
+                    let handler: (() => void) | null = null;
+                    if (intent === "cancel" && runId) {
+                      handler = () => control(() => client.cancelRun(runId), "Cancellation re-requested.");
+                    } else if (intent === "resume" && runId) {
+                      handler = () => control(() => client.resumeRun(runId, jobId), "Resume requested.");
+                    } else if (intent === "retry" && b.stage) {
+                      handler = () => control(() => client.retryStage(b.stage as string, runId, jobId), "Retry requested.");
+                    }
+                    const supported = handler !== null && runnable;
+                    return (
+                      <button
+                        key={i}
+                        style={{ ...mini, opacity: supported ? 1 : 0.5, cursor: supported ? "pointer" : "not-allowed" }}
+                        disabled={busy || !supported}
+                        title={supported ? undefined : "This blocker option has no automated action."}
+                        onClick={() => handler?.()}
+                      >
+                        {opt}
+                      </button>
+                    );
+                  })}
                 </div>
               ) : null}
             </div>
