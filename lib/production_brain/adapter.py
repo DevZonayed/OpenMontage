@@ -123,34 +123,31 @@ class BrainAdapter:
                 f"{self.name} brain is unavailable; a production run cannot be "
                 "orchestrated. Configure/sign in to the orchestrator and retry."
             )
-        # Idempotency: if a run is already active, return it — do NOT provision a
-        # second external job. (The store's single-lock start is the ultimate
-        # guard; this avoids a redundant provisioning call in the common case.)
-        existing = store.read_state()
-        if existing.get("state") in S.ACTIVE_RUN_STATES:
-            out = dict(existing)
-            out["already_active"] = True
-            return out
-        run_id = run_id or store._gen_id()
-        session_id, job_id, orchestration = self._provision(
-            project_id=store.project_dir.name, run_id=run_id,
-            requested_duration_seconds=requested_duration_seconds)
-        ident = self.identity()
-        brain_block = {
-            **ident.to_brain_block(),
-            "session_id": session_id,
-            "job_id": job_id,
-            "orchestration": orchestration,
-            "external": bool(self._external),
-        }
-        return store.start(
+
+        def _provisioner(rid: str):
+            # Invoked by the store ONLY for the winner of the idempotency race,
+            # while it holds the per-project lock — so exactly one external job is
+            # ever created (the loser never reaches here). Raising here fails the
+            # start closed without opening a run.
+            session_id, job_id, orchestration = self._provision(
+                project_id=store.project_dir.name, run_id=rid,
+                requested_duration_seconds=requested_duration_seconds)
+            ident = self.identity()
+            brain_extra = {
+                **ident.to_brain_block(),
+                "session_id": session_id,
+                "job_id": job_id,
+                "orchestration": orchestration,
+                "external": bool(self._external),
+            }
+            msg = message or self._start_message(ident, job_id, orchestration)
+            return session_id, job_id, brain_extra, msg
+
+        return store.start_provisioned(
+            provision=_provisioner,
             run_id=run_id,
-            brain=brain_block,
             requested_duration_seconds=requested_duration_seconds,
-            agent_id=ident.agent_id,
-            session_id=session_id,
-            job_id=job_id,
-            message=message or self._start_message(ident, job_id, orchestration),
+            message=message,
         )
 
     def _start_message(self, ident: "BrainIdentity", job: Optional[str], orchestration: str) -> str:

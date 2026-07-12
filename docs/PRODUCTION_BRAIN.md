@@ -100,7 +100,8 @@ is exactly how crash/restart recovery works.
 |---|---|
 | Atomic, durable writes | events appended + fsync'd, then `state.json` written via temp+`os.replace`, all under an advisory file lock |
 | Monotonic ordering | `seq` assigned under the lock from the max seq in the log |
-| Idempotent start | one active run per project; the active-run check and the `run_started` append happen under a **single lock hold**, so two concurrent starts cannot both append — exactly one wins, the rest get `already_active=true` |
+| Idempotent start | one active run per project; the active-run check, the **external job provisioning**, and the `run_started` append all happen under a **single per-project lock hold**, so of two concurrent starts only the winner ever calls the orchestrator — exactly one external job is created (no orphans); the rest get `already_active=true` |
+| Correlated control | every post-`run_started` event (stage/tool/**retry/resume/cancel**/complete) is structurally stamped with the run's persisted external `session_id`/`job_id` from `state["brain"]`, so restart/cancel/retry correlation is machine-verifiable — not message text |
 | No impossible events | every event is validated against the current run **under the same lock** as its append: an event before a run starts, after it is terminal, or with a mismatched `run_id` is **rejected (409), not persisted**. Strict folding also rejects an impossible coarse-state transition before it reaches the log |
 | Project-scoped cancel | validates the **exact** `run_id`; touches only this project |
 | Retry / resume | `retry` reopens a failed/blocked stage; `resume` recomputes state from the log and continues |
@@ -158,13 +159,18 @@ brain unavailable), `413` (body too large), `415` (wrong content-type), `429`
 
 `action` ∈ `learn | promote | correct | reject | delete | opt_out`.
 
-**Learning evidence is verified, not client-asserted.** A project-scope `learn`:
+**Learning evidence is verified, not client-asserted** — enforcement lives in
+`StyleLearningStore.learn` itself (project-scope only), not merely in the API. A
+project-scope `learn`:
 - requires an **explicit** `source ∈ {approval, correction}` — it is NEVER
   defaulted (a missing/opaque source ⇒ `400`);
 - requires nonempty `run_id`, `stage`, and `decision_ref`; and
-- is verified against the **authoritative append-only event log**: a matching,
-  non-rejected user approval/correction decision for that run + stage must exist
-  (a forged/mismatched ref, or a *rejected* decision ⇒ `409`).
+- is verified against the **authoritative append-only event log**. For
+  `source="approval"` a non-rejected `approval_granted` for that run+stage,
+  referenced by its `approval_id`, must exist. For `source="correction"` a
+  **distinct authoritative `correction` event** for that run+stage/ref must exist
+  — an approval or a generic `decision` event does **not** count. A forged/
+  mismatched ref, a *rejected* approval, or approval-as-correction ⇒ `409`.
 
 A **global** preference cannot be learned directly (`400`): it must be
 `promote`d from a **verified** (`provenance.verified == true`) project preference

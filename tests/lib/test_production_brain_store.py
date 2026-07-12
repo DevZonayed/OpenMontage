@@ -160,6 +160,36 @@ class TestStateMachine:
         assert rstage["status"] == "active" and rstage["error"] is None
 
 
+class TestControlEventsCarryExternalHandle:
+    def _started_with_handle(self, tmp_path):
+        s = _store(tmp_path)
+        s.start(brain={"name": "hermes", "adapter": "hermes", "session_id": "sess-9",
+                       "job_id": "job-9", "external": True},
+                requested_duration_seconds=120, session_id="sess-9", job_id="job-9")
+        return s
+
+    def test_stage_and_control_events_are_stamped_with_session_job(self, tmp_path):
+        s = self._started_with_handle(tmp_path)
+        s.enter_stage("research")
+        s.complete_stage("research")
+        s.retry_stage("research", run_id="run_1")
+        s.resume()
+        s.cancel("run_1")
+        by_type = {}
+        for e in s.read_events_raw():
+            by_type.setdefault(e["type"], []).append(e)
+        # Every post-start event structurally carries the persisted external handle.
+        for etype in ("stage_entered", "stage_completed", "retry", "resume", "run_cancelled"):
+            ev = by_type[etype][-1]
+            assert ev.get("session_id") == "sess-9", (etype, ev)
+            assert ev.get("job_id") == "job-9", (etype, ev)
+
+    def test_run_started_carries_its_own_handle(self, tmp_path):
+        s = self._started_with_handle(tmp_path)
+        started = [e for e in s.read_events_raw() if e["type"] == "run_started"][0]
+        assert started["session_id"] == "sess-9" and started["job_id"] == "job-9"
+
+
 class TestCancel:
     def test_cancel_exact_id(self, tmp_path):
         s = _started(tmp_path)

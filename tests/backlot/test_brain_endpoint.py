@@ -289,6 +289,28 @@ class TestVerifiedLearningApi:
             "stage": "proposal", "decision_ref": ref})
         assert r.status_code == 409
 
+    def test_correction_source_needs_a_correction_event(self, client):
+        # An approval ref must NOT satisfy a correction-sourced learn.
+        store = _seed(client, approver="auto")
+        appr = _approval_ref(store)
+        r = _post(client, "/api/project/demo/preferences", {
+            "action": "learn", "scope": "project", "category": "pacing", "key": "x",
+            "value": 1, "source": "correction", "run_id": "run_demo",
+            "stage": "proposal", "decision_ref": appr})
+        assert r.status_code == 409
+        assert client.get("/api/project/demo/preferences?scope=project").json()["project"]["preferences"] == []
+
+    def test_correction_learn_with_a_real_correction_event(self, client):
+        store = _seed(client, approver=None)  # active, awaiting at proposal
+        store.record_correction("proposal", decision_ref="corr-9", message="user fixed it")
+        r = _post(client, "/api/project/demo/preferences", {
+            "action": "learn", "scope": "project", "category": "pacing", "key": "x",
+            "value": 1, "source": "correction", "run_id": "run_demo",
+            "stage": "proposal", "decision_ref": "corr-9"})
+        assert r.status_code == 200
+        p = client.get("/api/project/demo/preferences?scope=project").json()["project"]["preferences"][0]
+        assert p["provenance"]["source"] == "correction" and p["provenance"]["verified"] is True
+
     def test_global_learn_directly_rejected(self, client):
         r = _post(client, "/api/preferences", {
             "action": "learn", "scope": "global", "category": "pacing",
@@ -297,15 +319,24 @@ class TestVerifiedLearningApi:
         assert client.get("/api/preferences").json()["global"]["preferences"] == []
 
     def test_promotion_requires_verified_project_pref(self, client):
-        # A project pref recorded WITHOUT verification (via direct store) cannot be
-        # promoted; only a verified one can.
-        from lib.production_brain.learning import StyleLearningStore
-
-        proj = StyleLearningStore.project_store(client._proj)
-        proj.learn(category="music", key="genre", value="ambient", source="approval")  # unverified
-        unverified_id = proj.preferences()[0]["pref_id"]
+        # A CORRECTION is an explicit user edit, not event-log-verified — so a
+        # corrected (unverified) project pref cannot be promoted; only a verified
+        # (approval-backed) one can.
+        store = _seed(client, approver="auto")
+        ref = _approval_ref(store)
+        _post(client, "/api/project/demo/preferences", {
+            "action": "learn", "scope": "project", "category": "music", "key": "genre",
+            "value": "ambient", "source": "approval", "run_id": "run_demo",
+            "stage": "proposal", "decision_ref": ref})
+        verified_id = client.get("/api/project/demo/preferences?scope=project").json()["project"]["preferences"][0]["pref_id"]
+        # Correct it → the current applied pref is now unverified.
+        _post(client, "/api/project/demo/preferences",
+              {"action": "correct", "scope": "project", "pref_id": verified_id, "value": "lofi"})
+        applied = [p for p in client.get("/api/project/demo/preferences?scope=project").json()["project"]["preferences"]
+                   if p["status"] == "applied"]
+        assert applied and applied[0]["provenance"]["verified"] is False
         r = _post(client, "/api/project/demo/preferences",
-                  {"action": "promote", "pref_id": unverified_id})
+                  {"action": "promote", "pref_id": applied[0]["pref_id"]})
         assert r.status_code == 409
         assert client.get("/api/preferences").json()["global"]["preferences"] == []
 

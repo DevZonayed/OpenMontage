@@ -154,19 +154,25 @@ class StyleLearningStore:
         decision_ref: Optional[str] = None,
         note: Optional[str] = None,
         corrects: Optional[str] = None,
-        require_evidence: bool = False,
+        require_evidence: bool = True,
         evidence: Any = None,
     ) -> dict:
-        """Record ONE preference learned from an explicit user choice.
+        """Record ONE project preference learned from an explicit, VERIFIED choice.
 
-        ``source`` MUST be an explicit member of {approval, correction} — it is
-        NEVER defaulted. When ``require_evidence`` is set (the project-scope path),
-        ``run_id``/``stage``/``decision_ref`` are all mandatory AND an ``evidence``
-        verifier must confirm the authoritative event log holds a matching,
-        non-rejected approval/correction decision for that run+stage. A claim that
-        cannot be verified raises and mutates nothing. If opted out, this is a
-        no-op and returns the current store unchanged.
+        This method is **project-scope only** and **always** requires event-log
+        evidence — enforcement lives here, not only at the API layer. A GLOBAL
+        preference can never be learned directly (use ``record_promotion`` from a
+        verified project pref, or ``correct``). ``source`` MUST be an explicit
+        member of {approval, correction} (never defaulted); ``run_id``/``stage``/
+        ``decision_ref`` are all mandatory; and an ``evidence`` verifier must
+        confirm the authoritative event log holds a matching, non-rejected
+        approval/correction for that run+stage. A claim that cannot be verified
+        raises and mutates nothing. If opted out, this is a no-op.
         """
+        if self.scope != "project":
+            raise LearningError(
+                "global preferences cannot be learned directly; promote a verified "
+                "project preference or record an explicit correction", status=400)
         if category not in CATEGORIES:
             raise LearningError(f"unknown style category: {category}")
         if source not in SOURCES:
@@ -178,19 +184,19 @@ class StyleLearningStore:
         except (TypeError, ValueError):
             raise LearningError("confidence must be a number in [0,1]")
 
-        verified = False
-        if require_evidence:
-            if not (run_id and stage and decision_ref):
-                raise LearningError(
-                    "a learned preference must cite run_id, stage and decision_ref "
-                    "so it can be verified against the run's event log")
-            if evidence is None:
-                raise LearningError("no evidence source is available to verify this learning")
-            if not evidence.verify(run_id=run_id, stage=stage, decision_ref=decision_ref, source=source):
-                raise LearningError(
-                    "no matching, non-rejected user approval/correction for this "
-                    "run+stage exists in the authoritative event log", status=409)
-            verified = True
+        # Project-scope learning ALWAYS demands verified evidence — a caller
+        # cannot opt out of verification.
+        if not (run_id and stage and decision_ref):
+            raise LearningError(
+                "a learned preference must cite run_id, stage and decision_ref "
+                "so it can be verified against the run's event log")
+        if evidence is None:
+            raise LearningError("no evidence source is available to verify this learning")
+        if not evidence.verify(run_id=run_id, stage=stage, decision_ref=decision_ref, source=source):
+            raise LearningError(
+                "no matching, non-rejected user approval/correction for this "
+                "run+stage exists in the authoritative event log", status=409)
+        verified = True
 
         provenance = {
             "source": source,

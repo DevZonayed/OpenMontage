@@ -66,6 +66,40 @@ class _NoIdClient(_UnavailableClient):
         return OrchestratorHandle(session_id="", job_id="")
 
 
+class _CountingClient:
+    """Thread-safe live client that counts create_job calls (idempotent on key)."""
+
+    kind = "live"
+    engine = "hermes"
+
+    def __init__(self, on_create=None):
+        import threading
+
+        self._lock = threading.Lock()
+        self._on_create = on_create
+        self.create_calls = 0
+        self._by_key = {}
+        self.cancelled = []
+
+    def available(self):
+        return True
+
+    def create_job(self, *, project_id, run_id, requested_duration_seconds, idempotency_key):
+        if self._on_create:
+            self._on_create()
+        with self._lock:
+            if idempotency_key in self._by_key:
+                return self._by_key[idempotency_key]
+            self.create_calls += 1
+            h = OrchestratorHandle(session_id=f"sess-{run_id}", job_id=f"job-{run_id}",
+                                   engine=self.engine)
+            self._by_key[idempotency_key] = h
+            return h
+
+    def cancel_job(self, *, job_id):
+        self.cancelled.append(job_id)
+
+
 class TestHermesFailClosed:
     def test_unavailable_orchestrator_refuses_to_start(self, tmp_path):
         s = _store(tmp_path)
@@ -129,6 +163,37 @@ class TestHermesFailClosed:
         assert second.get("already_active") is True
         assert first["run_id"] == second["run_id"]
         assert len(client.created) == 1  # only ONE external job was created
+
+    def test_concurrent_starts_create_exactly_one_external_job(self, tmp_path):
+        import threading
+
+        d = tmp_path / "p"
+        d.mkdir()
+        # A provision that BLOCKS briefly so both threads overlap in the window —
+        # only the lock winner may reach create_job.
+        gate = threading.Event()
+        client = _CountingClient(on_create=lambda: gate.wait(0.05))
+        results = []
+
+        def go(i):
+            s = ProductionBrainStore(d, gen_id=(lambda i=i: f"run_{i}"))
+            h = HermesBrainAdapter(client=client)
+            results.append(h.start(s, requested_duration_seconds=60))
+
+        threads = [threading.Thread(target=go, args=(i,)) for i in range(8)]
+        for t in threads:
+            t.start()
+        gate.set()
+        for t in threads:
+            t.join()
+
+        store = ProductionBrainStore(d)
+        started = [e for e in store.read_events_raw() if e["type"] == "run_started"]
+        assert len(started) == 1
+        # Exactly ONE external job was created — no orphans from the losers.
+        assert client.create_calls == 1
+        winners = [r for r in results if not r.get("already_active")]
+        assert len(winners) == 1
 
     def test_cancel_correlates_with_external_handle(self, tmp_path):
         s = _store(tmp_path)

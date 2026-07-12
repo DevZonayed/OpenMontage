@@ -24,6 +24,7 @@
         "approval_requested",
         "approval_granted",
         "approval_rejected",
+        "correction",
         "blocker_raised",
         "blocker_cleared",
         "stage_completed",

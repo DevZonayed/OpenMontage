@@ -100,6 +100,7 @@ EVENT_TYPES: frozenset[str] = frozenset(
         "approval_requested",
         "approval_granted",
         "approval_rejected",
+        "correction",
         "blocker_raised",
         "blocker_cleared",
         "stage_completed",
@@ -390,7 +391,10 @@ def reduce_event(state: dict, ev: dict, *, strict: bool = False) -> dict:
         if ev.get("message"):
             st["activity"] = ev["message"]
 
-    elif etype == "decision":
+    elif etype in ("decision", "correction"):
+        # A ``correction`` is a DISTINCT authoritative user-correction action —
+        # it is not the same as an approval and is the only evidence that backs
+        # correction-sourced learning (see lib.production_brain.evidence).
         counts["decisions"] = int(counts.get("decisions") or 0) + 1
         s = _stage(st, stage_id)
         if s is not None:

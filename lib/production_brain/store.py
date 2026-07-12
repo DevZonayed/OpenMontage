@@ -180,17 +180,30 @@ class ProductionBrainStore:
         no-impossible-event guarantees depend on this atomicity)."""
         events = self.read_events_raw()
         seq = self._max_seq(events) + 1
+        # Recompute prior state consistently with the log FIRST, so control/telemetry
+        # events can be structurally stamped with the run's persisted external
+        # handle (session_id/job_id from state["brain"]). This makes restart /
+        # cancel / retry / resume correlation machine-verifiable, not message text.
+        prior = self._consistent_state(events, self._max_seq(events))
+        fields = dict(event_fields)
+        _brain = prior.get("brain") or {}
+        # run_started carries its own identity; everything else inherits the run's
+        # persisted external handle. Stamp when the caller didn't supply one
+        # (absent OR None — event() passes explicit None keys).
+        if fields.get("type") != "run_started":
+            if not fields.get("session_id"):
+                fields["session_id"] = _brain.get("session_id")
+            if not fields.get("job_id"):
+                fields["job_id"] = _brain.get("job_id")
         ev = {
             "v": S.SCHEMA_VERSION,
             "seq": seq,
             "ts": self._now(),
         }
-        ev.update({k: v for k, v in event_fields.items() if v is not None})
+        ev.update({k: v for k, v in fields.items() if v is not None})
         ev = S.redact_event(ev)
-        # Recompute prior state consistently with the log, then fold. A strict
-        # fold raises InvalidTransition BEFORE anything is persisted, so an
-        # impossible event never reaches the durable log.
-        prior = self._consistent_state(events, self._max_seq(events))
+        # A strict fold raises InvalidTransition BEFORE anything is persisted, so
+        # an impossible event never reaches the durable log.
         new_state = S.reduce_event(prior, ev, strict=strict)
         # Append the durable event first, then refresh the cache.
         with open(self.events_path, "a", encoding="utf-8") as f:
@@ -293,6 +306,61 @@ class ProductionBrainStore:
             )
         return self.read_state()
 
+    def start_provisioned(
+        self,
+        *,
+        provision: "Callable[[str], tuple]",
+        run_id: Optional[str] = None,
+        requested_duration_seconds: Optional[int] = None,
+        brain: Optional[dict] = None,
+        message: Optional[str] = None,
+    ) -> dict:
+        """Reserve the run, THEN provision an external job — atomically.
+
+        The active-run check, the ``provision`` call, and the ``run_started``
+        append all happen under a SINGLE per-project lock hold. So of two
+        concurrent starts, only the WINNER ever calls ``provision`` (creating
+        exactly one external job); the loser blocks on the lock, then sees the
+        active run and returns ``already_active`` WITHOUT provisioning — no orphan
+        external job. ``provision(run_id) -> (session_id, job_id, brain_extra, msg)``
+        may raise to fail closed (then no run is opened)."""
+        # Duration validation is pure — do it before taking the lock.
+        if requested_duration_seconds is not None:
+            from lib import duration as _dur
+
+            try:
+                requested_duration_seconds = _dur.validate_target_seconds(requested_duration_seconds)
+            except _dur.DurationError as exc:
+                raise BrainStoreError(str(exc), status=400)
+        with self._locked():
+            st = self.read_state()
+            if st.get("state") in S.ACTIVE_RUN_STATES:
+                out = dict(st)
+                out["already_active"] = True
+                return out
+            rid = run_id or self._gen_id()
+            # WINNER-ONLY: reached only when no active run exists, so the external
+            # job is created exactly once.
+            session_id, job_id, brain_extra, provisioned_msg = provision(rid)
+            merged_brain = {**(brain or {}), **(brain_extra or {})}
+            data: dict = {"brain": merged_brain}
+            if requested_duration_seconds is not None:
+                data["requested_duration_seconds"] = int(requested_duration_seconds)
+            self._append_locked(
+                {
+                    "type": "run_started",
+                    "run_id": rid,
+                    "project_id": self.project_dir.name,
+                    "agent_id": merged_brain.get("agent_id"),
+                    "session_id": session_id or merged_brain.get("session_id"),
+                    "job_id": job_id or merged_brain.get("job_id"),
+                    "message": message or provisioned_msg or "Production run started.",
+                    "data": data,
+                },
+                strict=True,
+            )
+        return self.read_state()
+
     # ---- generic event helpers (used by the adapter/brain) -----------------
     def event(
         self,
@@ -356,6 +424,17 @@ class ProductionBrainStore:
 
     def decision(self, stage: str, *, message: Optional[str] = None, data: Optional[dict] = None, **kw) -> dict:
         return self.event("decision", stage=stage, message=message, data=data, **kw)
+
+    def record_correction(self, stage: str, *, decision_ref: str, message: Optional[str] = None,
+                          data: Optional[dict] = None, **kw) -> dict:
+        """Append a DISTINCT authoritative user-correction event for this run+stage.
+
+        This is the ONLY event that backs correction-sourced learning — an
+        approval or a generic decision does not qualify as correction evidence."""
+        payload = {"decision_ref": decision_ref}
+        if data:
+            payload.update(data)
+        return self.event("correction", stage=stage, message=message, data=payload, **kw)
 
     def output(self, stage: str, *, kind: str, path: Optional[str] = None, label: Optional[str] = None,
                actual_duration_seconds: Optional[float] = None, message: Optional[str] = None, **kw) -> dict:

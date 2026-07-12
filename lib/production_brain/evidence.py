@@ -48,25 +48,25 @@ class BrainLogEvidence:
             etype = e.get("type")
             est = e.get("stage")
             data = e.get("data") or {}
-            if est != stage:
-                # A rejection for THIS decision_ref still counts even if stage
-                # metadata drifted; but for matching we require the stage to line up.
-                if etype == "approval_rejected" and data.get("approval_id") == decision_ref:
-                    rejected = True
-                continue
-            ref_hit = (
-                data.get("approval_id") == decision_ref
-                or data.get("decision_ref") == decision_ref
-                or data.get("decision_id") == decision_ref
-            )
-            if not ref_hit:
-                continue
-            if source == "approval" and etype == "approval_granted":
-                matched = True
-            elif source == "correction" and etype in ("decision", "approval_granted"):
-                matched = True
-            if etype == "approval_rejected":
+            # An approval can be later rejected — that rejection invalidates the
+            # approval evidence even if the stage metadata drifted.
+            if source == "approval" and etype == "approval_rejected" and data.get("approval_id") == decision_ref:
                 rejected = True
+            if est != stage:
+                continue
+            if source == "approval":
+                # ONLY a granted approval, referenced by its approval_id, counts.
+                if etype == "approval_granted" and data.get("approval_id") == decision_ref:
+                    matched = True
+            else:  # source == "correction"
+                # ONLY a DISTINCT authoritative ``correction`` event counts — an
+                # approval_granted or a generic ``decision`` event must NOT
+                # masquerade as user-correction evidence.
+                if etype == "correction" and (
+                    data.get("decision_ref") == decision_ref
+                    or data.get("correction_id") == decision_ref
+                ):
+                    matched = True
         return matched and not rejected
 
 
