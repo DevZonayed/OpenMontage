@@ -19,6 +19,7 @@ import {
   volumePercent,
   zoneRect,
 } from "./layout";
+import { resolveAssetSrc } from "./composition/media";
 
 // ─────────────────────────────────────────────────────────────────────────────
 // CANONICAL PRODUCTION COMPOSITION
@@ -68,7 +69,19 @@ export type TimelineMeta = {
   title?: string;
   targetFormatted?: string;
   pipeline?: string;
+  // Media resolution parity: the SAME base is used by the Player and the CLI so a
+  // project-local `source` resolves to the identical loadable URL for both.
+  projectId?: string;
+  assetBaseUrl?: string;
 };
+
+// Media resolution context (projectId + assetBaseUrl) provided from props.meta so
+// every scene resolves `source` identically to how the CLI would.
+const MediaCtx = React.createContext<{ projectId?: string; assetBaseUrl?: string }>({});
+function useResolveSrc(source?: string | null): string | null {
+  const ctx = React.useContext(MediaCtx);
+  return resolveAssetSrc(source, { projectId: ctx.projectId, assetBaseUrl: ctx.assetBaseUrl });
+}
 
 export type TimelineDoc = {
   fps?: number;
@@ -219,7 +232,11 @@ const ZoneBox: React.FC<{
 
 // Full-frame background (media or designed gradient) — never carries text into
 // the lower bands; its label + badge are placed in their own zones.
-const BackgroundFill: React.FC<{ layer: TimelineLayer; media: boolean }> = ({ layer, media }) => {
+const BackgroundFill: React.FC<{ layer: TimelineLayer; media: boolean; resolvedSrc: string | null }> = ({
+  layer,
+  media,
+  resolvedSrc,
+}) => {
   const { frame, appear } = useEnvelope(layer.duration_frames, layer.fade);
   const dur = Math.max(1, layer.duration_frames);
   const [c0, c1] = TYPE[layer.type] || ["#232a36", "#5a6472"];
@@ -234,12 +251,12 @@ const BackgroundFill: React.FC<{ layer: TimelineLayer; media: boolean }> = ({ la
           <AbsoluteFill style={{ transform: `scale(${zoom})` }}>
             {layer.type === "video" ? (
               <OffthreadVideo
-                src={layer.source as string}
+                src={resolvedSrc as string}
                 trimBefore={layer.sourceOffsetFrames ? Math.max(0, Math.round(layer.sourceOffsetFrames)) : undefined}
                 style={{ width: "100%", height: "100%", objectFit: "cover" }}
               />
             ) : (
-              <Img src={layer.source as string} style={{ width: "100%", height: "100%", objectFit: "cover" }} />
+              <Img src={resolvedSrc as string} style={{ width: "100%", height: "100%", objectFit: "cover" }} />
             )}
           </AbsoluteFill>
         ) : (
@@ -258,7 +275,7 @@ const BackgroundFill: React.FC<{ layer: TimelineLayer; media: boolean }> = ({ la
 };
 
 // Type badge in the top-left badge zone.
-const Badge: React.FC<{ layer: TimelineLayer }> = ({ layer }) => {
+const Badge: React.FC<{ layer: TimelineLayer; hasMedia: boolean }> = ({ layer, hasMedia }) => {
   const { appear } = useEnvelope(layer.duration_frames, layer.fade);
   return (
     <ZoneBox zone="badge" style={{ display: "flex", alignItems: "flex-start" }}>
@@ -276,7 +293,7 @@ const Badge: React.FC<{ layer: TimelineLayer }> = ({ layer }) => {
           background: "rgba(0,0,0,0.32)",
         }}
       >
-        {layer.source && !isLoadableUrl(layer.source) ? `${layer.type} · placeholder` : layer.type}
+        {layer.source && !hasMedia ? `${layer.type} · placeholder` : layer.type}
       </span>
     </ZoneBox>
   );
@@ -442,8 +459,10 @@ function audioVolumeFn(layer: TimelineLayer): (f: number) => number {
 }
 
 // Extra audio layers beyond the visible-row cap still contribute their audio.
-const AudioOnly: React.FC<{ layer: TimelineLayer }> = ({ layer }) =>
-  isLoadableUrl(layer.source) ? <Audio src={layer.source} volume={audioVolumeFn(layer)} /> : null;
+const AudioOnly: React.FC<{ layer: TimelineLayer }> = ({ layer }) => {
+  const src = useResolveSrc(layer.source);
+  return src ? <Audio src={src} volume={audioVolumeFn(layer)} /> : null;
+};
 
 // ── Consolidated audio-presence: one fixed, non-overlapping row per audio layer ─
 const AudioRowStrip: React.FC<{ layer: TimelineLayer; slot: number }> = ({ layer, slot }) => {
@@ -454,6 +473,7 @@ const AudioRowStrip: React.FC<{ layer: TimelineLayer; slot: number }> = ({ layer
   const vol = typeof layer.volume === "number" ? Math.min(1, Math.max(0, layer.volume)) : 1;
   const { appear } = useEnvelope(layer.duration_frames, layer.fade);
   const volAt = audioVolumeFn(layer);
+  const resolvedAudio = useResolveSrc(layer.source);
   const name = layer.type === "narration" ? "◗ narration" : layer.type === "music" ? "♪ music" : "♪ sfx";
   const bars = 40;
   return (
@@ -470,7 +490,7 @@ const AudioRowStrip: React.FC<{ layer: TimelineLayer; slot: number }> = ({ layer
         opacity: appear,
       }}
     >
-      {isLoadableUrl(layer.source) ? <Audio src={layer.source} volume={volAt} /> : null}
+      {resolvedAudio ? <Audio src={resolvedAudio} volume={volAt} /> : null}
       {/* label chip — fixed width, truncated, clamped percentage (never 4090%) */}
       <div
         style={{
@@ -600,16 +620,21 @@ export const timelineFrameDefaults: TimelineFrameProps = {
   meta: { title: "Timeline Preview", targetFormatted: "0:08", pipeline: "animation" },
 };
 
-// One non-audio layer → its zone-placed scene(s).
-const VisualScene: React.FC<{ layer: TimelineLayer }> = ({ layer }) => {
+// Dispatch a non-audio layer to its scene (no hooks here → safe conditional return).
+const NonAudioScene: React.FC<{ layer: TimelineLayer }> = ({ layer }) => {
   if (layer.type === "caption") return <CaptionScene layer={layer} />;
   if (isText(layer.type)) return <TitleScene layer={layer} />;
-  // Visual (video/image/shape): full-frame background + badge + optional lower-third.
-  const media = (layer.type === "video" || layer.type === "image") && isLoadableUrl(layer.source);
+  return <VisualScene layer={layer} />;
+};
+
+// Visual (video/image/shape): full-frame background + badge + optional lower-third.
+const VisualScene: React.FC<{ layer: TimelineLayer }> = ({ layer }) => {
+  const resolved = useResolveSrc(layer.source);
+  const media = (layer.type === "video" || layer.type === "image") && !!resolved;
   return (
     <>
-      <BackgroundFill layer={layer} media={media} />
-      <Badge layer={layer} />
+      <BackgroundFill layer={layer} media={media} resolvedSrc={resolved} />
+      <Badge layer={layer} hasMedia={!!resolved} />
       {layer.text ? <LowerThird layer={layer} /> : null}
     </>
   );
@@ -622,20 +647,22 @@ export const TimelineFrame: React.FC<TimelineFrameProps> = ({ timeline, meta }) 
   const hasVisible = visual.length > 0;
 
   return (
-    <AbsoluteFill>
-      <Backdrop />
-      {visual.map((l) => (
-        <Sequence
-          key={l.id}
-          from={Math.max(0, l.start_frame)}
-          durationInFrames={Math.max(1, l.duration_frames)}
-          name={`${l.type}:${l.id}`}
-        >
-          <VisualScene layer={l} />
-        </Sequence>
-      ))}
-      <AudioPresence layers={audio} />
-      {!hasVisible ? <TitleCard meta={meta} /> : null}
-    </AbsoluteFill>
+    <MediaCtx.Provider value={{ projectId: meta?.projectId, assetBaseUrl: meta?.assetBaseUrl }}>
+      <AbsoluteFill>
+        <Backdrop />
+        {visual.map((l) => (
+          <Sequence
+            key={l.id}
+            from={Math.max(0, l.start_frame)}
+            durationInFrames={Math.max(1, l.duration_frames)}
+            name={`${l.type}:${l.id}`}
+          >
+            <NonAudioScene layer={l} />
+          </Sequence>
+        ))}
+        <AudioPresence layers={audio} />
+        {!hasVisible ? <TitleCard meta={meta} /> : null}
+      </AbsoluteFill>
+    </MediaCtx.Provider>
   );
 };

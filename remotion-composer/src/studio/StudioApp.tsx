@@ -35,6 +35,7 @@ import {
   trimLayer,
 } from "../composition/operations";
 import { BacklotClient } from "../composition/client";
+import { BrainPanel, PreferencesPanel } from "./BrainPanel";
 
 // ── helpers ──
 function timecode(frame: number, fps: number): string {
@@ -81,6 +82,7 @@ export const StudioApp: React.FC<StudioAppProps> = ({ client }) => {
   const [run, setRun] = useState<Record<string, unknown>>({ state: "not_started" });
   const [rendering, setRendering] = useState(false);
   const [notice, setNotice] = useState<string | null>(null);
+  const [rightTab, setRightTab] = useState<"production" | "inspector" | "style">("production");
 
   const playerRef = useRef<PlayerRef>(null);
 
@@ -286,9 +288,15 @@ export const StudioApp: React.FC<StudioAppProps> = ({ client }) => {
     return () => window.removeEventListener("keydown", onKey);
   }, [redo, save, seek, step, togglePlay, undo, model]);
 
+  // Feed the Player the SAME assetBaseUrl + projectId the CLI would use, so a
+  // project-local `source` resolves to the identical media URL in preview + render.
+  const assetBaseUrl = typeof window !== "undefined" ? window.location.origin : "";
   const inputProps: TimelineFrameProps | null = useMemo(
-    () => (model ? (renderProps(model) as TimelineFrameProps) : null),
-    [model],
+    () =>
+      model
+        ? (renderProps(model, { assetBaseUrl, projectId: client.projectId }) as TimelineFrameProps)
+        : null,
+    [model, assetBaseUrl, client.projectId],
   );
 
   if (loading) {
@@ -439,40 +447,66 @@ export const StudioApp: React.FC<StudioAppProps> = ({ client }) => {
           />
         </div>
 
-        {/* Inspector + live status */}
+        {/* Tabbed right column: Production (Hermes brain) · Inspector · Style */}
         <div style={inspector}>
-          <LiveStatus run={run} />
-          <div style={{ height: 1, background: "#232329", margin: "12px 0" }} />
-          {selectedLayer ? (
-            <Inspector
-              key={selectedLayer.id}
-              layer={selectedLayer}
-              asset={model.assets.find((a) => a.id === selectedLayer.assetId) ?? null}
-              onEdit={(edit) => apply((c) => trimLayer(c, selectedLayer.id, edit))}
-              onMove={(f) => apply((c) => moveLayer(c, selectedLayer.id, f))}
-              onResize={(d) => apply((c) => resizeLayer(c, selectedLayer.id, d))}
-              onVolume={(v) => apply((c) => setVolume(c, selectedLayer.id, v))}
-              onSplit={() => apply((c) => splitLayer(c, selectedLayer.id, frame).composition)}
-              onRevert={(assetId, v) => apply((c) => revertAsset(c, assetId, v))}
-              onApprove={(assetId, ap) => apply((c) => setAssetApproval(c, assetId, ap))}
-              onDelete={() => {
-                apply((c) => removeLayer(c, selectedLayer.id));
-                setSelected(null);
-              }}
-              onRegen={async (instr) => {
-                try {
-                  await client.queueRevision(selectedLayer.id, instr);
-                  setNotice(`Queued regeneration for ${selectedLayer.id}. Its stable id + approval are preserved.`);
-                } catch (e) {
-                  setNotice(`Could not queue: ${e instanceof Error ? e.message : String(e)}`);
-                }
-              }}
-            />
-          ) : (
-            <div style={{ color: "#5f5f68", fontSize: 13 }}>Select a layer to edit it.</div>
-          )}
-          <div style={{ height: 1, background: "#232329", margin: "12px 0" }} />
-          <ValidationPanel result={validation} />
+          <div style={{ display: "flex", gap: 4, marginBottom: 10 }}>
+            {(["production", "inspector", "style"] as const).map((t) => (
+              <button
+                key={t}
+                onClick={() => setRightTab(t)}
+                style={{
+                  flex: 1,
+                  background: rightTab === t ? "#1c1c21" : "transparent",
+                  color: rightTab === t ? "#ececef" : "#a0a0a9",
+                  border: `1px solid ${rightTab === t ? "#3a3a44" : "#232329"}`,
+                  borderRadius: 6,
+                  padding: "5px 4px",
+                  fontSize: 11,
+                  textTransform: "capitalize",
+                  cursor: "pointer",
+                }}
+              >
+                {t === "production" ? "Production" : t === "inspector" ? "Inspector" : "Style"}
+              </button>
+            ))}
+          </div>
+
+          {rightTab === "production" ? <BrainPanel client={client} /> : null}
+          {rightTab === "style" ? <PreferencesPanel client={client} /> : null}
+          {rightTab === "inspector" ? (
+            <>
+              {selectedLayer ? (
+                <Inspector
+                  key={selectedLayer.id}
+                  layer={selectedLayer}
+                  asset={model.assets.find((a) => a.id === selectedLayer.assetId) ?? null}
+                  onEdit={(edit) => apply((c) => trimLayer(c, selectedLayer.id, edit))}
+                  onMove={(f) => apply((c) => moveLayer(c, selectedLayer.id, f))}
+                  onResize={(d) => apply((c) => resizeLayer(c, selectedLayer.id, d))}
+                  onVolume={(v) => apply((c) => setVolume(c, selectedLayer.id, v))}
+                  onSplit={() => apply((c) => splitLayer(c, selectedLayer.id, frame).composition)}
+                  onRevert={(assetId, v) => apply((c) => revertAsset(c, assetId, v))}
+                  onApprove={(assetId, ap) => apply((c) => setAssetApproval(c, assetId, ap))}
+                  onDelete={() => {
+                    apply((c) => removeLayer(c, selectedLayer.id));
+                    setSelected(null);
+                  }}
+                  onRegen={async (instr) => {
+                    try {
+                      await client.queueRevision(selectedLayer.id, instr);
+                      setNotice(`Queued regeneration for ${selectedLayer.id}. Its stable id + approval are preserved.`);
+                    } catch (e) {
+                      setNotice(`Could not queue: ${e instanceof Error ? e.message : String(e)}`);
+                    }
+                  }}
+                />
+              ) : (
+                <div style={{ color: "#5f5f68", fontSize: 13 }}>Select a layer to edit it.</div>
+              )}
+              <div style={{ height: 1, background: "#232329", margin: "12px 0" }} />
+              <ValidationPanel result={validation} />
+            </>
+          ) : null}
         </div>
       </div>
     </div>
@@ -894,7 +928,8 @@ const trackHeader: React.CSSProperties = {
   letterSpacing: "0.06em",
 };
 const inspector: React.CSSProperties = {
-  width: 280,
+  width: 340,
+  flex: "0 0 auto",
   borderLeft: "1px solid #232329",
   background: "#0c0c0f",
   padding: 12,

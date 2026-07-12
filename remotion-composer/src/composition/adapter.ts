@@ -228,16 +228,29 @@ export function canonicalToBackendDoc(c: CanonicalComposition): BackendTimelineD
 // Props the composition receives — IDENTICAL for Player preview and CLI render.
 export interface RenderProps {
   timeline: BackendTimelineDoc;
-  meta?: { title?: string; pipeline?: string; targetFormatted?: string };
+  meta?: {
+    title?: string;
+    pipeline?: string;
+    targetFormatted?: string;
+    // Media-resolution parity: the SAME base+projectId the CLI is given, so a
+    // project-local `source` resolves to the identical loadable URL in both.
+    projectId?: string;
+    assetBaseUrl?: string;
+  };
 }
 
-export function renderProps(c: CanonicalComposition): RenderProps {
+export function renderProps(
+  c: CanonicalComposition,
+  opts: { assetBaseUrl?: string; projectId?: string } = {},
+): RenderProps {
   return {
     timeline: canonicalToBackendDoc(c),
     meta: {
       title: c.meta.title,
       pipeline: c.meta.pipeline,
       targetFormatted: c.meta.targetFormatted,
+      projectId: opts.projectId ?? c.id,
+      assetBaseUrl: opts.assetBaseUrl,
     },
   };
 }

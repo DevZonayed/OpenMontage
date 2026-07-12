@@ -13,6 +13,13 @@
 
 import { BackendTimelineDoc, BackendTimelinePayload } from "./adapter";
 import { deterministicTimelinePayload } from "./fixtures";
+import {
+  BrainAssetsPayload,
+  BrainEventsPage,
+  BrainState,
+  deterministicBrainState,
+  PreferencesPayload,
+} from "./brain";
 
 export type FetchLike = (
   input: string,
@@ -202,6 +209,116 @@ export class BacklotClient {
       duration: seconds,
       strategy,
     });
+  }
+
+  // ── Production brain (Hermes) — reads are fixture-tolerant ──
+  async getBrain(): Promise<BrainState> {
+    if (this.forceFixtures) {
+      this.usedFixture = true;
+      return deterministicBrainState(this.projectId);
+    }
+    try {
+      const s = await this.getJSON<BrainState>(`/api/project/${this.projectId}/brain`);
+      this.usedFixture = false;
+      return s;
+    } catch (e) {
+      if (this.fixtureFallback) {
+        this.usedFixture = true;
+        return deterministicBrainState(this.projectId);
+      }
+      throw e;
+    }
+  }
+
+  async getBrainEvents(after = 0, limit = 200): Promise<BrainEventsPage> {
+    const empty: BrainEventsPage = {
+      events: [],
+      cursor: after,
+      next_cursor: after,
+      latest_seq: 0,
+      count: 0,
+      has_more: false,
+    };
+    return this.tolerantGet(
+      `/api/project/${this.projectId}/brain/events?after=${after}&limit=${limit}`,
+      empty,
+    );
+  }
+
+  async getBrainAssets(): Promise<BrainAssetsPayload> {
+    return this.tolerantGet(`/api/project/${this.projectId}/brain/assets`, {
+      outputs: [],
+      count: 0,
+      run_id: null,
+      actual_duration_seconds: null,
+    });
+  }
+
+  // ── Brain control (CSRF; never faked). `run_id`/`job_id` are sent verbatim. ──
+  async startRun(): Promise<BrainState> {
+    this.assertOnline("start a production run");
+    return this.postJSON<BrainState>(`/api/project/${this.projectId}/brain/start`, {});
+  }
+  async approveRun(
+    runId: string,
+    opts: { approvalId?: string; stage?: string; note?: string } = {},
+  ): Promise<BrainState> {
+    this.assertOnline("approve");
+    return this.postJSON<BrainState>(`/api/project/${this.projectId}/brain/approve`, {
+      run_id: runId,
+      approval_id: opts.approvalId,
+      stage: opts.stage,
+      note: opts.note,
+    });
+  }
+  async rejectRun(
+    runId: string,
+    opts: { approvalId?: string; stage?: string; note?: string } = {},
+  ): Promise<BrainState> {
+    this.assertOnline("reject");
+    return this.postJSON<BrainState>(`/api/project/${this.projectId}/brain/reject`, {
+      run_id: runId,
+      approval_id: opts.approvalId,
+      stage: opts.stage,
+      note: opts.note,
+    });
+  }
+  async cancelRun(runId: string): Promise<BrainState> {
+    this.assertOnline("cancel the run");
+    return this.postJSON<BrainState>(`/api/project/${this.projectId}/brain/cancel`, {
+      run_id: runId,
+    });
+  }
+  async retryStage(stage: string, runId?: string | null, jobId?: string | null): Promise<BrainState> {
+    this.assertOnline("retry a stage");
+    return this.postJSON<BrainState>(`/api/project/${this.projectId}/brain/retry`, {
+      stage,
+      run_id: runId ?? undefined,
+      job_id: jobId ?? undefined,
+    });
+  }
+  async resumeRun(runId?: string | null, jobId?: string | null): Promise<BrainState> {
+    this.assertOnline("resume the run");
+    return this.postJSON<BrainState>(`/api/project/${this.projectId}/brain/resume`, {
+      run_id: runId ?? undefined,
+      job_id: jobId ?? undefined,
+    });
+  }
+
+  // ── Preferences / learning ──
+  async getPreferences(scope: "all" | "global" | "project" = "all", category?: string): Promise<PreferencesPayload> {
+    const q = category ? `?scope=${scope}&category=${encodeURIComponent(category)}` : `?scope=${scope}`;
+    return this.tolerantGet(`/api/project/${this.projectId}/preferences${q}`, {
+      categories: [],
+    });
+  }
+  async updatePreference(body: Record<string, unknown>): Promise<Record<string, unknown>> {
+    this.assertOnline("update a preference");
+    return this.postJSON(`/api/project/${this.projectId}/preferences`, body);
+  }
+  async resetPreferences(scope: "global" | "project"): Promise<Record<string, unknown>> {
+    this.assertOnline("reset preferences");
+    return this.postJSON(`/api/project/${this.projectId}/preferences/reset`, { scope });
   }
 
   private assertOnline(action: string): void {
