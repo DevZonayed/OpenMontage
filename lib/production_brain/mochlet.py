@@ -82,6 +82,47 @@ def is_uuid(value: Any) -> bool:
     return isinstance(value, str) and bool(_UUID_RE.match(value))
 
 
+# Keys under which a ``listProjects`` payload may carry its project array. The
+# live Mochlet MCP returns structuredContent ``{"result": [<project>...]}``; the
+# documented/legacy shape is ``{"projects": [...]}``. ``projects`` is preferred so
+# a payload that happens to carry both keeps the explicit contract.
+_PROJECT_LIST_KEYS = ("projects", "result")
+
+
+def extract_project_list(payload: Any) -> Optional[list[dict]]:
+    """Normalize a ``listProjects`` payload into a clean project list.
+
+    Accepts the actual live Mochlet structuredContent envelope
+    ``{"result": [...]}``, the legacy/tested ``{"projects": [...]}`` shape, and a
+    bare top-level array. Returns:
+
+      * ``None`` when the payload has NO recognizable project-array shape — the
+        caller treats this as "discovery did not succeed" (fail-closed; a stale
+        selected project must NOT pass on an unverifiable list);
+      * a list (possibly empty) when an array WAS found — only well-formed project
+        dicts (a string ``id``) survive; malformed elements are dropped.
+
+    This is deliberately narrow: it recognizes the real envelope without loosening
+    the malformed-payload distinction the connection layer depends on.
+    """
+    raw: Optional[list] = None
+    if isinstance(payload, list):
+        raw = payload
+    elif isinstance(payload, dict):
+        for key in _PROJECT_LIST_KEYS:
+            val = payload.get(key)
+            if isinstance(val, list):
+                raw = val
+                break
+    if raw is None:
+        return None
+    return [
+        {"id": p["id"], "name": p.get("name"), "path": p.get("path")}
+        for p in raw
+        if isinstance(p, dict) and isinstance(p.get("id"), str)
+    ]
+
+
 class MochletProjectError(OrchestratorUnavailable):
     """Mochlet is reachable but the configured project can't be resolved."""
 
@@ -363,14 +404,7 @@ class MochletMcpOrchestratorClient:
     def list_projects(self) -> list[dict]:
         client = self._open()
         page = client.call_tool("listProjects", {})
-        projects = page.get("projects") if isinstance(page, dict) else None
-        out = []
-        if isinstance(projects, list):
-            for p in projects:
-                if isinstance(p, dict) and isinstance(p.get("id"), str):
-                    out.append({"id": p["id"], "name": p.get("name"),
-                                "path": p.get("path")})
-        return out
+        return extract_project_list(page) or []
 
     # -- instruction --------------------------------------------------------
     def _instruction(self, project_id: str, run_id: str,

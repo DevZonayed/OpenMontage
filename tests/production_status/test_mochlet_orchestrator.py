@@ -214,6 +214,16 @@ def test_list_projects_returns_ids(tmp_path):
     assert projects[0]["name"] == "the-electricity-bulb"
 
 
+def test_list_projects_accepts_live_result_envelope(tmp_path):
+    # REGRESSION: the LIVE Mochlet MCP returns ``{"result": [...]}``; list_projects
+    # must normalize it identically to the legacy ``{"projects": [...]}`` shape.
+    fake = FakeMochletMcp(projects_envelope_key="result")
+    c = _client(fake, tmp_path)
+    projects = c.list_projects()
+    assert [p["id"] for p in projects] == [PID]
+    assert projects[0]["name"] == "the-electricity-bulb"
+
+
 def test_non_uuid_job_from_server_is_refused(tmp_path, monkeypatch):
     fake = FakeMochletMcp()
     c = _client(fake, tmp_path)
@@ -363,3 +373,66 @@ def test_token_never_appears_in_handle(tmp_path):
     h = c.create_job(project_id="p", run_id="r", requested_duration_seconds=60, idempotency_key="k")
     assert "tok-super-secret" not in repr(h)
     assert "tok-super-secret" not in str(fake.sent_chats)
+
+
+# --------------------------------------------------------------------------- #
+# extract_project_list — the narrow listProjects envelope normalizer
+# --------------------------------------------------------------------------- #
+def test_extract_project_list_accepts_result_envelope():
+    # The EXACT live Mochlet envelope with the real OpenMontage project present.
+    from lib.production_brain.mochlet import extract_project_list
+
+    payload = {"result": [
+        {"id": PID, "name": "the-electricity-bulb", "path": "/repo/the-electricity-bulb"}]}
+    out = extract_project_list(payload)
+    assert out == [{"id": PID, "name": "the-electricity-bulb",
+                    "path": "/repo/the-electricity-bulb"}]
+
+
+def test_extract_project_list_accepts_legacy_projects_envelope():
+    from lib.production_brain.mochlet import extract_project_list
+
+    out = extract_project_list({"projects": [{"id": PID}]})
+    assert out == [{"id": PID, "name": None, "path": None}]
+
+
+def test_extract_project_list_accepts_bare_array():
+    from lib.production_brain.mochlet import extract_project_list
+
+    assert extract_project_list([{"id": PID}]) == [{"id": PID, "name": None, "path": None}]
+
+
+def test_extract_project_list_prefers_projects_key_over_result():
+    # A payload carrying BOTH keeps the explicit legacy contract (projects wins).
+    from lib.production_brain.mochlet import extract_project_list
+
+    out = extract_project_list({"projects": [{"id": PID}], "result": [{"id": "other"}]})
+    assert [p["id"] for p in out] == [PID]
+
+
+def test_extract_project_list_fail_closed_on_malformed():
+    # No recognizable array → None (distinct from an empty list) so the caller keeps
+    # projects_listed False and refuses a stale selection. Malformed checks preserved.
+    from lib.production_brain.mochlet import extract_project_list
+
+    assert extract_project_list({}) is None
+    assert extract_project_list({"result": "nope"}) is None
+    assert extract_project_list({"result": {"id": PID}}) is None  # dict, not a list
+    assert extract_project_list("garbage") is None
+    assert extract_project_list(None) is None
+
+
+def test_extract_project_list_recognized_empty_is_empty_list():
+    # A recognized-but-empty array is [] (NOT None) — discovery succeeded, no projects.
+    from lib.production_brain.mochlet import extract_project_list
+
+    assert extract_project_list({"result": []}) == []
+    assert extract_project_list({"projects": []}) == []
+
+
+def test_extract_project_list_drops_non_dict_and_idless_elements():
+    from lib.production_brain.mochlet import extract_project_list
+
+    out = extract_project_list({"result": [
+        {"id": PID}, "junk", {"name": "no-id"}, {"id": 123}]})
+    assert out == [{"id": PID, "name": None, "path": None}]

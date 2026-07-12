@@ -72,6 +72,16 @@ def test_verify_mcp_requires_control_and_discovery_tools():
     assert v["has_required_tools"] is False
 
 
+def test_verify_mcp_accepts_live_result_envelope():
+    # REGRESSION: the LIVE Mochlet MCP returns listProjects structuredContent as
+    # ``{"result": [<project>...]}`` (not ``{"projects": [...]}``). verify_mcp must
+    # normalize it and surface the real project — else it wrongly reports needs_project.
+    fake = FakeMochletMcp(token=TOKEN, projects_envelope_key="result")
+    v = C.verify_mcp(C.DEFAULT_MOCHLET_URL, transport=fake.transport, token=TOKEN)
+    assert v["projects_listed"] is True
+    assert [p["id"] for p in v["projects"]] == [PID]
+
+
 # --------------------------------------------------------------------------- #
 # Connection status
 # --------------------------------------------------------------------------- #
@@ -108,6 +118,30 @@ def test_status_needs_project_when_capable_but_unselected(tmp_path):
                             secret_getter=_MemSecrets({ORCHESTRATOR_TOKEN_ACCOUNT: TOKEN}).getter)
     assert s["status"] == "needs_project" and s["available"] is False
     assert len(s["projects"]) == 2
+
+
+def test_status_connected_with_live_result_envelope(tmp_path):
+    # REGRESSION: with the real ``{"result": [...]}`` listProjects envelope and the
+    # OpenMontage project persisted, status must be "connected" (not "needs_project").
+    C._persist_config(endpoint=C.DEFAULT_MOCHLET_URL, kind="mcp", project_id=PID,
+                      project_path="/repo/x", base_dir=tmp_path)
+    fake = FakeMochletMcp(token=TOKEN, projects_envelope_key="result")
+    s = C.connection_status(env={}, base_dir=tmp_path, transport=fake.transport,
+                            secret_getter=_MemSecrets({ORCHESTRATOR_TOKEN_ACCOUNT: TOKEN}).getter)
+    assert s["status"] == "connected" and s["available"] is True
+    assert s["project"] == PID
+
+
+def test_connect_persists_with_live_result_envelope(tmp_path):
+    # REGRESSION: guided connect must resolve+persist the project from the live
+    # ``{"result": [...]}`` envelope, enabling production.
+    secrets = _MemSecrets()
+    fake = FakeMochletMcp(token="tok-123", projects_envelope_key="result")
+    s = C.connect(url=C.DEFAULT_MOCHLET_URL, token="tok-123", project_id=PID,
+                  base_dir=tmp_path, transport=fake.transport,
+                  secret_setter=secrets.setter, secret_getter=secrets.getter, env={})
+    assert s["status"] == "connected" and s["available"] is True
+    assert C.stored_config(tmp_path)["mochlet_project_id"] == PID
 
 
 def test_status_tools_disabled(tmp_path):

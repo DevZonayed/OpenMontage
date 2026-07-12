@@ -56,13 +56,17 @@ class FakeMochletMcp:
                  version: str = "0.1.99", tools: Optional[list[str]] = None,
                  projects: Optional[list[dict]] = None, event_stream: bool = False,
                  redirect: bool = False, health_ok: bool = True,
-                 trailing_notification: bool = False, projects_error: bool = False):
+                 trailing_notification: bool = False, projects_error: bool = False,
+                 projects_envelope_key: str = "projects"):
         self.token = token
         self.server_name = server_name
         self.version = version
         self.health_ok = health_ok
         self.trailing_notification = trailing_notification
         self.projects_error = projects_error
+        # Which structuredContent key carries the project array. The LIVE Mochlet
+        # MCP uses ``"result"``; the legacy/documented shape used ``"projects"``.
+        self.projects_envelope_key = projects_envelope_key
         self.tools = list(ALL_TOOLS if tools is None else tools)
         self.projects = projects if projects is not None else [
             {"id": "669a5386-f37b-4c6f-a712-b12e8221e54d",
@@ -146,7 +150,7 @@ class FakeMochletMcp:
         if name == "listProjects":
             if self.projects_error:
                 return {"isError": True, "content": [{"type": "text", "text": "discovery disabled"}]}
-            return self._ok({"projects": self.projects})
+            return self._ok({self.projects_envelope_key: self.projects})
         if name == "openProject":
             return self._ok({"ok": True, "id": args.get("id")})
         if name == "listSessions":
