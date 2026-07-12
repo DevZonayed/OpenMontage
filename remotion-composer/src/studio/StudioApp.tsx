@@ -35,8 +35,10 @@ import {
   trimLayer,
 } from "../composition/operations";
 import { BacklotClient } from "../composition/client";
-import { BrainPanel, PreferencesPanel } from "./BrainPanel";
+import { PreferencesPanel } from "./PreferencesPanel";
 import { CommandCenter } from "./CommandCenter";
+import { ProductionInspector } from "./ProductionInspector";
+import { useStatusView } from "./useStatusView";
 
 // ── helpers ──
 function timecode(frame: number, fps: number): string {
@@ -83,6 +85,10 @@ export const StudioApp: React.FC<StudioAppProps> = ({ client }) => {
   const [rendering, setRendering] = useState(false);
   const [notice, setNotice] = useState<string | null>(null);
   const [rightTab, setRightTab] = useState<"production" | "inspector" | "style">("production");
+
+  // Single canonical /status controller shared by the command center AND the
+  // Production inspector — one poll, one primary action, guaranteed same stage.
+  const status = useStatusView(client);
 
   const playerRef = useRef<PlayerRef>(null);
 
@@ -304,15 +310,17 @@ export const StudioApp: React.FC<StudioAppProps> = ({ client }) => {
   return (
     <div style={{ display: "flex", flexDirection: "column", height: "100%", color: "#ececef" }}>
       {/* PRIMARY: the shared command-center card (same view model as the board). */}
-      <CommandCenter client={client} />
+      <CommandCenter status={status} client={client} />
 
       {/* Header / actions */}
       <div style={header}>
         <div style={{ display: "flex", alignItems: "center", gap: 12 }}>
           <strong style={{ fontSize: 15 }}>{model.meta.title || client.projectId}</strong>
-          <span style={pill}>
-            {model.width}×{model.height} · {model.fps}fps · {model.totalFrames} frames ·{" "}
-            {model.meta.targetFormatted || `${model.targetDurationSeconds}s`}
+          <span style={pill} data-testid="tl-meta">
+            {model.width}×{model.height} · {model.fps}fps ·{" "}
+            {hasLayers
+              ? `${model.totalFrames} frames · ${model.meta.targetFormatted || `${model.targetDurationSeconds}s`}`
+              : (status.view?.target?.available ? status.view.target.label : "duration pending")}
           </span>
           {usedFixture ? <span style={{ ...pill, borderColor: "#e8c07d", color: "#e8c07d" }}>◐ demo data</span> : null}
           <span
@@ -385,7 +393,7 @@ export const StudioApp: React.FC<StudioAppProps> = ({ client }) => {
         <div style={{ flex: 1, display: "flex", flexDirection: "column", minWidth: 0 }}>
           {!hasLayers ? (
             <div style={stage}>
-              <EmptyTimelineCard client={client} usedFixture={usedFixture} />
+              <EmptyTimelineCard view={status.view} usedFixture={usedFixture} />
             </div>
           ) : (
           <div style={stage}>
@@ -467,7 +475,7 @@ export const StudioApp: React.FC<StudioAppProps> = ({ client }) => {
             ))}
           </div>
 
-          {rightTab === "production" ? <BrainPanel client={client} /> : null}
+          {rightTab === "production" ? <ProductionInspector status={status} /> : null}
           {rightTab === "style" ? <PreferencesPanel client={client} /> : null}
           {rightTab === "inspector" ? (
             <>
@@ -830,15 +838,13 @@ const ValidationPanel: React.FC<{ result: ReturnType<typeof validateComposition>
 // Shown in place of a blank canvas when the timeline has no layers yet: an
 // intentional state card explaining the current production stage and what will
 // appear here — never a misleading empty "Rendering…" preview.
-const EmptyTimelineCard: React.FC<{ client: BacklotClient; usedFixture: boolean }> = ({ client, usedFixture }) => {
-  const [status, setStatus] = useState<import("../composition/status").StatusView | null>(null);
-  useEffect(() => {
-    let alive = true;
-    client.getStatus().then((v) => { if (alive) setStatus(v); }).catch(() => { /* keep neutral empty copy */ });
-    return () => { alive = false; };
-  }, [client]);
-  const stage = status?.current_stage_label ?? null;
-  const stageNo = status?.stage_number ?? null;
+const EmptyTimelineCard: React.FC<{
+  view: import("../composition/status").StatusView | null;
+  usedFixture: boolean;
+}> = ({ view, usedFixture }) => {
+  const stage = view?.current_stage_label ?? null;
+  const stageNo = view?.stage_number ?? null;
+  const target = view?.target;
   return (
     <div style={{ maxWidth: 560, textAlign: "center", padding: 28 }} data-testid="empty-timeline">
       <div style={{ fontSize: 42, marginBottom: 12, opacity: 0.5 }}>🎬</div>
@@ -849,6 +855,10 @@ const EmptyTimelineCard: React.FC<{ client: BacklotClient; usedFixture: boolean 
         {stage
           ? `Production is at ${stageNo ? `stage ${stageNo} of 11 · ` : ""}${stage}. Hermes builds the timeline as it produces assets — scenes, narration and captions will appear here automatically.`
           : "Hermes builds the timeline as it produces your video. Once it generates the first assets, scenes and layers will appear here."}
+      </div>
+      {/* Truthful target duration — never the invented composer default. */}
+      <div style={{ fontSize: 12, color: "#8a93a3", fontFamily: "ui-monospace, monospace", marginBottom: 10 }} data-testid="empty-target">
+        {target?.available ? target.label : "Target duration pending"}
       </div>
       <div style={{ fontSize: 12, color: "#5f5f68" }}>
         {usedFixture

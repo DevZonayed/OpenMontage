@@ -5,9 +5,10 @@
 // primary action. Network errors preserve the last known state and show a
 // "reconnecting" indicator — they never fall back to fabricated data.
 
-import React, { useCallback, useEffect, useRef, useState } from "react";
+import React, { useState } from "react";
 import { BacklotClient } from "../composition/client";
 import { StatusAction, StatusView } from "../composition/status";
+import { StatusController } from "./useStatusView";
 
 const OWNER_LABEL: Record<string, string> = { hermes: "Hermes", user: "You", system: "System" };
 const STEP_GLYPH: Record<string, string> = {
@@ -23,14 +24,6 @@ const STEP_COLOR: Record<string, { bg: string; bd: string; fg: string }> = {
   upcoming: { bg: "#1c1c21", bd: "#232329", fg: "#5f5f68" },
 };
 
-function pollMs(v: StatusView | null): number {
-  const st = v?.overall_state;
-  if (st === "producing" || st === "planning" || st === "cancelling") return 2500;
-  if (st === "reconciling") return 2000;
-  if (["awaiting_approval", "awaiting_plan_approval", "blocked", "ready_to_produce"].includes(st ?? "")) return 4000;
-  return 8000;
-}
-
 function fmtSecs(secs?: number | null): string {
   if (secs == null) return "";
   const s = Math.max(0, Math.round(secs));
@@ -39,122 +32,12 @@ function fmtSecs(secs?: number | null): string {
 }
 
 export interface CommandCenterProps {
+  status: StatusController;
   client: BacklotClient;
-  onRenderRequest?: () => void;
 }
 
-export const CommandCenter: React.FC<CommandCenterProps> = ({ client }) => {
-  const [view, setView] = useState<StatusView | null>(null);
-  const [coldError, setColdError] = useState(false);
-  const [busy, setBusy] = useState(false);
-  const [actionError, setActionError] = useState<string | null>(null);
-  const [connectOpen, setConnectOpen] = useState(false);
-  const lastGood = useRef<StatusView | null>(null);
-  const timer = useRef<ReturnType<typeof setTimeout> | null>(null);
-
-  const tick = useCallback(async () => {
-    try {
-      const v = await client.getStatus();
-      lastGood.current = v;
-      setColdError(false);
-      setView(v);
-    } catch {
-      // Preserve last known state, flag stale/reconnecting. NEVER fabricate.
-      if (lastGood.current) {
-        setView({
-          ...lastGood.current,
-          stale: true,
-          diagnostics: [
-            ...(lastGood.current.diagnostics || []),
-            { kind: "stale", message: "Reconnecting to live updates…" },
-          ],
-        });
-      } else {
-        // Cold start with no prior state — surface a reconnecting affordance
-        // instead of an indefinite "Loading…".
-        setColdError(true);
-      }
-    }
-  }, [client]);
-
-  useEffect(() => {
-    let alive = true;
-    const loop = async () => {
-      if (!alive) return;
-      await tick();
-      if (!alive) return;
-      // Retry faster while we have no state at all (cold start / backend booting).
-      timer.current = setTimeout(loop, lastGood.current ? pollMs(lastGood.current) : 3000);
-    };
-    void loop();
-    return () => {
-      alive = false;
-      if (timer.current) clearTimeout(timer.current);
-    };
-  }, [tick]);
-
-  const repaint = useCallback(() => { void tick(); }, [tick]);
-
-  const runAction = useCallback(async (a: StatusAction) => {
-    setActionError(null);
-    const P = view?.run_id;
-    const brainRun = !!view?.sources?.brain_run_id;
-    try {
-      switch (a.id) {
-        case "connect_hermes":
-        case "retry_connect":
-          setConnectOpen(true);
-          return;
-        case "start":
-        case "continue_hermes":
-        case "restart":
-          setBusy(true);
-          await client.startRun();
-          break;
-        case "approve_plan":
-          setBusy(true);
-          await client.approvePlan(P ?? "");
-          break;
-        case "request_changes":
-          if (!window.confirm("Send the plan back for changes? The current run stops; nothing is lost.")) return;
-          setBusy(true);
-          await client.cancelCoarseRun(P ?? "");
-          break;
-        case "preview":
-          setBusy(true);
-          await client.previewRun();
-          break;
-        case "view_deliverable":
-          return;
-        case "approve":
-          setBusy(true);
-          await client.approveRun(P ?? "", { approvalId: a.approval_id ?? undefined, stage: a.stage ?? undefined });
-          break;
-        case "reject":
-          setBusy(true);
-          await client.rejectRun(P ?? "", { approvalId: a.approval_id ?? undefined, stage: a.stage ?? undefined });
-          break;
-        case "retry_stage":
-        case "retry_control":
-          setBusy(true);
-          await client.retryStage(a.stage ?? view?.current_stage ?? "", P);
-          break;
-        case "stop":
-          if (!window.confirm("Stop this production run? Completed work is preserved.")) return;
-          setBusy(true);
-          if (brainRun) await client.cancelRun(P ?? "");
-          else await client.cancelCoarseRun(P ?? "");
-          break;
-        default:
-          return;
-      }
-      await tick();
-    } catch (e) {
-      setActionError(e instanceof Error ? e.message : String(e));
-    } finally {
-      setBusy(false);
-    }
-  }, [client, tick, view]);
+export const CommandCenter: React.FC<CommandCenterProps> = ({ status, client }) => {
+  const { view, coldError, busy, actionError, connectOpen, setConnectOpen, runAction, refresh } = status;
 
   if (!view) {
     return (
@@ -173,20 +56,17 @@ export const CommandCenter: React.FC<CommandCenterProps> = ({ client }) => {
   const conn = view.connection || {};
   const activeRun = view.is_live
     || ["producing", "cancelling", "cancelled", "failed", "completed"].includes(view.overall_state);
+  // Status-only banner (no button) — the SINGLE clickable Connect action is the
+  // primary button below, so the whole page has exactly one Connect CTA.
   const showConn = !conn.available && !!conn.status && conn.status !== "unknown"
     && conn.status !== "demo" && !activeRun;
 
   return (
     <section style={s.card} aria-live="polite" data-testid="command-center" data-state={view.overall_state}>
       {showConn ? (
-        <div style={s.connBanner}>
-          <div>
-            <strong style={{ fontSize: 13 }}>{conn.headline || "Hermes connection"}</strong>
-            {conn.detail ? <div style={{ fontSize: 11, color: "#a0a0a9", marginTop: 2 }}>{conn.detail}</div> : null}
-          </div>
-          <button style={s.btnSmall} onClick={() => setConnectOpen(true)}>
-            {conn.status === "unreachable" ? "Retry connection" : "Connect Hermes"}
-          </button>
+        <div style={s.connBanner} role="status" data-testid="cc-conn">
+          <strong style={{ fontSize: 13 }}>{conn.headline || "Hermes connection"}</strong>
+          {conn.detail ? <div style={{ fontSize: 11, color: "#a0a0a9", marginTop: 2 }}>{conn.detail}</div> : null}
         </div>
       ) : null}
 
@@ -281,7 +161,7 @@ export const CommandCenter: React.FC<CommandCenterProps> = ({ client }) => {
       ) : null}
 
       {connectOpen ? (
-        <ConnectModal client={client} view={view} onClose={() => setConnectOpen(false)} onDone={() => { setConnectOpen(false); repaint(); }} />
+        <ConnectModal client={client} view={view} onClose={() => setConnectOpen(false)} onDone={() => { setConnectOpen(false); refresh(); }} />
       ) : null}
     </section>
   );

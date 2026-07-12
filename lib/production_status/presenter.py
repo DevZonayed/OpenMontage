@@ -462,6 +462,9 @@ def build_status_view(
         overall=overall, brain=brain, brain_run=brain_run, run=run,
         timeline=timeline, current_stage=current_stage)
 
+    # --- truthful target duration (never invent 1:00) ------------------------
+    target = _target_block(brain=brain, brain_run=brain_run, run=run, timeline=timeline)
+
     # --- staleness (client passed last-known-live-with-network-error) --------
     if stale:
         diagnostics.append({
@@ -496,6 +499,7 @@ def build_status_view(
         "run_id": brain.get("run_id") if brain_run else (run or {}).get("run_id"),
         "stop_available": stop_available,
         "render": render,
+        "target": target,
         "connection": connection,
         "diagnostics": diagnostics,
         "sources": {
@@ -723,6 +727,66 @@ def _narrative(
         "active_task": (run or {}).get("activity") or activity or "Running preflight and planning.",
         "owner": OWNER_HERMES, "why_waiting": None,
         "primary": primary, "secondary": secondary, "diagnostic": diagnostic}
+
+
+# --------------------------------------------------------------------------- #
+# Target duration (truthful — never the invented 1:00 default)
+# --------------------------------------------------------------------------- #
+_TARGET_FPS = 30
+
+
+def _fmt_mmss(seconds) -> str:
+    try:
+        s = int(round(float(seconds)))
+    except (TypeError, ValueError):
+        return "0:00"
+    return f"{s // 60}:{s % 60:02d}"
+
+
+def _target_block(*, brain, brain_run, run, timeline) -> dict:
+    """The project's target duration, sourced truthfully.
+
+    A live run's completed length wins; else the run's requested duration; else the
+    persisted target. When a REAL timeline with layers exists, its duration is
+    authoritative. If nothing is known, ``available`` is False (``duration pending``)
+    — we never present the 60s composer default as the user's chosen duration.
+    """
+    fps = _TARGET_FPS
+    layers = _timeline_layers(timeline)
+    tl = (timeline or {})
+    # 1) A real, non-empty timeline is authoritative.
+    if layers > 0 and tl.get("target_duration_seconds"):
+        secs = tl["target_duration_seconds"]
+        return _target(secs, fps, "timeline", is_target=False)
+    # 2) A completed run's actual length.
+    if brain_run and brain.get("actual_duration_seconds"):
+        return _target(brain["actual_duration_seconds"], fps, "actual", is_target=False)
+    # 3) The requested/target duration from the run (or the brain's requested).
+    for key in ("requested_duration_seconds", "target_duration_seconds"):
+        val = (run or {}).get(key)
+        if val:
+            return _target(val, fps, "requested", is_target=True)
+    if brain_run and brain.get("requested_duration_seconds"):
+        return _target(brain["requested_duration_seconds"], fps, "requested", is_target=True)
+    return {"available": False, "duration_seconds": None, "formatted": None,
+            "frames": None, "fps": fps, "source": None, "is_target": True,
+            "label": "duration pending"}
+
+
+def _target(seconds, fps, source, *, is_target) -> dict:
+    try:
+        secs = float(seconds)
+    except (TypeError, ValueError):
+        return {"available": False, "duration_seconds": None, "formatted": None,
+                "frames": None, "fps": fps, "source": None, "is_target": True,
+                "label": "duration pending"}
+    formatted = _fmt_mmss(secs)
+    frames = int(round(secs * fps))
+    label = (f"target {formatted} · {frames} target frames" if is_target
+             else f"{formatted} · {frames} frames")
+    return {"available": True, "duration_seconds": secs, "formatted": formatted,
+            "frames": frames, "fps": fps, "source": source, "is_target": is_target,
+            "label": label}
 
 
 # --------------------------------------------------------------------------- #

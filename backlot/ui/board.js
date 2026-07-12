@@ -585,15 +585,13 @@ function renderStepper(view) {
 }
 
 function renderConnectionBanner(view) {
+  // Status text ONLY — no button. The single clickable Connect action on the
+  // page is the command-center primary below (one-action invariant).
   const conn = view.connection || {};
-  const banner = el("div", { class: `cmd-conn ${conn.status}`, role: "status" });
+  const banner = el("div", { class: `cmd-conn ${conn.status} statusonly`, role: "status" });
   banner.append(el("div", { class: "cmd-conn-text" },
     el("b", {}, conn.headline || "Hermes connection"),
     conn.detail ? el("div", { class: "cmd-conn-detail" }, conn.detail) : null));
-  const act = el("button", { class: "cmd-btn small", type: "button" },
-    conn.status === "unreachable" ? "Retry connection" : "Connect Hermes");
-  act.onclick = () => openConnectModal(view);
-  banner.append(act);
   return banner;
 }
 

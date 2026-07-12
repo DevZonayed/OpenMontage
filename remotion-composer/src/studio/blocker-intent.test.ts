@@ -1,5 +1,5 @@
 import { describe, it, expect } from "vitest";
-import { blockerOptionIntent } from "./BrainPanel";
+import { blockerOptionIntent } from "./PreferencesPanel";
 
 // Regression: a "Retry cancellation" blocker option must re-attempt the CANCEL,
 // not retry the stage. `cancel` outranks `retry`.

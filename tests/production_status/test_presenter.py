@@ -353,6 +353,38 @@ def test_coarse_plan_gate_still_offers_approve_plan():
     assert v["primary_action"]["id"] == "approve_plan"
 
 
+def test_target_duration_uses_requested_not_composer_default():
+    # The screenshot fixture: run requested 150s, no timeline → target 2:30 / 4500,
+    # never the invented 60s (1:00 / 1800) composer default.
+    v = build_status_view(
+        board=_approved_board(),
+        run={"state": "waiting_for_approval", "plan_approved": True,
+             "requested_duration_seconds": 150},
+        timeline={"layers": []}, connection=CONN_OK)
+    t = v["target"]
+    assert t["available"] is True
+    assert t["formatted"] == "2:30"
+    assert t["frames"] == 4500
+    assert t["is_target"] is True
+    assert "4500 target frames" in t["label"]
+
+
+def test_target_duration_pending_when_unknown():
+    v = build_status_view(board={"project_id": "p"}, run={"state": "not_started"},
+                          connection=CONN_OK)
+    assert v["target"]["available"] is False
+    assert v["target"]["label"] == "duration pending"
+
+
+def test_target_prefers_real_timeline_when_layers_exist():
+    v = build_status_view(brain=_brain_running(stage="edit"),
+                          run={"requested_duration_seconds": 150},
+                          timeline={"layers": [{"id": "a"}], "target_duration_seconds": 90},
+                          connection=CONN_OK)
+    assert v["target"]["formatted"] == "1:30"
+    assert v["target"]["is_target"] is False  # authoritative, not a target
+
+
 def test_never_raises_on_empty_inputs():
     v = build_status_view()
     assert v["overall_state"] == "not_started"

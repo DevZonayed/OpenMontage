@@ -86,6 +86,17 @@ export interface StatusRender {
   layer_count: number;
 }
 
+export interface StatusTarget {
+  available: boolean;
+  duration_seconds?: number | null;
+  formatted?: string | null;
+  frames?: number | null;
+  fps: number;
+  source?: string | null;
+  is_target: boolean;
+  label: string;
+}
+
 export interface StatusIdentity {
   agent?: string | null;
   job?: string | null;
@@ -122,6 +133,7 @@ export interface StatusView {
   run_id?: string | null;
   stop_available: boolean;
   render: StatusRender;
+  target: StatusTarget;
   connection: ConnectionView;
   diagnostics: StatusDiagnostic[];
   sources: {
@@ -194,6 +206,7 @@ export function deterministicStatusView(projectId: string): StatusView {
     run_id: "demo-run",
     stop_available: true,
     render: { renderable: false, active: false, reason: "Demo — no timeline layers yet.", layer_count: 0 },
+    target: { available: true, duration_seconds: 150, formatted: "2:30", frames: 4500, fps: 30, source: "requested", is_target: true, label: "target 2:30 · 4500 target frames" },
     connection: { status: "demo", available: false, headline: "Demo mode" },
     diagnostics: [],
     sources: { brain_state: "running", brain_run_id: "demo-run" },
