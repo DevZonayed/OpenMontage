@@ -17,38 +17,43 @@
         "enabled": true,
         "opacity": 1,
         "source": "http://127.0.0.1:4760/qa-photo.png",
-        "text": "Real media"
+        "text": "Establishing shot — real generated media"
       },
       {
         "id": "title1",
         "type": "text",
         "track": 1,
-        "start_frame": 12,
-        "duration_frames": 110,
+        "start_frame": 30,
+        "duration_frames": 190,
         "z": 3,
         "enabled": true,
         "opacity": 1,
         "title": "PREVIEW = RENDER",
-        "subtitle": "pinned local cli",
-        "transitionIn": {
-          "kind": "fade",
-          "durationFrames": 10
-        },
-        "transitionOut": {
-          "kind": "fade",
-          "durationFrames": 10
-        }
+        "subtitle": "one canonical composition",
+        "transitionIn": { "kind": "fade", "durationFrames": 12 }
       },
       {
         "id": "cap1",
         "type": "caption",
         "track": 1,
-        "start_frame": 130,
-        "duration_frames": 100,
-        "z": 3,
+        "start_frame": 30,
+        "duration_frames": 190,
+        "z": 4,
         "enabled": true,
         "opacity": 1,
-        "text": "Real image + audible audio, one canonical composition."
+        "text": "Caption, lower-third, title and two audio tracks share the frame without colliding."
+      },
+      {
+        "id": "narr1",
+        "type": "narration",
+        "track": 2,
+        "start_frame": 0,
+        "duration_frames": 240,
+        "z": 1,
+        "enabled": true,
+        "opacity": 1,
+        "volume": 1,
+        "source": "http://127.0.0.1:4760/qa-tone.mp3"
       },
       {
         "id": "music1",
@@ -59,18 +64,11 @@
         "z": 0,
         "enabled": true,
         "opacity": 1,
-        "volume": 0.8,
-        "fade": {
-          "inFrames": 15,
-          "outFrames": 20
-        },
+        "volume": 0.4,
+        "fade": { "inFrames": 15, "outFrames": 20 },
         "source": "http://127.0.0.1:4760/qa-tone.mp3"
       }
     ]
   },
-  "meta": {
-    "title": "QA Render",
-    "pipeline": "animation",
-    "targetFormatted": "0:08"
-  }
+  "meta": { "title": "QA Render", "pipeline": "animation", "targetFormatted": "0:08" }
 }

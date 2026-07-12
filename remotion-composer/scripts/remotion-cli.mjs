@@ -14,7 +14,7 @@
 // Pure helpers are exported for unit testing; the CLI entry runs when executed.
 
 import { spawnSync } from "node:child_process";
-import { accessSync, constants, statSync } from "node:fs";
+import { accessSync, constants, realpathSync, statSync } from "node:fs";
 import { dirname, resolve, sep } from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -27,36 +27,53 @@ export function projectRoot() {
 
 /**
  * Resolve and validate the pinned local Remotion binary.
- * Throws RemotionCliError (fail-closed) if it is outside the root, missing,
- * not a regular file, or not executable.
+ *
+ * `.bin/remotion` is a SYMLINK, so we follow it with `realpathSync` and verify the
+ * REAL target — not just the textual link path — is contained inside the (also
+ * realpath-resolved) worktree root. A link pointing outside the tree therefore
+ * fails closed instead of executing external code. Returns the verified real path.
+ *
+ * Throws RemotionCliError (fail-closed) if the target is missing, outside the
+ * root, not a regular file, or not executable.
  */
 export function resolveRemotionBin(root = projectRoot()) {
-  const rootAbs = resolve(root);
-  const bin = resolve(rootAbs, "node_modules", ".bin", "remotion");
-
-  // Containment: the resolved binary MUST live inside the worktree/package root.
-  const rootWithSep = rootAbs.endsWith(sep) ? rootAbs : rootAbs + sep;
-  if (!bin.startsWith(rootWithSep)) {
-    throw new RemotionCliError(`Refusing to run a Remotion binary outside the project root: ${bin}`);
-  }
-
-  let st;
+  // Canonicalize the root (worktrees can contain symlinked path components).
+  let rootReal;
   try {
-    st = statSync(bin);
+    rootReal = realpathSync(resolve(root));
+  } catch {
+    rootReal = resolve(root); // non-existent root → link resolution below fails closed
+  }
+  const linkPath = resolve(rootReal, "node_modules", ".bin", "remotion");
+
+  // Follow the symlink to its REAL absolute target.
+  let real;
+  try {
+    real = realpathSync(linkPath);
   } catch {
     throw new RemotionCliError(
-      `Local Remotion binary not found at ${bin}. Run \`npm ci\` in remotion-composer/ first.`,
+      `Local Remotion binary not found at ${linkPath}. Run \`npm ci\` in remotion-composer/ first.`,
     );
   }
+
+  // Containment: the REAL target must live inside the worktree/package root.
+  const rootWithSep = rootReal.endsWith(sep) ? rootReal : rootReal + sep;
+  if (!real.startsWith(rootWithSep)) {
+    throw new RemotionCliError(
+      `Refusing to run a Remotion binary whose real path is outside the project root: ${real}`,
+    );
+  }
+
+  const st = statSync(real);
   if (!st.isFile()) {
-    throw new RemotionCliError(`Local Remotion path is not a regular file: ${bin}`);
+    throw new RemotionCliError(`Local Remotion real path is not a regular file: ${real}`);
   }
   try {
-    accessSync(bin, constants.X_OK);
+    accessSync(real, constants.X_OK);
   } catch {
-    throw new RemotionCliError(`Local Remotion binary is not executable: ${bin}`);
+    throw new RemotionCliError(`Local Remotion binary is not executable: ${real}`);
   }
-  return bin;
+  return real;
 }
 
 /**

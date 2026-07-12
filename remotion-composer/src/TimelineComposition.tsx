@@ -11,21 +11,24 @@ import {
   Img,
   OffthreadVideo,
 } from "remotion";
+import {
+  audioRow,
+  safeArea,
+  truncateLabel,
+  volumePercent,
+  zoneRect,
+} from "./layout";
 
 // ─────────────────────────────────────────────────────────────────────────────
 // CANONICAL PRODUCTION COMPOSITION
 //
-// This is the ONE Remotion composition that powers (a) the embedded @remotion/player
-// live preview inside Backlot and (b) the final render via the pinned Remotion CLI.
-// Both are fed the identical `{timeline, meta}` props (see composition/adapter.ts →
-// renderProps), so the preview cannot diverge from the render — same component, same
-// data, same pixels.
-//
-// It renders the persisted backend timeline layers as a real motion film: each layer
-// becomes an animated <Sequence>; transforms/crops/opacity/fades/transitions and
-// per-layer audio volume are honored; real media (absolute-URL `source`) is composited
-// via <Img>/<OffthreadVideo>/<Audio>; project-local paths without a resolvable URL
-// fall back to a designed, self-contained placeholder scene so ANY project renders.
+// The ONE Remotion composition that powers both the embedded @remotion/player live
+// preview and the final pinned-CLI render (identical `{timeline, meta}` props → no
+// preview/render drift). Every on-screen element is placed into a DISJOINT layout
+// zone inside a title-safe area (see layout.ts), so scene titles, lower-thirds,
+// captions, badges and the audio-presence strip can all be on screen simultaneously
+// without ever colliding. Audio layers are consolidated into stacked, fixed-slot
+// rows so multiple tracks never overpaint each other.
 // ─────────────────────────────────────────────────────────────────────────────
 
 export type Transform = {
@@ -94,17 +97,11 @@ const AUDIO = new Set(["narration", "music", "sfx"]);
 const isText = (t: string) => t === "text" || t === "caption";
 const accentOf = (t: string) => (TYPE[t] ? TYPE[t][1] : DIM);
 
-// A source is "loadable media" when a browser can fetch it: an absolute URL
-// (http/https/protocol-relative/blob) OR a same-origin absolute path such as
-// `/media/...` or `/thumb/...` (which validation also treats as safe/render-ready).
-// Bare project-local RELATIVE paths still render as a designed placeholder — see
-// BACKEND_CONTRACT.md for the headless-CLI media-resolution gap.
 export function isLoadableUrl(src?: string | null): src is string {
   if (!src || typeof src !== "string") return false;
   const s = src.trim();
   if (s === "" || s.includes("\\")) return false;
   if (/^(https?:)?\/\//.test(s) || s.startsWith("blob:")) return true;
-  // Same-origin absolute path (but not a scheme like `javascript:` or `//`).
   return s.startsWith("/") && !s.startsWith("//") && !s.split("/").includes("..");
 }
 
@@ -121,14 +118,11 @@ const Backdrop: React.FC = () => {
         background: `radial-gradient(120% 90% at ${gx}% ${gy}%, #141a2e 0%, #0b1020 55%, #070a13 100%)`,
       }}
     >
-      <AbsoluteFill
-        style={{ boxShadow: "inset 0 0 320px 60px rgba(0,0,0,0.55)", opacity: 0.9 }}
-      />
+      <AbsoluteFill style={{ boxShadow: "inset 0 0 320px 60px rgba(0,0,0,0.55)", opacity: 0.9 }} />
     </AbsoluteFill>
   );
 };
 
-// Envelope: spring-in, hold, plus explicit fade in/out (frames) when provided.
 function useEnvelope(dur: number, fade?: Fade) {
   const frame = useCurrentFrame();
   const { fps } = useVideoConfig();
@@ -144,21 +138,15 @@ function useEnvelope(dur: number, fade?: Fade) {
   return { frame, enter, appear: Math.min(enter, out, fadeIn) };
 }
 
-// Per-layer transition (applied on top of the base envelope).
 type TransitionStyle = { opacity: number; transform: string; clipPath?: string };
-function transitionStyle(
-  frame: number,
-  dur: number,
-  tin?: Transition,
-  tout?: Transition,
-): TransitionStyle {
+function transitionStyle(frame: number, dur: number, tin?: Transition, tout?: Transition): TransitionStyle {
   let opacity = 1;
   let tx = 0;
-  let ty = 0;
+  const ty = 0;
   let scale = 1;
   let clip = "";
   const apply = (t: Transition, phase: "in" | "out", p: number) => {
-    const k = phase === "in" ? p : 1 - p; // 0→1 progress of the effect
+    const k = phase === "in" ? p : 1 - p;
     switch (t.kind) {
       case "fade":
         opacity *= k;
@@ -183,11 +171,7 @@ function transitionStyle(
   if (tout && tout.kind !== "none" && frame > dur - tout.durationFrames) {
     apply(tout, "out", (dur - frame) / Math.max(1, tout.durationFrames));
   }
-  return {
-    opacity,
-    transform: `translate(${tx}px, ${ty}px) scale(${scale})`,
-    clipPath: clip || undefined,
-  };
+  return { opacity, transform: `translate(${tx}px, ${ty}px) scale(${scale})`, clipPath: clip || undefined };
 }
 
 function transformStyle(t?: Transform): React.CSSProperties {
@@ -199,80 +183,143 @@ function transformStyle(t?: Transform): React.CSSProperties {
   const clip = t.crop
     ? `inset(${t.crop.top * 100}% ${t.crop.right * 100}% ${t.crop.bottom * 100}% ${t.crop.left * 100}%)`
     : undefined;
-  return {
-    transform: parts.length ? parts.join(" ") : undefined,
-    opacity: t.opacity,
-    clipPath: clip,
-  };
+  return { transform: parts.length ? parts.join(" ") : undefined, opacity: t.opacity, clipPath: clip };
 }
 
-// ── Real media scene (image / video) ──────────────────────────────────────────
-const MediaScene: React.FC<{ layer: TimelineLayer }> = ({ layer }) => {
+// Absolute-positioned wrapper that places its children inside a named layout zone.
+const ZoneBox: React.FC<{
+  zone: "badge" | "title" | "lowerThird" | "caption" | "audio";
+  style?: React.CSSProperties;
+  children: React.ReactNode;
+}> = ({ zone, style, children }) => {
+  const { width, height } = useVideoConfig();
+  const r = zoneRect(zone, width, height);
+  return (
+    <div style={{ position: "absolute", left: r.left, top: r.top, width: r.width, height: r.height, ...style }}>
+      {children}
+    </div>
+  );
+};
+
+// Full-frame background (media or designed gradient) — never carries text into
+// the lower bands; its label + badge are placed in their own zones.
+const BackgroundFill: React.FC<{ layer: TimelineLayer; media: boolean }> = ({ layer, media }) => {
   const { frame, appear } = useEnvelope(layer.duration_frames, layer.fade);
   const dur = Math.max(1, layer.duration_frames);
-  const zoom = interpolate(frame, [0, dur], [1.02, 1.1], {
-    easing: Easing.inOut(Easing.ease),
-  });
+  const [c0, c1] = TYPE[layer.type] || ["#232a36", "#5a6472"];
+  const zoom = interpolate(frame, [0, dur], [1.02, 1.1], { easing: Easing.inOut(Easing.ease) });
+  const pan = interpolate(frame, [0, dur], [-2, 2]);
   const base = typeof layer.opacity === "number" ? layer.opacity : 1;
   const tstyle = transitionStyle(frame, dur, layer.transitionIn, layer.transitionOut);
-  const src = layer.source as string;
   return (
-    <AbsoluteFill style={{ opacity: appear * base * (tstyle.opacity ?? 1) }}>
-      <AbsoluteFill style={{ ...transformStyle(layer.transform), ...tstyle, opacity: undefined }}>
-        <AbsoluteFill style={{ transform: `scale(${zoom})` }}>
-          {layer.type === "video" ? (
-            <OffthreadVideo
-              src={src}
-              trimBefore={layer.sourceOffsetFrames ? Math.max(0, Math.round(layer.sourceOffsetFrames)) : undefined}
-              style={{ width: "100%", height: "100%", objectFit: "cover" }}
-            />
-          ) : (
-            <Img src={src} style={{ width: "100%", height: "100%", objectFit: "cover" }} />
-          )}
-        </AbsoluteFill>
+    <AbsoluteFill style={{ opacity: appear * base * tstyle.opacity }}>
+      <AbsoluteFill style={{ ...transformStyle(layer.transform), transform: tstyle.transform, clipPath: tstyle.clipPath }}>
+        {media ? (
+          <AbsoluteFill style={{ transform: `scale(${zoom})` }}>
+            {layer.type === "video" ? (
+              <OffthreadVideo
+                src={layer.source as string}
+                trimBefore={layer.sourceOffsetFrames ? Math.max(0, Math.round(layer.sourceOffsetFrames)) : undefined}
+                style={{ width: "100%", height: "100%", objectFit: "cover" }}
+              />
+            ) : (
+              <Img src={layer.source as string} style={{ width: "100%", height: "100%", objectFit: "cover" }} />
+            )}
+          </AbsoluteFill>
+        ) : (
+          <AbsoluteFill
+            style={{
+              transform: `scale(${zoom}) translateX(${pan}%)`,
+              background: `linear-gradient(135deg, ${c1}44 0%, ${c0} 55%, #0a0e18 100%)`,
+            }}
+          />
+        )}
       </AbsoluteFill>
-      {layer.text ? <LowerLabel text={layer.text} accent={accentOf(layer.type)} /> : null}
+      {/* legibility grade at the bottom so lower-band text stays readable */}
+      <AbsoluteFill style={{ background: "linear-gradient(0deg, rgba(6,9,17,0.82) 0%, rgba(6,9,17,0) 42%)" }} />
     </AbsoluteFill>
   );
 };
 
-const LowerLabel: React.FC<{ text: string; accent: string }> = ({ text, accent }) => (
-  <AbsoluteFill style={{ justifyContent: "flex-end", padding: 56 }}>
-    <div
-      style={{
-        color: BONE,
-        fontFamily: "system-ui, sans-serif",
-        fontWeight: 700,
-        fontSize: 54,
-        letterSpacing: "-0.01em",
-        textShadow: "0 6px 30px rgba(0,0,0,0.6)",
-        maxWidth: "80%",
-        borderLeft: `5px solid ${accent}`,
-        paddingLeft: 22,
-      }}
-    >
-      {text}
-    </div>
-  </AbsoluteFill>
-);
+// Type badge in the top-left badge zone.
+const Badge: React.FC<{ layer: TimelineLayer }> = ({ layer }) => {
+  const { appear } = useEnvelope(layer.duration_frames, layer.fade);
+  return (
+    <ZoneBox zone="badge" style={{ display: "flex", alignItems: "flex-start" }}>
+      <span
+        style={{
+          opacity: appear,
+          color: accentOf(layer.type),
+          border: `1.5px solid ${accentOf(layer.type)}`,
+          borderRadius: 999,
+          padding: "8px 20px",
+          fontFamily: "ui-monospace, monospace",
+          fontSize: 24,
+          letterSpacing: "0.14em",
+          textTransform: "uppercase",
+          background: "rgba(0,0,0,0.32)",
+        }}
+      >
+        {layer.source && !isLoadableUrl(layer.source) ? `${layer.type} · placeholder` : layer.type}
+      </span>
+    </ZoneBox>
+  );
+};
 
-// ── Kinetic title / on-screen text ────────────────────────────────────────────
-const TextScene: React.FC<{ layer: TimelineLayer }> = ({ layer }) => {
+// Lower-third label (from a visual layer's `text`) in the lowerThird zone.
+const LowerThird: React.FC<{ layer: TimelineLayer }> = ({ layer }) => {
+  const { enter, appear } = useEnvelope(layer.duration_frames, layer.fade);
+  const x = interpolate(enter, [0, 1], [-36, 0]);
+  const accent = accentOf(layer.type);
+  return (
+    <ZoneBox zone="lowerThird" style={{ display: "flex", alignItems: "center" }}>
+      <div
+        style={{
+          opacity: appear,
+          transform: `translateX(${x}px)`,
+          borderLeft: `6px solid ${accent}`,
+          background: "linear-gradient(90deg, rgba(10,12,20,0.82), rgba(10,12,20,0.15))",
+          padding: "14px 30px",
+          borderRadius: 10,
+          maxWidth: "82%",
+        }}
+      >
+        <div
+          style={{
+            color: BONE,
+            fontFamily: "system-ui, sans-serif",
+            fontWeight: 700,
+            fontSize: 52,
+            lineHeight: 1.05,
+            letterSpacing: "-0.01em",
+            textShadow: "0 6px 30px rgba(0,0,0,0.6)",
+          }}
+        >
+          {truncateLabel(layer.text || "", 52)}
+        </div>
+      </div>
+    </ZoneBox>
+  );
+};
+
+// Kinetic title / on-screen text in the centered title zone.
+const TitleScene: React.FC<{ layer: TimelineLayer }> = ({ layer }) => {
   const { frame, enter, appear } = useEnvelope(layer.duration_frames, layer.fade);
-  const y = interpolate(enter, [0, 1], [34, 0]);
-  const scale = interpolate(enter, [0, 1], [0.94, 1]);
+  const y = interpolate(enter, [0, 1], [30, 0]);
+  const scale = interpolate(enter, [0, 1], [0.95, 1]);
   const underline = interpolate(enter, [0, 1], [0, 1]);
   const accent = accentOf(layer.type);
   const dur = Math.max(1, layer.duration_frames);
   const tstyle = transitionStyle(frame, dur, layer.transitionIn, layer.transitionOut);
   return (
-    <AbsoluteFill style={{ justifyContent: "center", alignItems: "center", padding: "0 8%" }}>
+    <ZoneBox zone="title" style={{ display: "flex", alignItems: "center", justifyContent: "center" }}>
       <div
         style={{
-          opacity: appear * (tstyle.opacity ?? 1),
-          transform: `translateY(${y}px) scale(${scale}) ${tstyle.transform ?? ""}`,
+          opacity: appear * tstyle.opacity,
+          transform: `translateY(${y}px) scale(${scale})`,
           textAlign: "center",
           ...transformStyle(layer.transform),
+          maxWidth: "100%",
         }}
       >
         {layer.subtitle ? (
@@ -286,7 +333,7 @@ const TextScene: React.FC<{ layer: TimelineLayer }> = ({ layer }) => {
               marginBottom: 18,
             }}
           >
-            {layer.subtitle}
+            {truncateLabel(layer.subtitle, 44)}
           </div>
         ) : null}
         <div
@@ -294,8 +341,8 @@ const TextScene: React.FC<{ layer: TimelineLayer }> = ({ layer }) => {
             color: BONE,
             fontFamily: "system-ui, -apple-system, sans-serif",
             fontWeight: 800,
-            fontSize: 96,
-            lineHeight: 1.04,
+            fontSize: 92,
+            lineHeight: 1.05,
             letterSpacing: "-0.02em",
             textShadow: "0 8px 40px rgba(0,0,0,0.55)",
           }}
@@ -305,7 +352,7 @@ const TextScene: React.FC<{ layer: TimelineLayer }> = ({ layer }) => {
         <div
           style={{
             height: 6,
-            marginTop: 28,
+            marginTop: 26,
             borderRadius: 3,
             background: accent,
             width: `${underline * 42}%`,
@@ -315,27 +362,28 @@ const TextScene: React.FC<{ layer: TimelineLayer }> = ({ layer }) => {
           }}
         />
       </div>
-    </AbsoluteFill>
+    </ZoneBox>
   );
 };
 
-// ── Lower-third caption ───────────────────────────────────────────────────────
+// Caption card in the caption zone (centered, above the audio strip).
 const CaptionScene: React.FC<{ layer: TimelineLayer }> = ({ layer }) => {
   const { frame, enter, appear } = useEnvelope(layer.duration_frames, layer.fade);
-  const x = interpolate(enter, [0, 1], [-40, 0]);
+  const yy = interpolate(enter, [0, 1], [18, 0]);
   const dur = Math.max(1, layer.duration_frames);
   const tstyle = transitionStyle(frame, dur, layer.transitionIn, layer.transitionOut);
   return (
-    <AbsoluteFill style={{ justifyContent: "flex-end", alignItems: "flex-start", padding: "0 0 9% 7%" }}>
+    <ZoneBox zone="caption" style={{ display: "flex", alignItems: "center", justifyContent: "center" }}>
       <div
         style={{
-          opacity: appear * (tstyle.opacity ?? 1),
-          transform: `translateX(${x}px)`,
-          background: "linear-gradient(90deg, rgba(10,12,20,0.86), rgba(10,12,20,0.4))",
-          borderLeft: `5px solid ${accentOf(layer.type)}`,
-          padding: "18px 30px 18px 24px",
-          borderRadius: 10,
-          maxWidth: "72%",
+          opacity: appear * tstyle.opacity,
+          transform: `translateY(${yy}px)`,
+          background: "rgba(10,12,20,0.72)",
+          border: `1px solid ${accentOf(layer.type)}55`,
+          padding: "16px 34px",
+          borderRadius: 12,
+          maxWidth: "88%",
+          textAlign: "center",
         }}
       >
         <div
@@ -343,82 +391,27 @@ const CaptionScene: React.FC<{ layer: TimelineLayer }> = ({ layer }) => {
             color: BONE,
             fontFamily: "system-ui, sans-serif",
             fontWeight: 600,
-            fontSize: 46,
+            fontSize: 44,
+            lineHeight: 1.12,
             letterSpacing: "-0.01em",
           }}
         >
-          {layer.text || "Caption"}
+          {truncateLabel(layer.text || "Caption", 96)}
         </div>
       </div>
-    </AbsoluteFill>
+    </ZoneBox>
   );
 };
 
-// ── Designed placeholder visual (no loadable media) ───────────────────────────
-const VisualScene: React.FC<{ layer: TimelineLayer }> = ({ layer }) => {
-  const { frame, appear } = useEnvelope(layer.duration_frames, layer.fade);
-  const dur = Math.max(1, layer.duration_frames);
-  const [c0, c1] = TYPE[layer.type] || ["#232a36", "#5a6472"];
-  const zoom = interpolate(frame, [0, dur], [1.0, 1.12], { easing: Easing.inOut(Easing.ease) });
-  const pan = interpolate(frame, [0, dur], [-2.5, 2.5]);
-  const op = typeof layer.opacity === "number" ? layer.opacity : 1;
-  const tstyle = transitionStyle(frame, dur, layer.transitionIn, layer.transitionOut);
-  return (
-    <AbsoluteFill style={{ opacity: appear * op * (tstyle.opacity ?? 1) }}>
-      <AbsoluteFill style={{ ...transformStyle(layer.transform), ...tstyle, opacity: undefined }}>
-        <AbsoluteFill
-          style={{
-            transform: `scale(${zoom}) translateX(${pan}%)`,
-            background: `linear-gradient(135deg, ${c1}44 0%, ${c0} 55%, #0a0e18 100%)`,
-          }}
-        />
-      </AbsoluteFill>
-      <AbsoluteFill style={{ background: "linear-gradient(0deg, rgba(6,9,17,0.72) 0%, rgba(6,9,17,0) 46%)" }} />
-      <AbsoluteFill style={{ padding: 56, justifyContent: "space-between" }}>
-        <span
-          style={{
-            alignSelf: "flex-start",
-            color: accentOf(layer.type),
-            border: `1.5px solid ${accentOf(layer.type)}`,
-            borderRadius: 999,
-            padding: "6px 16px",
-            fontFamily: "ui-monospace, monospace",
-            fontSize: 22,
-            letterSpacing: "0.14em",
-            textTransform: "uppercase",
-            background: "rgba(0,0,0,0.25)",
-          }}
-        >
-          {layer.source ? `${layer.type} · placeholder` : layer.type}
-        </span>
-        {layer.text ? (
-          <div
-            style={{
-              color: BONE,
-              fontFamily: "system-ui, sans-serif",
-              fontWeight: 700,
-              fontSize: 62,
-              letterSpacing: "-0.01em",
-              textShadow: "0 6px 30px rgba(0,0,0,0.6)",
-              maxWidth: "80%",
-            }}
-          >
-            {layer.text}
-          </div>
-        ) : null}
-      </AbsoluteFill>
-    </AbsoluteFill>
-  );
-};
-
-// ── Audio: real <Audio> when a media url is present, else a presence strip ─────
-const AudioScene: React.FC<{ layer: TimelineLayer }> = ({ layer }) => {
+// ── Consolidated audio-presence: one fixed, non-overlapping row per audio layer ─
+const AudioRowStrip: React.FC<{ layer: TimelineLayer; slot: number }> = ({ layer, slot }) => {
   const frame = useCurrentFrame();
+  const { width, height } = useVideoConfig();
+  const row = audioRow(slot, width, height);
   const accent = accentOf(layer.type);
-  const bars = 48;
   const vol = typeof layer.volume === "number" ? Math.min(1, Math.max(0, layer.volume)) : 1;
   const dur = Math.max(1, layer.duration_frames);
-  // Volume envelope with optional fades.
+  const { appear } = useEnvelope(layer.duration_frames, layer.fade);
   const volAt = (f: number) => {
     let v = vol;
     if (layer.fade?.inFrames) v *= interpolate(f, [0, layer.fade.inFrames], [0, 1], { extrapolateRight: "clamp" });
@@ -426,41 +419,72 @@ const AudioScene: React.FC<{ layer: TimelineLayer }> = ({ layer }) => {
       v *= interpolate(f, [dur - layer.fade.outFrames, dur], [1, 0], { extrapolateLeft: "clamp" });
     return Math.min(1, Math.max(0, v));
   };
-  // Stagger the presence strips so stacked audio layers don't collide visually.
-  const bottomPad = layer.type === "narration" ? 34 : layer.type === "music" ? 104 : 174;
+  const name = layer.type === "narration" ? "◗ narration" : layer.type === "music" ? "♪ music" : "♪ sfx";
+  const bars = 40;
   return (
-    <AbsoluteFill style={{ justifyContent: "flex-end", alignItems: "center", padding: `0 0 ${bottomPad}px` }}>
-      {isLoadableUrl(layer.source) ? (
-        <Audio
-          src={layer.source}
-          volume={volAt}
-          trimBefore={layer.sourceOffsetFrames ? Math.max(0, Math.round(layer.sourceOffsetFrames)) : undefined}
-        />
-      ) : null}
-      <div style={{ display: "flex", gap: 5, alignItems: "flex-end", height: 46, opacity: 0.85 }}>
-        {Array.from({ length: bars }).map((_, i) => {
-          const h = 8 + (Math.sin(i * 0.6 + frame * 0.22) * 0.5 + 0.5) * 38 * (0.4 + 0.6 * vol);
-          return <div key={i} style={{ width: 5, height: h, borderRadius: 3, background: accent }} />;
-        })}
-      </div>
+    <div
+      style={{
+        position: "absolute",
+        left: row.left,
+        top: row.top,
+        width: row.width,
+        height: row.height,
+        display: "flex",
+        alignItems: "center",
+        gap: 16,
+        opacity: appear,
+      }}
+    >
+      {isLoadableUrl(layer.source) ? <Audio src={layer.source} volume={volAt} /> : null}
+      {/* label chip — fixed width, truncated, clamped percentage (never 4090%) */}
       <div
         style={{
-          marginTop: 10,
+          flex: "0 0 auto",
+          display: "flex",
+          alignItems: "center",
+          gap: 10,
           color: accent,
           fontFamily: "ui-monospace, monospace",
           fontSize: 20,
-          letterSpacing: "0.14em",
+          letterSpacing: "0.06em",
           textTransform: "uppercase",
+          background: "rgba(0,0,0,0.35)",
+          border: `1px solid ${accent}55`,
+          borderRadius: 999,
+          padding: "6px 16px",
+          whiteSpace: "nowrap",
         }}
       >
-        {layer.type === "narration" ? "◗ narration" : layer.type === "music" ? "♪ music" : "♪ sfx"}
-        {vol < 1 ? ` · ${Math.round(vol * 100)}%` : ""}
+        <span>{truncateLabel(name, 16)}</span>
+        <span style={{ color: BONE, opacity: 0.85 }}>{volumePercent(layer.volume)}</span>
       </div>
-    </AbsoluteFill>
+      {/* waveform fills the rest of the row */}
+      <div style={{ flex: 1, display: "flex", gap: 4, alignItems: "flex-end", height: Math.min(38, row.height - 8) }}>
+        {Array.from({ length: bars }).map((_, i) => {
+          const h = 6 + (Math.sin(i * 0.55 + frame * 0.22) * 0.5 + 0.5) * (row.height - 14) * (0.4 + 0.6 * vol);
+          return <div key={i} style={{ flex: 1, height: Math.max(3, h), borderRadius: 2, background: accent, opacity: 0.9 }} />;
+        })}
+      </div>
+    </div>
   );
 };
 
-// ── Elegant title card when the timeline has no visible layers yet ─────────────
+const AudioPresence: React.FC<{ layers: TimelineLayer[] }> = ({ layers }) => (
+  <>
+    {layers.map((l, i) => (
+      <Sequence
+        key={l.id}
+        from={Math.max(0, l.start_frame)}
+        durationInFrames={Math.max(1, l.duration_frames)}
+        name={`audio:${l.type}:${l.id}`}
+      >
+        <AudioRowStrip layer={l} slot={i} />
+      </Sequence>
+    ))}
+  </>
+);
+
+// Elegant title card when the timeline has no visible layers yet.
 const TitleCard: React.FC<{ meta?: TimelineMeta }> = ({ meta }) => {
   const { enter } = useEnvelope(9999);
   const y = interpolate(enter, [0, 1], [24, 0]);
@@ -468,49 +492,14 @@ const TitleCard: React.FC<{ meta?: TimelineMeta }> = ({ meta }) => {
   return (
     <AbsoluteFill style={{ justifyContent: "center", alignItems: "center" }}>
       <div style={{ opacity: enter, transform: `translateY(${y}px)`, textAlign: "center" }}>
-        <div
-          style={{
-            color: AMBER,
-            fontFamily: "ui-monospace, monospace",
-            fontSize: 24,
-            letterSpacing: "0.32em",
-            textTransform: "uppercase",
-            marginBottom: 22,
-          }}
-        >
+        <div style={{ color: AMBER, fontFamily: "ui-monospace, monospace", fontSize: 24, letterSpacing: "0.32em", textTransform: "uppercase", marginBottom: 22 }}>
           Backlot
         </div>
-        <div
-          style={{
-            color: BONE,
-            fontFamily: "system-ui, sans-serif",
-            fontWeight: 800,
-            fontSize: 92,
-            letterSpacing: "-0.02em",
-            textShadow: "0 8px 40px rgba(0,0,0,0.5)",
-          }}
-        >
-          {meta?.title || "Untitled project"}
+        <div style={{ color: BONE, fontFamily: "system-ui, sans-serif", fontWeight: 800, fontSize: 92, letterSpacing: "-0.02em", textShadow: "0 8px 40px rgba(0,0,0,0.5)" }}>
+          {truncateLabel(meta?.title || "Untitled project", 40)}
         </div>
-        <div
-          style={{
-            height: 4,
-            background: AMBER,
-            width: `${line * 180}px`,
-            margin: "26px auto 0",
-            borderRadius: 2,
-            boxShadow: `0 0 22px ${AMBER}`,
-          }}
-        />
-        <div
-          style={{
-            color: DIM,
-            fontFamily: "ui-monospace, monospace",
-            fontSize: 26,
-            marginTop: 26,
-            letterSpacing: "0.06em",
-          }}
-        >
+        <div style={{ height: 4, background: AMBER, width: `${line * 180}px`, margin: "26px auto 0", borderRadius: 2, boxShadow: `0 0 22px ${AMBER}` }} />
+        <div style={{ color: DIM, fontFamily: "ui-monospace, monospace", fontSize: 26, marginTop: 26, letterSpacing: "0.06em" }}>
           {meta?.pipeline || "animation"} · {meta?.targetFormatted || "0:00"} · timeline is empty — add layers to compose
         </div>
       </div>
@@ -526,42 +515,47 @@ export const timelineFrameDefaults: TimelineFrameProps = {
     height: 1080,
     layers: [
       { id: "bg", type: "video", start_frame: 0, duration_frames: 240, z: 0 },
-      { id: "ttl", type: "text", start_frame: 20, duration_frames: 200, z: 2, text: "Timeline Preview" },
+      { id: "ttl", type: "text", start_frame: 20, duration_frames: 200, z: 2, title: "Timeline Preview" },
     ],
   },
   meta: { title: "Timeline Preview", targetFormatted: "0:08", pipeline: "animation" },
 };
 
-const Scene: React.FC<{ layer: TimelineLayer }> = ({ layer }) => {
-  if (AUDIO.has(layer.type)) return <AudioScene layer={layer} />;
+// One non-audio layer → its zone-placed scene(s).
+const VisualScene: React.FC<{ layer: TimelineLayer }> = ({ layer }) => {
   if (layer.type === "caption") return <CaptionScene layer={layer} />;
-  if (isText(layer.type)) return <TextScene layer={layer} />;
-  if ((layer.type === "video" || layer.type === "image") && isLoadableUrl(layer.source)) {
-    return <MediaScene layer={layer} />;
-  }
-  return <VisualScene layer={layer} />;
+  if (isText(layer.type)) return <TitleScene layer={layer} />;
+  // Visual (video/image/shape): full-frame background + badge + optional lower-third.
+  const media = (layer.type === "video" || layer.type === "image") && isLoadableUrl(layer.source);
+  return (
+    <>
+      <BackgroundFill layer={layer} media={media} />
+      <Badge layer={layer} />
+      {layer.text ? <LowerThird layer={layer} /> : null}
+    </>
+  );
 };
 
 export const TimelineFrame: React.FC<TimelineFrameProps> = ({ timeline, meta }) => {
-  const layers = (timeline?.layers || [])
-    .filter((l) => l && l.enabled !== false)
-    .slice()
-    .sort((a, b) => (a.z || 0) - (b.z || 0));
-  const hasVisible = layers.some((l) => !AUDIO.has(l.type));
+  const all = (timeline?.layers || []).filter((l) => l && l.enabled !== false);
+  const visual = all.filter((l) => !AUDIO.has(l.type)).slice().sort((a, b) => (a.z || 0) - (b.z || 0));
+  const audio = all.filter((l) => AUDIO.has(l.type));
+  const hasVisible = visual.length > 0;
 
   return (
     <AbsoluteFill>
       <Backdrop />
-      {layers.map((l) => (
+      {visual.map((l) => (
         <Sequence
           key={l.id}
           from={Math.max(0, l.start_frame)}
           durationInFrames={Math.max(1, l.duration_frames)}
           name={`${l.type}:${l.id}`}
         >
-          <Scene layer={l} />
+          <VisualScene layer={l} />
         </Sequence>
       ))}
+      <AudioPresence layers={audio} />
       {!hasVisible ? <TitleCard meta={meta} /> : null}
     </AbsoluteFill>
   );
