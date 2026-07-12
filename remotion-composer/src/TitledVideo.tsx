@@ -19,7 +19,7 @@ const { fontFamily } = loadFont("normal", {
   subsets: ["latin"],
 });
 
-export interface TitledVideoProps {
+export type TitledVideoProps = {
   videoSrc: string;
   tagline: string;
   // When the tagline starts animating in, in seconds from the start of the video.

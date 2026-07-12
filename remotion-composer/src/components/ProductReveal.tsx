@@ -9,7 +9,7 @@ import {
   Easing,
 } from "remotion";
 
-export interface ProductRevealProps {
+export type ProductRevealProps = {
   productImage: string;
   productName: string;
   price: string;

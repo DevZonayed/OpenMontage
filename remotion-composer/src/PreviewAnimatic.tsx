@@ -6,7 +6,7 @@ import { AbsoluteFill, interpolate, spring, useCurrentFrame, useVideoConfig, Seq
 // network, no paid media — it is honestly a PREVIEW of the plan, not the final
 // generated film (which is agent-driven).
 
-export interface PreviewAnimaticProps {
+export type PreviewAnimaticProps = {
   title: string;
   pipeline: string;
   targetFormatted: string;
