@@ -1,0 +1,59 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "openmontage/artifacts/production_event",
+  "title": "Production Event",
+  "description": "One entry in the append-only, monotonically-sequenced production event history (run_events.jsonl). The event log is the AUTHORITATIVE source of truth for a run; production_run_state is a materialized view of it. Events are never mutated or deleted. Every event carries stable brain/session/job identity and is secret-redacted before persistence.",
+  "type": "object",
+  "required": ["v", "seq", "ts", "run_id", "project_id", "type"],
+  "properties": {
+    "v": { "type": "string", "const": "1.0" },
+    "seq": { "type": "integer", "minimum": 1, "description": "Monotonic per-run sequence; the read cursor." },
+    "ts": { "type": "string", "format": "date-time" },
+    "run_id": { "type": "string" },
+    "project_id": { "type": "string" },
+    "type": {
+      "type": "string",
+      "enum": [
+        "run_started",
+        "stage_entered",
+        "stage_progress",
+        "tool_call",
+        "provider_call",
+        "decision",
+        "output",
+        "approval_requested",
+        "approval_granted",
+        "approval_rejected",
+        "correction",
+        "blocker_raised",
+        "blocker_cleared",
+        "stage_completed",
+        "stage_failed",
+        "stage_skipped",
+        "retry",
+        "resume",
+        "heartbeat",
+        "run_cancel_requested",
+        "run_completed",
+        "run_failed",
+        "run_cancelled",
+        "note"
+      ]
+    },
+    "stage": { "type": ["string", "null"] },
+    "agent_id": { "type": ["string", "null"] },
+    "session_id": { "type": ["string", "null"] },
+    "job_id": { "type": ["string", "null"] },
+    "tool": { "type": ["string", "null"] },
+    "provider": { "type": ["string", "null"] },
+    "level": { "type": "string", "enum": ["info", "warning", "error"] },
+    "message": { "type": ["string", "null"] },
+    "data": {
+      "type": "object",
+      "description": "Structured payload — always secret-redacted. No API keys/tokens ever.",
+      "additionalProperties": true
+    },
+    "redacted": { "type": "boolean", "description": "True when redaction masked one or more values." }
+  },
+  "additionalProperties": true
+}
