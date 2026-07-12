@@ -101,3 +101,9 @@ venv/
 
 # Backlot local cache (thumbnails)
 .backlot/
+
+# App-managed Maestro native-skill artifacts (materialized on disk per worktree,
+# never repo content). The nested .claude/skills/.gitignore hides the native skill
+# dirs; ignore it and the on-demand browser skill so worktrees stay clean.
+.claude/skills/.gitignore
+.claude/skills/browser/

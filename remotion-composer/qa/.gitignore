@@ -1,0 +1,2 @@
+# Rendered QA artifacts are regenerable — keep only the reproducible props files.
+out/

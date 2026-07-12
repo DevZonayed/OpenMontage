@@ -1,0 +1,15 @@
+{
+  "timeline": {
+    "version": "1.0",
+    "fps": 30,
+    "target_duration_seconds": 300,
+    "total_frames": 9000,
+    "width": 1920,
+    "height": 1080,
+    "layers": [
+      { "id": "bg", "type": "video", "track": 0, "start_frame": 0, "duration_frames": 9000, "z": 0, "enabled": true, "opacity": 1, "text": "Five minute composition", "source": null },
+      { "id": "end", "type": "text", "track": 1, "start_frame": 8850, "duration_frames": 150, "z": 3, "enabled": true, "opacity": 1, "title": "FRAME 9000", "subtitle": "300s @ 30fps" }
+    ]
+  },
+  "meta": { "title": "9000-frame invariant", "pipeline": "animation", "targetFormatted": "5:00" }
+}

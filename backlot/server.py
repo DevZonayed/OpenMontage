@@ -270,8 +270,21 @@ async def _watch_projects() -> None:
             hub.publish(pid)
 
 
-def create_app() -> FastAPI:
+def create_app(*, render_base_url: Optional[str] = None) -> FastAPI:
     app = FastAPI(title="Backlot", docs_url=None, redoc_url=None)
+
+    # Trusted loopback base the CLI render resolves project media against. It is
+    # provided EXPLICITLY by the server runtime — `cmd_serve` passes the ACTUAL
+    # bound port (http://127.0.0.1:<port>) — or from operator config
+    # (BACKLOT_RENDER_BASE_URL / BACKLOT_PORT). NEVER derived from a request Host
+    # header. Fail CLOSED (None) when nothing trusted is configured: the render
+    # endpoints then refuse to render rather than guess a (possibly wrong) port.
+    try:
+        from lib.render_meta import resolve_render_base_url
+        app.state.render_base_url = resolve_render_base_url(
+            base_url=render_base_url, require_explicit=True)
+    except Exception:
+        app.state.render_base_url = None
 
     @app.middleware("http")
     async def _no_cache_ui(request: Request, call_next):
@@ -427,8 +440,15 @@ def create_app() -> FastAPI:
             frame = int(frame)
         except (TypeError, ValueError):
             raise HTTPException(status_code=400, detail="frame must be an integer")
+        base = getattr(request.app.state, "render_base_url", None)
+        if not base:
+            raise HTTPException(
+                status_code=503,
+                detail="Render base URL is not configured; project media cannot be "
+                       "resolved. Start via `backlot serve` or set BACKLOT_PORT / "
+                       "BACKLOT_RENDER_BASE_URL.")
         try:
-            res = await asyncio.to_thread(render_still, project_dir, frame)
+            res = await asyncio.to_thread(render_still, project_dir, frame, base_url=base)
         except FrameRenderError as exc:
             raise HTTPException(status_code=400, detail=str(exc))
         if not res.get("ok"):
@@ -443,7 +463,14 @@ def create_app() -> FastAPI:
         project_dir = _safe_project_dir(project_id)
         await _guarded_json_body(request)   # CSRF + origin + size guard
         _enforce_rate(request, "render")
-        res = await asyncio.to_thread(render_timeline_preview, project_dir)
+        base = getattr(request.app.state, "render_base_url", None)
+        if not base:
+            raise HTTPException(
+                status_code=503,
+                detail="Render base URL is not configured; project media cannot be "
+                       "resolved. Start via `backlot serve` or set BACKLOT_PORT / "
+                       "BACKLOT_RENDER_BASE_URL.")
+        res = await asyncio.to_thread(render_timeline_preview, project_dir, base_url=base)
         if not res.get("ok"):
             raise HTTPException(status_code=400, detail=res.get("reason") or "Timeline render failed.")
         return res

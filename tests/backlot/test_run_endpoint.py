@@ -28,7 +28,9 @@ def client(tmp_path, monkeypatch):
     async def no_watch():
         return None
     monkeypatch.setattr(server_mod, "_watch_projects", no_watch)
-    with TestClient(server_mod.create_app()) as c:
+    # A real server always configures its trusted render base (cmd_serve passes the
+    # bound port); model that so the render endpoints exercise their success path.
+    with TestClient(server_mod.create_app(render_base_url="http://127.0.0.1:4750")) as c:
         yield c
 
 
