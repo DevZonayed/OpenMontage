@@ -125,9 +125,41 @@ def reject_approval(project_dir: Path, body: dict) -> dict:
 def _client(orchestrator):
     if orchestrator is not None:
         return orchestrator
-    from lib.production_brain.orchestrator import default_orchestrator_client
+    # Control the SAME live orchestrator Start used (env/persisted Mochlet MCP),
+    # not the bare env-only REST client — otherwise cancel/retry/resume could be
+    # dispatched to the WRONG service. build_live_client is itself defensive and
+    # returns a fail-closed client when unconfigured, so we do NOT swap in a
+    # different (env-REST) client on error.
+    from lib.production_brain.connection import build_live_client
 
-    return default_orchestrator_client()
+    return build_live_client()
+
+
+def _record_successor(store, run_id: str, stage: Optional[str], successor, *,
+                      old_job_id: Optional[str] = None) -> None:
+    """Record the result of a retry/resume control TRUTHFULLY.
+
+    Fail-closed at the persistence boundary: only a CANONICAL UUID handle is ever
+    written. A same-id control (retry, ``runJob``) logs "Retrying job <id>" and does
+    NOT invent lineage; a new-id control (resume via ``sendChat``) records the
+    successor handle as "Resumed as successor job <new>"."""
+    from lib.production_brain.mochlet import is_uuid
+
+    job_id = getattr(successor, "job_id", None)
+    session_id = getattr(successor, "session_id", None)
+    if not is_uuid(job_id):
+        return
+    if not is_uuid(session_id):
+        session_id = None
+    if job_id == old_job_id:
+        message = f"Retrying job {job_id}."
+    else:
+        message = f"Resumed as successor job {job_id}."
+    try:
+        store.update_external_handle(
+            run_id, session_id=session_id, job_id=job_id, stage=stage, message=message)
+    except BrainStoreError:
+        pass
 
 
 def cancel_run(project_dir: Path, body: dict, *, orchestrator=None) -> dict:
@@ -182,12 +214,17 @@ def retry_stage(project_dir: Path, body: dict, *, orchestrator=None) -> dict:
             job_id = _require_control_handle(state, brain, body)
             key = f"{state['run_id']}:retry:{stage}"
             try:
-                _client(orchestrator).control_job(job_id=job_id, action="retry", idempotency_key=key)
+                successor = _client(orchestrator).control_job(job_id=job_id, action="retry", idempotency_key=key)
             except Exception:
                 store.raise_blocker(stage, kind="control_unconfirmed",
                                    message=f"External retry of stage '{stage}' is unconfirmed — retry.",
                                    options=["Retry"])
                 return store.read_state()
+            store.retry_stage(stage, run_id=run_id)
+            # Record the (same-id) handle LAST so the activity truthfully reads
+            # "Retrying job <id>".
+            _record_successor(store, state["run_id"], stage, successor, old_job_id=job_id)
+            return store.read_state()
         return store.retry_stage(stage, run_id=run_id)
     except BrainStoreError as exc:
         raise BrainApiError(str(exc), status=exc.status)
@@ -204,7 +241,7 @@ def resume_run(project_dir: Path, body: dict, *, orchestrator=None) -> dict:
             job_id = _require_control_handle(state, brain, body)
             key = f"{state['run_id']}:resume"
             try:
-                _client(orchestrator).control_job(job_id=job_id, action="resume", idempotency_key=key)
+                successor = _client(orchestrator).control_job(job_id=job_id, action="resume", idempotency_key=key)
             except Exception:
                 from lib.production_brain.schema import STAGES
 
@@ -213,6 +250,12 @@ def resume_run(project_dir: Path, body: dict, *, orchestrator=None) -> dict:
                                    message="External resume is unconfirmed — retry.",
                                    options=["Retry"])
                 return store.read_state()
+            store.resume()
+            # Record the successor handle LAST so the activity truthfully reads
+            # "Resumed as successor job <new>".
+            _record_successor(store, state["run_id"], state.get("current_stage"), successor,
+                              old_job_id=job_id)
+            return store.read_state()
         return store.resume()
     except BrainStoreError as exc:
         raise BrainApiError(str(exc), status=exc.status)

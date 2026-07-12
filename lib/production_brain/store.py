@@ -491,6 +491,19 @@ class ProductionBrainStore:
     def heartbeat(self, *, message: Optional[str] = None, **kw) -> dict:
         return self.event("heartbeat", message=message, **kw)
 
+    def update_external_handle(self, run_id: str, *, session_id: Optional[str] = None,
+                               job_id: Optional[str] = None, stage: Optional[str] = None,
+                               message: Optional[str] = None) -> dict:
+        """Record a SUCCESSOR external job/session handle (retry/resume lineage).
+
+        The new handle is carried in ``data`` so the reducer swaps the run's live
+        handle while preserving the predecessor — the UI shows the job that is
+        actually running, and we never claim the old job resumed."""
+        return self.event(
+            "external_handle_updated", stage=stage, run_id=run_id,
+            message=message or "Production continued under a successor job.",
+            data={"session_id": session_id, "job_id": job_id})
+
     # ---- approvals / control (validate the EXACT run id) -------------------
     def grant_approval(self, run_id: str, *, approval_id: Optional[str] = None,
                        stage: Optional[str] = None, by: Optional[str] = None,

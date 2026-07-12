@@ -17,21 +17,32 @@ describe("BacklotClient", () => {
       calls.push(url);
       return jsonRes({ timeline: { fps: 30, target_duration_seconds: 5, total_frames: 150, layers: [] }, etag: "e1" });
     };
-    const c = new BacklotClient({ projectId: "demo", fetchImpl, fixtureFallback: false });
+    const c = new BacklotClient({ projectId: "demo", fetchImpl });
     const p = await c.getTimeline();
     expect(p.etag).toBe("e1");
     expect(calls[0]).toBe("/api/project/demo/timeline");
     expect(c.usedFixture).toBe(false);
   });
 
-  it("falls back to deterministic fixtures when the server is unreachable", async () => {
+  it("THROWS on a network error — never auto-substitutes fabricated data", async () => {
     const fetchImpl: FetchLike = async () => {
       throw new Error("ECONNREFUSED");
     };
-    const c = new BacklotClient({ projectId: "demo", fetchImpl, fixtureFallback: true });
+    const c = new BacklotClient({ projectId: "demo", fetchImpl });
+    await expect(c.getTimeline()).rejects.toThrow("ECONNREFUSED");
+    await expect(c.getBrain()).rejects.toThrow("ECONNREFUSED");
+    await expect(c.getStatus()).rejects.toThrow("ECONNREFUSED");
+    expect(c.usedFixture).toBe(false); // no silent fixture flip
+  });
+
+  it("returns clearly-labelled sample data ONLY in explicit demo mode (forceFixtures)", async () => {
+    const c = new BacklotClient({ projectId: "demo", forceFixtures: true });
     const p = await c.getTimeline();
     expect(c.usedFixture).toBe(true);
     expect(p.timeline.total_frames).toBe(360);
+    const v = await c.getStatus();
+    expect(v.is_demo).toBe(true);
+    expect(v.is_live).toBe(false);
   });
 
   it("attaches the CSRF token and if_match on save", async () => {
@@ -83,11 +94,8 @@ describe("BacklotClient", () => {
     expect(p.timeline.total_frames).toBe(360);
   });
 
-  it("brain reads fall back to a clearly-labelled deterministic fixture offline", async () => {
-    const fetchImpl: FetchLike = async () => {
-      throw new Error("ECONNREFUSED");
-    };
-    const c = new BacklotClient({ projectId: "demo", fetchImpl, fixtureFallback: true });
+  it("brain reads return a clearly-labelled deterministic fixture ONLY in demo mode", async () => {
+    const c = new BacklotClient({ projectId: "demo", forceFixtures: true });
     const s = await c.getBrain();
     expect(c.usedFixture).toBe(true);
     expect(s.state).toBe("not_started");

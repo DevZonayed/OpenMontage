@@ -113,6 +113,7 @@ EVENT_TYPES: frozenset[str] = frozenset(
         "run_completed",
         "run_failed",
         "run_cancelled",
+        "external_handle_updated",
         "note",
     }
 )
@@ -606,6 +607,23 @@ def reduce_event(state: dict, ev: dict, *, strict: bool = False) -> dict:
         _set_state("cancelled")
         st["current_stage"] = None
         st["activity"] = ev.get("message") or "Production run cancelled. Completed work is preserved."
+
+    elif etype == "external_handle_updated":
+        # Mochlet implements retry/resume as a SUCCESSOR job; record the new
+        # canonical handle so the UI shows the job that is actually running (we
+        # never pretend the old job resumed). Lineage is preserved in the log.
+        brain = st.setdefault("brain", {})
+        new_job = data.get("job_id")
+        new_sess = data.get("session_id")
+        # Only a DIFFERENT job is a successor (resume); a same-id control (retry)
+        # updates activity without inventing lineage.
+        if new_job and new_job != brain.get("job_id"):
+            brain["predecessor_job_id"] = brain.get("job_id")
+            brain["job_id"] = new_job
+        if new_sess:
+            brain["session_id"] = new_sess
+        if ev.get("message"):
+            st["activity"] = ev["message"]
 
     elif etype in ("heartbeat", "note"):
         if ev.get("message"):

@@ -68,6 +68,7 @@ _RATE_LIMITS = {
     "inbox": (40, 10.0),     # agent-queue READ polled ~every 2s by the board — own bucket, never drains 'projects'
     "brain": (60, 10.0),     # production-brain control (approve/cancel/retry/resume) — bursty on a live run
     "preferences": (30, 10.0),  # learned-style read/update/reset — user-driven, infrequent
+    "hermes": (12, 60.0),        # guided Hermes/Mochlet connect — user-driven, rare
 }
 _RATE_MAX_KEYS = 4096  # hard cap on tracked buckets (memory bound)
 
@@ -658,6 +659,41 @@ def create_app(*, render_base_url: Optional[str] = None) -> FastAPI:
     app.post("/api/project/{project_id}/brain/cancel")(_brain_control("cancel_run"))
     app.post("/api/project/{project_id}/brain/retry")(_brain_control("retry_stage"))
     app.post("/api/project/{project_id}/brain/resume")(_brain_control("resume_run"))
+
+    # ---- Canonical production status (ONE view model: board + studio share it) --
+    # Reconciles brain + coarse run + checkpoints + timeline + Hermes connection
+    # into a single command-center view so the two surfaces never disagree.
+
+    @app.get("/api/project/{project_id}/status")
+    async def project_status(project_id: str, demo: int = 0, stale: int = 0) -> dict:
+        from backlot.status_api import build_status_payload
+        project_dir = _safe_project_dir(project_id)
+        return await asyncio.to_thread(
+            build_status_payload, project_dir, demo=bool(demo), stale=bool(stale))
+
+    # ---- Hermes / Mochlet connection (guided, secure) ------------------------
+
+    @app.get("/api/hermes/connection")
+    async def hermes_connection_get() -> dict:
+        from backlot.status_api import hermes_connection
+        return await asyncio.to_thread(hermes_connection)
+
+    @app.post("/api/hermes/connect")
+    async def hermes_connect_post(request: Request) -> dict:
+        from backlot.status_api import StatusApiError, hermes_connect
+        body = await _guarded_json_body(request)
+        _enforce_rate(request, "hermes")
+        try:
+            return await asyncio.to_thread(hermes_connect, body)
+        except StatusApiError as exc:
+            raise HTTPException(status_code=getattr(exc, "status", 400), detail=str(exc))
+
+    @app.post("/api/hermes/disconnect")
+    async def hermes_disconnect_post(request: Request) -> dict:
+        from backlot.status_api import hermes_disconnect
+        body = await _guarded_json_body(request)
+        _enforce_rate(request, "hermes")
+        return await asyncio.to_thread(hermes_disconnect, body)
 
     # ---- Learned style preferences (visible, auditable, reversible) ----------
 
