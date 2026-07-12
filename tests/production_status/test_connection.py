@@ -22,8 +22,8 @@ class _Resp:
 def _transport(status_code=200, body=None, exc=None):
     calls = []
 
-    def call(url, *, timeout):
-        calls.append((url, timeout))
+    def call(url, *, timeout, headers=None):
+        calls.append({"url": url, "timeout": timeout, "headers": headers})
         if exc is not None:
             raise exc
         return _Resp(status_code, body)
@@ -54,7 +54,32 @@ def test_probe_healthy_service():
     h = C.probe_health(C.DEFAULT_MOCHLET_URL, transport=t)
     assert h["reachable"] and h["healthy"]
     assert h["service"] == "mochlet"
-    assert t.calls[0][0].endswith("/health")
+    assert t.calls[0]["url"].endswith("/health")
+
+
+def test_probe_forwards_bearer_token():
+    t = _transport(200, {"service": "mochlet"})
+    C.probe_health(C.DEFAULT_MOCHLET_URL, transport=t, token="tok-abc")
+    assert t.calls[0]["headers"] == {"Authorization": "Bearer tok-abc"}
+
+
+def test_connect_verify_sends_stored_token(tmp_path):
+    # A /health that requires auth (401 without token, 200 with it) must succeed
+    # because connect verifies WITH the credential it just stored.
+    secrets = _MemSecrets()
+    seen = {}
+
+    def call(url, *, timeout, headers=None):
+        seen["headers"] = headers
+        # authorized only when the bearer header is present
+        return _Resp(200 if headers and "Authorization" in headers else 401,
+                     {"service": "mochlet"})
+
+    s = C.connect(url=C.DEFAULT_MOCHLET_URL, token="tok-xyz", base_dir=tmp_path,
+                  transport=call, secret_setter=secrets.setter, secret_getter=secrets.getter,
+                  env={})
+    assert s["status"] == "connected" and s["available"] is True
+    assert seen["headers"] == {"Authorization": "Bearer tok-xyz"}
 
 
 def test_probe_connection_refused_is_unreachable():

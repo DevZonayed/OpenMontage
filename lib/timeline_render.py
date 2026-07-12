@@ -72,6 +72,16 @@ def render_timeline_preview(project_dir: Path, *,
     if not timeline or not isinstance(timeline, dict):
         return {"ok": False, "reason": "This project has no timeline yet."}
 
+    # No render unless there are renderable layers: an empty skeleton with a
+    # positive frame count would otherwise produce a misleading blank film (a
+    # 2:30 project of black). Enforced here so a direct API caller can't bypass
+    # the disabled UI button.
+    layers = timeline.get("layers")
+    if not isinstance(layers, list) or len(layers) == 0:
+        return {"ok": False,
+                "reason": "The timeline has no layers to render yet. Hermes builds the "
+                          "timeline during production — there is nothing to render."}
+
     total = int(timeline.get("total_frames") or 0)
     if total <= 0:
         return {"ok": False, "reason": "The timeline has no frames."}

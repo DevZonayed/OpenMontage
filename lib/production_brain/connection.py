@@ -128,18 +128,21 @@ def probe_target(*, env: Optional[dict] = None, base_dir: Optional[Path] = None)
 # --------------------------------------------------------------------------- #
 # Health handshake
 # --------------------------------------------------------------------------- #
-def _default_transport(url: str, *, timeout: float):
+def _default_transport(url: str, *, timeout: float, headers: Optional[dict] = None):
     import requests  # a declared dependency
 
-    return requests.get(url, timeout=timeout, allow_redirects=False)
+    return requests.get(url, timeout=timeout, allow_redirects=False, headers=headers)
 
 
 def probe_health(url: str, *, transport: Optional[Callable[..., Any]] = None,
-                 timeout: float = _PROBE_TIMEOUT_SECONDS) -> dict:
+                 timeout: float = _PROBE_TIMEOUT_SECONDS,
+                 token: Optional[str] = None) -> dict:
     """GET ``<url>/health`` and classify the result. Never raises.
 
-    ``transport(url, timeout=...)`` is injectable so the suite never hits the
-    network. Returns ``{reachable, healthy, status_code, service, detail}``.
+    ``transport(url, timeout=..., headers=...)`` is injectable so the suite never
+    hits the network. When ``token`` is supplied it rides the verify request as a
+    ``Bearer`` header, so an authenticated ``/health`` succeeds (the token is never
+    returned/logged). Returns ``{reachable, healthy, status_code, service, detail}``.
     """
     try:
         base = validate_endpoint(url)
@@ -148,8 +151,9 @@ def probe_health(url: str, *, transport: Optional[Callable[..., Any]] = None,
                 "service": None, "detail": str(exc)}
     target = base.rstrip("/") + HEALTH_PATH
     call = transport or _default_transport
+    headers = {"Authorization": f"Bearer {token}"} if token else None
     try:
-        resp = call(target, timeout=timeout)
+        resp = call(target, timeout=timeout, headers=headers)
     except Exception as exc:  # connection refused / timeout / library error
         return {"reachable": False, "healthy": False, "status_code": None,
                 "service": None,
@@ -196,7 +200,8 @@ def connection_status(
     """
     endpoint = configured_endpoint(env=env, base_dir=base_dir)
     getter = secret_getter or _keyring_getter
-    token_present = bool(getter(ORCHESTRATOR_TOKEN_ACCOUNT))
+    token = getter(ORCHESTRATOR_TOKEN_ACCOUNT)
+    token_present = bool(token)
 
     def _base(status: str, available: bool, headline: str, detail: str,
               actions: list[dict]) -> dict:
@@ -219,7 +224,7 @@ def connection_status(
         # Not configured. Detect whether local Mochlet is already running so the
         # guided connect can be one click.
         if probe:
-            health = probe_health(DEFAULT_MOCHLET_URL, transport=transport)
+            health = probe_health(DEFAULT_MOCHLET_URL, transport=transport, token=token)
             if health["reachable"]:
                 return _base(
                     "detected", False,
@@ -238,7 +243,7 @@ def connection_status(
         return _base("configured", True, "Hermes configured",
                      "An orchestrator endpoint is configured.", [])
 
-    health = probe_health(endpoint, transport=transport)
+    health = probe_health(endpoint, transport=transport, token=token)
     if health["healthy"]:
         svc = health.get("service")
         return _base(
@@ -300,7 +305,11 @@ def connect(
                 f"could not store the credential securely ({exc.__class__.__name__})",
                 status=500) from exc
 
-    health = probe_health(target, transport=transport)
+    # Verify WITH the credential (the one just provided, or a previously-stored
+    # one) so an authenticated /health succeeds instead of looping on needs_token.
+    getter = secret_getter or _keyring_getter
+    verify_token = token or getter(ORCHESTRATOR_TOKEN_ACCOUNT)
+    health = probe_health(target, transport=transport, token=verify_token)
     if not health["reachable"]:
         # Do not persist an endpoint we can't reach.
         return connection_status(env=env, base_dir=base_dir, transport=transport,

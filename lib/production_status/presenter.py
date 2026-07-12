@@ -374,16 +374,23 @@ def build_status_view(
         mode = "demo" if demo else ("local" if (checkpoints["any"] or run_state != "not_started") else "idle")
         if run_state == _RUN_WAITING and plan_approved:
             overall = "ready_to_produce"
-            current_stage = checkpoints["current"] or _first_incomplete(checkpoints) or "assets"
+            # The approved plan already covers research→scene_plan (planning); the
+            # next thing Hermes *produces* is asset generation, so the command
+            # center points at the first incomplete PRODUCTION stage (assets
+            # onward), not an intermediate planning checkpoint.
+            current_stage = (_first_incomplete_production(checkpoints)
+                             or checkpoints["current"] or PRODUCTION_START)
         elif run_state == _RUN_WAITING:
             overall = "awaiting_plan_approval"
             current_stage = "proposal"
+        elif run_state == "cancelling":
+            # Checked before _RUN_ACTIVE (which also contains "cancelling") so a
+            # coarse cancellation is never mislabeled as "planning".
+            overall = "cancelling"
+            current_stage = checkpoints["current"]
         elif run_state in _RUN_ACTIVE:
             overall = "planning"
             current_stage = checkpoints["current"] or "research"
-        elif run_state == "cancelling":
-            overall = "cancelling"
-            current_stage = checkpoints["current"]
         elif run_state == "cancelled":
             overall = "cancelled"
             current_stage = None
@@ -507,6 +514,21 @@ def build_status_view(
 
 def _first_incomplete(checkpoints: dict) -> Optional[str]:
     for sid in CANONICAL_STAGES:
+        if sid not in checkpoints["completed"]:
+            return sid
+    return None
+
+
+# Production (asset-generating) work begins at ``assets``; research→scene_plan are
+# the planning stages an approved plan already covers.
+PRODUCTION_START = "assets"
+_PRODUCTION_START_INDEX = _STAGE_INDEX[PRODUCTION_START]
+
+
+def _first_incomplete_production(checkpoints: dict) -> Optional[str]:
+    """First canonical stage at/after ``assets`` that isn't completed."""
+    for idx in range(_PRODUCTION_START_INDEX, CANONICAL_STAGE_COUNT):
+        sid = CANONICAL_STAGES[idx]
         if sid not in checkpoints["completed"]:
             return sid
     return None

@@ -99,9 +99,12 @@ def test_plan_approved_awaiting_hermes_has_one_primary_continue():
     assert prev and prev[0]["advances_production"] is False
     # Stop is NOT offered on a merely-approved run
     assert v["stop_available"] is False
-    # canonical stage vocab + a real "stage N of 11"
+    # canonical stage vocab: the approved plan covers research→scene_plan, so the
+    # next PRODUCTION stage is asset generation (Stage 5), not an intermediate
+    # planning checkpoint.
     assert v["stage_count"] == 11
-    assert v["stage_number"] is not None
+    assert v["current_stage"] == "assets"
+    assert v["stage_number"] == 5
     assert v["why_waiting"]
     assert "raw" not in v["headline"].lower()
 
@@ -207,6 +210,15 @@ def test_blocked_brain_unavailable_routes_to_connect():
     assert v["overall_state"] == "blocked"
     assert v["primary_action"]["id"] == "connect_hermes"
     assert v["stop_available"] is True
+
+
+def test_coarse_cancelling_is_not_mislabeled_planning():
+    # run.json "cancelling" is in _RUN_ACTIVE; it must resolve to cancelling, not
+    # the "Hermes is preparing your production" planning copy.
+    v = build_status_view(board={"project_id": "p", "stages": [], "events": []},
+                          run={"state": "cancelling", "run_id": "r1"}, connection=CONN_OK)
+    assert v["overall_state"] == "cancelling"
+    assert "preparing" not in (v["active_task"] or "").lower()
 
 
 def test_cancellation_pending_is_non_terminal_cancelling():
