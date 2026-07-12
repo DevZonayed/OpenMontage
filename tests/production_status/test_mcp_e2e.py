@@ -45,7 +45,8 @@ def test_start_creates_one_real_external_job(tmp_path):
     assert len(fake.sent_chats) == 1
 
 
-def test_retry_records_successor_handle(tmp_path):
+def test_retry_keeps_the_same_job_id(tmp_path):
+    # runJob re-runs the same job → the live handle must NOT change; activity says retrying.
     proj = tmp_path / "eb"
     proj.mkdir()
     fake = FakeMochletMcp()
@@ -56,15 +57,39 @@ def test_retry_records_successor_handle(tmp_path):
     rid = state["run_id"]
     original_job = state["brain"]["job_id"]
 
-    # retry a stage through the API with the SAME live client → successor job
     new_state = brain_api.retry_stage(
         proj, {"run_id": rid, "stage": "assets", "job_id": original_job},
         orchestrator=client)
     brain = new_state["brain"]
-    assert brain["job_id"] != original_job  # the successor is now the live handle
+    assert brain["job_id"] == original_job          # SAME job (re-run), no successor
+    assert "predecessor_job_id" not in brain         # no fabricated lineage
+    assert fake.controls[-1]["action"] == "run"
+
+
+def test_resume_records_successor_new_job_same_session(tmp_path):
+    # resume → sendChat on the session → NEW job, same session; live handle swaps,
+    # predecessor recorded, activity says "Resumed as successor".
+    proj = tmp_path / "ebr"
+    proj.mkdir()
+    fake = FakeMochletMcp()
+    client = _mochlet_client(fake, tmp_path)
+    adapter = HermesBrainAdapter(client=client)
+    store = ProductionBrainStore(proj)
+    state = adapter.start(store, requested_duration_seconds=150)
+    rid = state["run_id"]
+    original_job = state["brain"]["job_id"]
+    original_session = state["brain"]["session_id"]
+
+    new_state = brain_api.resume_run(
+        proj, {"run_id": rid, "job_id": original_job}, orchestrator=client)
+    brain = new_state["brain"]
+    assert brain["job_id"] != original_job              # successor job
     assert is_uuid(brain["job_id"])
     assert brain["predecessor_job_id"] == original_job  # lineage preserved
-    assert fake.controls[-1]["action"] == "run"
+    assert brain["session_id"] == original_session      # SAME session
+    assert "successor" in new_state["activity"].lower()
+    # resume went through sendChat, never continueSession
+    assert not any(cc["action"] == "continue" for cc in fake.controls)
 
 
 def test_cancel_targets_the_exact_mochlet_job(tmp_path):

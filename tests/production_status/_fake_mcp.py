@@ -168,19 +168,20 @@ class FakeMochletMcp:
                 self.jobs[jid]["status"] = "cancelled"
             return self._ok({"ok": True, "cancelled": jid})
         if name == "runJob":
-            # runJob re-runs an EXISTING job and (per Mochlet) yields a successor.
+            # Mochlet localApi: re-runs the EXISTING job and returns the SAME job
+            # (same id) — NOT a successor.
             src = args.get("id")
-            new = self._new_job(self.jobs.get(src, {}).get("projectId"),
-                                self.jobs.get(src, {}).get("sessionId"),
-                                predecessor=src, marker=self.jobs.get(src, {}).get("marker"))
-            self.controls.append({"action": "run", "id": src, "successor": new["job"]["id"]})
-            return self._ok(new)
+            job = self.jobs.get(src)
+            if job is not None:
+                job["status"] = "running"
+            self.controls.append({"action": "run", "id": src})
+            return self._ok({"job": {"id": src},
+                             "session": {"id": (job or {}).get("sessionId")}})
         if name == "continueSession":
-            sid = args.get("sessionId")
-            new = self._new_job(args.get("projectId"), sid, marker=args.get("marker"))
-            self.controls.append({"action": "continue", "sessionId": sid,
-                                  "successor": new["job"]["id"]})
-            return self._ok(new)
+            # Mochlet localApi: forks a CODING session/worktree; it ignores text and
+            # creates NO production job. Modeled truthfully (returns no job handle).
+            self.controls.append({"action": "continue", "sessionId": args.get("sessionId")})
+            return self._ok({"ok": True, "session": {"id": args.get("sessionId")}})
         return {"isError": True, "content": [{"type": "text", "text": f"Unhandled: {name}"}]}
 
     # -- helpers ------------------------------------------------------------

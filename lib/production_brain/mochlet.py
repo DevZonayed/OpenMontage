@@ -47,13 +47,19 @@ _UUID_RE = re.compile(
 # can be de-duplicated against ``listJobPage`` after an indeterminate sendChat.
 _RUN_MARKER_PREFIX = "OM-RUN"
 
-# Tools the bridge must have to actually start, discover, and control a production
-# (create + cancel + retry/resume + project discovery + dedup/status). If any is
-# missing the connection is "tools disabled", not "connected".
+# Tools the bridge must have to actually start, discover, and control a production.
+# Per Mochlet localApi semantics: create/resume = sendChat, retry (re-run the SAME
+# job) = runJob, cancel = cancelJob, discovery/status = listProjects/listJobPage/
+# getJob. ``continueSession`` is deliberately NOT required or used — it forks a
+# CODING session/worktree (ignores text, creates no production job).
 REQUIRED_TOOLS = (
-    "sendChat", "cancelJob", "runJob", "continueSession",
+    "sendChat", "runJob", "cancelJob",
     "listProjects", "listJobPage", "getJob",
 )
+
+# Job statuses that mean the job is not (re)runnable — retry/dedup fail closed.
+_TERMINAL_JOB_STATUSES = frozenset(
+    {"cancelled", "canceled", "failed", "error", "done", "completed"})
 
 # Non-secret Mochlet server identity — verify_mcp refuses to mark a foreign MCP
 # server (that merely happens to expose these tool names) as connected.
@@ -259,8 +265,16 @@ class MochletMcpOrchestratorClient:
         client.call_tool("cancelJob", {"id": job_id})
 
     def control_job(self, *, job_id: str, action: str, idempotency_key: str) -> Optional[OrchestratorHandle]:
-        """Issue a lifecycle control. Cancel returns None; retry/resume return the
-        SUCCESSOR handle Mochlet creates (the caller persists it)."""
+        """Issue a lifecycle control against the REAL Mochlet localApi semantics.
+
+        * ``cancel`` → ``cancelJob``; returns None.
+        * ``retry`` → ``runJob`` re-runs the SAME job (same id). Returns a handle
+          with the UNCHANGED job_id (never a fabricated successor).
+        * ``resume`` → ``sendChat`` on the run's EXACT existing session, which
+          returns a NEW (successor) job in the SAME session. ``continueSession`` is
+          NOT used (it forks a coding session and creates no production job).
+        Every path validates ids and fails closed on mismatch/terminal/missing.
+        """
         if action == "cancel":
             self.cancel_job(job_id=job_id)
             return None
@@ -268,34 +282,64 @@ class MochletMcpOrchestratorClient:
             raise OrchestratorUnavailable("refusing to control a non-canonical job id")
         client = self._open()
         if action == "retry":
-            # Mochlet re-runs an existing job as a SUCCESSOR — return the new handle.
-            result = client.call_tool("runJob", {"id": job_id})
-            handle = self._parse_handle(result)
-            if handle is None:
-                # Indeterminate: no confirmed successor — do NOT let local state
-                # advance pretending the old job resumed.
-                raise OrchestratorUnavailable(
-                    "Mochlet runJob returned no successor job handle; retry is unconfirmed.")
-            return handle
+            return self._retry_same_job(client, job_id)
         if action == "resume":
-            # Resume the run by continuing its EXACT session (a successor job).
-            job = client.call_tool("getJob", {"id": job_id})
-            session_id = _session_of(job)
-            if not is_uuid(session_id):
-                raise OrchestratorUnavailable(
-                    "Could not resolve the run's Mochlet session to resume; resume is "
-                    "unconfirmed (refusing to start an unrelated session).")
-            result = client.call_tool("continueSession", {
-                "projectId": self.mochlet_project_id,
-                "sessionId": session_id,
-                "text": "Resume the paused production stage.",
-            })
-            handle = self._parse_handle(result)
-            if handle is None:
-                raise OrchestratorUnavailable(
-                    "Mochlet continueSession returned no successor handle; resume is unconfirmed.")
-            return handle
+            return self._resume_via_send_chat(client, job_id)
         raise OrchestratorUnavailable(f"unsupported control action: {action}")
+
+    def _retry_same_job(self, client: MochletMcpClient, job_id: str) -> OrchestratorHandle:
+        # runJob re-runs the EXISTING job (Mochlet localApi returns the same job).
+        result = client.call_tool("runJob", {"id": job_id})
+        returned = _job_id_of(result)
+        if returned is not None and returned != job_id:
+            raise OrchestratorUnavailable(
+                "Mochlet runJob returned a different job id than requested; retry is "
+                "unconfirmed (refusing to mis-correlate the handle).")
+        # Confirm the job actually moved to a runnable state (not terminal).
+        job = client.call_tool("getJob", {"id": job_id})
+        status = str((job.get("status") if isinstance(job, dict) else "") or "").lower()
+        if status in _TERMINAL_JOB_STATUSES:
+            raise OrchestratorUnavailable(
+                f"Mochlet did not re-run job {job_id} (status '{status}'); retry unconfirmed.")
+        session_id = _session_of(job)
+        return OrchestratorHandle(
+            session_id=session_id if is_uuid(session_id) else job_id, job_id=job_id,
+            engine=self.engine, detail="Mochlet job re-run (same id)")
+
+    def _resume_via_send_chat(self, client: MochletMcpClient, job_id: str) -> OrchestratorHandle:
+        job = client.call_tool("getJob", {"id": job_id})
+        session_id = _session_of(job)
+        if not is_uuid(session_id):
+            raise OrchestratorUnavailable(
+                "Could not resolve the run's Mochlet session to resume; resume is "
+                "unconfirmed (refusing to start an unrelated session).")
+        result = client.call_tool("sendChat", {
+            "projectId": self.mochlet_project_id,
+            "sessionId": session_id,
+            "text": ("[OM-RESUME] Resume the paused OpenMontage production stage on this "
+                     "session; continue the canonical pipeline and emit stage events."),
+            "agentContext": {"system": "openmontage", "control": "resume",
+                             "prior_job_id": job_id, "session_id": session_id},
+        })
+        new = self._parse_handle(result)
+        if new is None or not is_uuid(new.job_id):
+            raise OrchestratorUnavailable(
+                "Mochlet sendChat (resume) returned no successor job handle; resume unconfirmed.")
+        new_session = _session_of(result) or new.session_id
+        if is_uuid(new_session) and new_session != session_id:
+            # Wrong session — compensate the mis-created job and fail closed.
+            try:
+                self.cancel_job(job_id=new.job_id)
+            except Exception:
+                pass
+            raise OrchestratorUnavailable(
+                "Resume created a job in a different session; it was cancelled — resume refused.")
+        if new.job_id == job_id:
+            raise OrchestratorUnavailable(
+                "Resume did not produce a successor job on the session; resume unconfirmed.")
+        return OrchestratorHandle(
+            session_id=session_id, job_id=new.job_id, engine=self.engine,
+            detail="Mochlet resume successor (new job, same session)")
 
     # -- discovery ----------------------------------------------------------
     def list_projects(self) -> list[dict]:
@@ -355,6 +399,20 @@ class MochletMcpOrchestratorClient:
                 self._idem.delete(key)
             except Exception:
                 pass
+
+
+def _job_id_of(result: Any) -> Optional[str]:
+    """Extract a job id from a control result in nested or flat shape."""
+    if not isinstance(result, dict):
+        return None
+    job = result.get("job")
+    if isinstance(job, dict) and isinstance(job.get("id"), str):
+        return job["id"]
+    for k in ("id", "jobId", "job_id"):
+        v = result.get(k)
+        if isinstance(v, str):
+            return v
+    return None
 
 
 def _session_of(job: Any) -> Optional[str]:

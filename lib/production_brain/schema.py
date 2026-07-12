@@ -615,7 +615,9 @@ def reduce_event(state: dict, ev: dict, *, strict: bool = False) -> dict:
         brain = st.setdefault("brain", {})
         new_job = data.get("job_id")
         new_sess = data.get("session_id")
-        if new_job:
+        # Only a DIFFERENT job is a successor (resume); a same-id control (retry)
+        # updates activity without inventing lineage.
+        if new_job and new_job != brain.get("job_id"):
             brain["predecessor_job_id"] = brain.get("job_id")
             brain["job_id"] = new_job
         if new_sess:

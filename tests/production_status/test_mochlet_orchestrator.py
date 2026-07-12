@@ -89,23 +89,71 @@ def test_cancel_calls_canceljob_with_exact_id(tmp_path):
     assert fake.cancelled == [h.job_id]
 
 
-def test_retry_returns_successor_handle(tmp_path):
+def test_retry_reruns_the_SAME_job(tmp_path):
+    # Mochlet runJob re-runs the existing job; retry must return the SAME job id.
     fake = FakeMochletMcp()
     c = _client(fake, tmp_path)
     h = c.create_job(project_id="p", run_id="r", requested_duration_seconds=60, idempotency_key="k")
-    successor = c.control_job(job_id=h.job_id, action="retry", idempotency_key="k:retry")
-    assert successor is not None and is_uuid(successor.job_id)
-    assert successor.job_id != h.job_id  # a real successor, not a pretend resume
+    result = c.control_job(job_id=h.job_id, action="retry", idempotency_key="k:retry")
+    assert result is not None
+    assert result.job_id == h.job_id  # SAME job, not a fabricated successor
     assert fake.controls[-1]["action"] == "run"
 
 
-def test_resume_returns_successor_handle(tmp_path):
+def test_retry_refuses_when_job_stays_terminal(tmp_path, monkeypatch):
+    # runJob returned, but getJob shows the job did NOT move to a runnable state.
     fake = FakeMochletMcp()
     c = _client(fake, tmp_path)
     h = c.create_job(project_id="p", run_id="r", requested_duration_seconds=60, idempotency_key="k")
+    from lib.production_brain import mcp_client as mc
+    orig = mc.MochletMcpClient.call_tool
+
+    def patched(self, name, arguments=None):
+        if name == "getJob":
+            return {"id": h.job_id, "status": "cancelled"}  # rerun didn't take
+        return orig(self, name, arguments)
+
+    monkeypatch.setattr(mc.MochletMcpClient, "call_tool", patched)
+    with pytest.raises(OrchestratorUnavailable):
+        c.control_job(job_id=h.job_id, action="retry", idempotency_key="k:retry")
+
+
+def test_resume_creates_successor_via_sendchat_same_session(tmp_path):
+    # Resume = sendChat on the exact session → NEW job, SAME session (not continueSession).
+    fake = FakeMochletMcp()
+    c = _client(fake, tmp_path)
+    h = c.create_job(project_id="p", run_id="r", requested_duration_seconds=60, idempotency_key="k")
+    before = len(fake.sent_chats)
     successor = c.control_job(job_id=h.job_id, action="resume", idempotency_key="k:resume")
     assert successor is not None and is_uuid(successor.job_id)
-    assert fake.controls[-1]["action"] == "continue"
+    assert successor.job_id != h.job_id            # a real successor job
+    assert successor.session_id == h.session_id    # SAME session
+    # it went through sendChat (not continueSession), with a resume agentContext
+    assert len(fake.sent_chats) == before + 1
+    resume_chat = fake.sent_chats[-1]
+    assert resume_chat["sessionId"] == h.session_id
+    assert resume_chat["agentContext"]["control"] == "resume"
+    assert not any(cc["action"] == "continue" for cc in fake.controls)
+
+
+def test_resume_rejects_and_compensates_wrong_session(tmp_path, monkeypatch):
+    fake = FakeMochletMcp()
+    c = _client(fake, tmp_path)
+    h = c.create_job(project_id="p", run_id="r", requested_duration_seconds=60, idempotency_key="k")
+    from lib.production_brain import mcp_client as mc
+    orig = mc.MochletMcpClient.call_tool
+
+    def patched(self, name, arguments=None):
+        if name == "sendChat" and arguments.get("agentContext", {}).get("control") == "resume":
+            # returns a job in a DIFFERENT (unrelated) session
+            return {"session": {"id": "99999999-9999-4999-8999-999999999999"},
+                    "job": {"id": "88888888-8888-4888-8888-888888888888"}}
+        return orig(self, name, arguments)
+
+    monkeypatch.setattr(mc.MochletMcpClient, "call_tool", patched)
+    with pytest.raises(OrchestratorUnavailable):
+        c.control_job(job_id=h.job_id, action="resume", idempotency_key="k:resume")
+    assert "88888888-8888-4888-8888-888888888888" in fake.cancelled  # compensated
 
 
 def test_cancel_control_returns_none(tmp_path):
@@ -141,7 +189,9 @@ def test_non_uuid_job_from_server_is_refused(tmp_path, monkeypatch):
         c.create_job(project_id="p", run_id="rz", requested_duration_seconds=60, idempotency_key="kz")
 
 
-def test_retry_without_successor_handle_raises(tmp_path, monkeypatch):
+def test_retry_confirms_via_getjob_when_runjob_omits_id(tmp_path, monkeypatch):
+    # runJob may return no explicit id; retry is confirmed via getJob (running) and
+    # still returns the SAME job id.
     fake = FakeMochletMcp()
     c = _client(fake, tmp_path)
     h = c.create_job(project_id="p", run_id="r", requested_duration_seconds=60, idempotency_key="k")
@@ -150,7 +200,24 @@ def test_retry_without_successor_handle_raises(tmp_path, monkeypatch):
 
     def patched(self, name, arguments=None):
         if name == "runJob":
-            return {}  # no successor handle — indeterminate
+            return {}  # no id echoed — confirmation must come from getJob
+        return orig(self, name, arguments)
+
+    monkeypatch.setattr(mc.MochletMcpClient, "call_tool", patched)
+    result = c.control_job(job_id=h.job_id, action="retry", idempotency_key="k:retry")
+    assert result.job_id == h.job_id  # same job, confirmed running via getJob
+
+
+def test_retry_rejects_mismatched_runjob_id(tmp_path, monkeypatch):
+    fake = FakeMochletMcp()
+    c = _client(fake, tmp_path)
+    h = c.create_job(project_id="p", run_id="r", requested_duration_seconds=60, idempotency_key="k")
+    from lib.production_brain import mcp_client as mc
+    orig = mc.MochletMcpClient.call_tool
+
+    def patched(self, name, arguments=None):
+        if name == "runJob":
+            return {"job": {"id": "77777777-7777-4777-8777-777777777777"}}  # WRONG id
         return orig(self, name, arguments)
 
     monkeypatch.setattr(mc.MochletMcpClient, "call_tool", patched)
