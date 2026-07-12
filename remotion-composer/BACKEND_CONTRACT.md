@@ -90,15 +90,25 @@ on BOTH sides, not "can pass":
   (`POST /api/project/{id}/frame`, `POST /api/project/{id}/timeline/render`) pass
   `base_url=request.app.state.render_base_url` into those functions.
 
-**Security model for the base:**
-- `app.state.render_base_url` is set at server startup by `resolve_render_base_url()`,
-  which reads the **active bound port** from `BACKLOT_PORT` (set by `backlot serve
-  --port`) or the documented default → `http://127.0.0.1:<port>`. It is NEVER derived
-  from a request `Host` / `X-Forwarded-*` header.
+**Security model for the base (explicit + fail-closed):**
+- The base is provided by the **actual server runtime**: `cmd_serve` builds the app
+  with `create_app(render_base_url="http://127.0.0.1:<the-bound-port>")` — the EXACT
+  port it binds — and `app.state.render_base_url` is that validated base. It is NEVER
+  derived from a request `Host` / `X-Forwarded-*` header, and never inferred.
+- `create_app` resolves with `require_explicit=True`: if no explicit base and no
+  operator config (`BACKLOT_RENDER_BASE_URL` / `BACKLOT_PORT`) is present, it does
+  **not** guess the default port — `app.state.render_base_url` is `None` and the
+  render endpoints **fail closed with HTTP 503** rather than render (possibly dropping
+  media to a placeholder against a wrong port).
+- The render functions (`render_still`, `render_timeline_preview`) **fail closed**
+  (`{"ok": False, ...}`) if `build_render_meta` cannot produce a valid base — they
+  never fall back to empty meta and render a placeholder while reporting success.
 - `resolve_render_base_url` accepts only **loopback HTTP** (127.0.0.1 / ::1 / localhost)
   or an explicitly-configured **`BACKLOT_RENDER_BASE_URL` HTTPS** base (operator trust).
-  Non-loopback http, other schemes, and any path/query/fragment are rejected.
-- The port/base is explicitly injectable (`base_url`/`port` params) for tests and runtime.
+  Non-loopback http, other schemes, a non-integer/out-of-range `BACKLOT_PORT`, and any
+  path/query/fragment are rejected.
+- The port/base is explicitly injectable (`base_url`/`port` params) for tests. A
+  standalone lib render (no server) may fall back to the documented loopback default.
 - Per-layer path safety is unchanged: `lib.timeline` only persists project-local
   `source`s, and `resolveAssetSrc` rejects `..` traversal and non-loopback schemes.
 

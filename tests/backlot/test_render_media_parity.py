@@ -135,6 +135,58 @@ def test_frame_route_passes_active_port(tmp_path, monkeypatch):
     assert captured["base_url"] == "http://127.0.0.1:4753"
 
 
+def test_create_app_uses_explicit_runtime_base(monkeypatch):
+    # cmd_serve passes the ACTUAL bound port explicitly — not inferred from env.
+    monkeypatch.delenv("BACKLOT_PORT", raising=False)
+    monkeypatch.delenv("BACKLOT_RENDER_BASE_URL", raising=False)
+    app = server_mod.create_app(render_base_url="http://127.0.0.1:4780")
+    assert app.state.render_base_url == "http://127.0.0.1:4780"
+
+
+def test_render_base_require_explicit_fails_closed(monkeypatch):
+    # No explicit base and no operator config → fail closed (never guess a port).
+    with pytest.raises(RenderBaseError):
+        resolve_render_base_url(env={}, require_explicit=True)
+    assert resolve_render_base_url(env={"BACKLOT_PORT": "4790"}, require_explicit=True) \
+        == "http://127.0.0.1:4790"
+
+
+def test_frame_route_fails_closed_when_base_unconfigured(tmp_path, monkeypatch):
+    monkeypatch.delenv("BACKLOT_PORT", raising=False)
+    monkeypatch.delenv("BACKLOT_RENDER_BASE_URL", raising=False)
+    _mk_project(tmp_path)
+    monkeypatch.setattr(server_mod, "PROJECTS_DIR", tmp_path)
+
+    async def no_watch():
+        return None
+    monkeypatch.setattr(server_mod, "_watch_projects", no_watch)
+
+    # An unconfigured app (no explicit base, no env) has render_base_url None.
+    app = server_mod.create_app()  # render_base_url=None → require_explicit → None
+    assert app.state.render_base_url is None
+    with TestClient(app) as c:
+        token = c.get("/api/csrf").json()["csrf"]
+        r = c.post("/api/project/rproj/frame", json={"frame": 0},
+                   headers={"X-OpenMontage-CSRF": token})
+    assert r.status_code == 503  # fail closed, not a placeholder render
+
+
+def test_render_still_fails_closed_on_invalid_base(tmp_path):
+    # An invalid (non-loopback) base must NOT render placeholders + report success.
+    proj = tmp_path / "badbase"
+    proj.mkdir()
+    calls: list = []
+    res = fr.render_still(
+        proj, 0, timeline=_TIMELINE,
+        runner=lambda argv: calls.append(argv),  # would run the CLI
+        browser="/usr/bin/true", base_url="http://evil.example.com",
+        doctor=lambda: {"available": True},
+    )
+    assert res["ok"] is False
+    assert "base" in res["reason"].lower()
+    assert calls == []  # the render subprocess was never invoked
+
+
 def test_timeline_route_passes_active_port(tmp_path, monkeypatch):
     monkeypatch.setenv("BACKLOT_PORT", "4753")
     _mk_project(tmp_path)

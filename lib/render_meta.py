@@ -85,6 +85,7 @@ def resolve_render_base_url(
     base_url: Optional[str] = None,
     port: Optional[int] = None,
     env: Optional[dict] = None,
+    require_explicit: bool = False,
 ) -> str:
     """Resolve the trusted base URL the CLI render fetches project media from.
 
@@ -92,8 +93,12 @@ def resolve_render_base_url(
       1. an explicit ``base_url`` argument (validated),
       2. an explicit ``port`` argument → ``http://127.0.0.1:<port>``,
       3. ``BACKLOT_RENDER_BASE_URL`` env (validated),
-      4. ``BACKLOT_PORT`` env (the active bound port) → loopback,
-      5. the documented default port → loopback.
+      4. ``BACKLOT_PORT`` env (the active bound port) → loopback.
+
+    When ``require_explicit`` is True (the SERVER path — the base must come from the
+    actual runtime), NONE of the above being set raises ``RenderBaseError`` (fail
+    closed) — it never silently guesses the default port. When False (a standalone
+    lib render with no server), it falls back to the documented default loopback.
     """
     env = env if env is not None else os.environ
     if base_url:
@@ -103,11 +108,20 @@ def resolve_render_base_url(
     cfg = env.get("BACKLOT_RENDER_BASE_URL")
     if cfg:
         return _validate_base(cfg)
-    try:
-        p = int(env.get("BACKLOT_PORT", _DEFAULT_PORT))
-    except (TypeError, ValueError):
-        p = _DEFAULT_PORT
-    return _validate_base(f"http://127.0.0.1:{p}")
+    bp = env.get("BACKLOT_PORT")
+    if bp is not None and str(bp) != "":
+        try:
+            p = int(bp)
+        except (TypeError, ValueError):
+            raise RenderBaseError(f"BACKLOT_PORT is not an integer: {bp!r}")
+        if not (0 < p < 65536):
+            raise RenderBaseError(f"BACKLOT_PORT out of range: {p}")
+        return _validate_base(f"http://127.0.0.1:{p}")
+    if require_explicit:
+        raise RenderBaseError(
+            "no trusted render base configured — pass an explicit base or set "
+            "BACKLOT_PORT / BACKLOT_RENDER_BASE_URL")
+    return _validate_base(f"http://127.0.0.1:{_DEFAULT_PORT}")
 
 
 def build_render_meta(
