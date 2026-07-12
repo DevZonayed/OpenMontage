@@ -317,18 +317,28 @@ const ConnectModal: React.FC<{
   onDone: () => void;
 }> = ({ client, view, onClose, onDone }) => {
   const conn = view.connection || {};
-  const [url, setUrl] = useState(conn.suggested_endpoint || conn.endpoint || "http://127.0.0.1:9235");
+  const [url, setUrl] = useState(conn.suggested_endpoint || conn.endpoint || "http://127.0.0.1:9235/mcp");
   const [token, setToken] = useState("");
+  const [projects, setProjects] = useState<Array<{ id: string; name?: string | null; path?: string | null }>>([]);
+  const [projectId, setProjectId] = useState("");
   const [status, setStatus] = useState<{ msg: string; kind: "" | "ok" | "err" }>({ msg: "", kind: "" });
   const [busy, setBusy] = useState(false);
-  const doConnect = async () => {
+  const doConnect = async (withProject: boolean) => {
     setBusy(true);
-    setStatus({ msg: "Verifying local Hermes…", kind: "" });
+    setStatus({ msg: "Verifying Hermes (MCP capabilities + project)…", kind: "" });
     try {
-      const res = await client.connectHermes({ url: url.trim(), token: token || undefined });
+      const res = await client.connectHermes({
+        url: url.trim(), token: token || undefined,
+        project_id: withProject && projectId ? projectId : undefined,
+      });
       if (res.available) {
         setStatus({ msg: "✓ " + (res.headline || "Connected"), kind: "ok" });
         setTimeout(onDone, 600);
+      } else if (res.status === "needs_project" && res.projects && res.projects.length) {
+        setProjects(res.projects);
+        setProjectId(res.projects[0].id);
+        setStatus({ msg: res.detail || "Choose the OpenMontage project in Mochlet.", kind: "" });
+        setBusy(false);
       } else {
         setStatus({ msg: (res.headline || "Couldn't connect") + (res.detail ? " — " + res.detail : ""), kind: "err" });
         setBusy(false);
@@ -343,20 +353,33 @@ const ConnectModal: React.FC<{
       <div style={s.modal}>
         <h3 style={{ margin: "0 0 8px" }}>Connect Hermes</h3>
         <p style={{ fontSize: 12, color: "#a0a0a9", lineHeight: 1.4 }}>
-          Production runs through the Hermes brain. Point it at your local Mochlet
-          orchestrator (recommended) or an approved endpoint. Your token is stored only
-          in the OS keychain — never printed or written to disk.
+          Production runs through the Hermes brain (Mochlet). It verifies the local MCP
+          orchestrator&apos;s capabilities and the project. Your token is stored only in
+          the OS keychain — never printed or written to disk.
         </p>
-        <label style={s.label}>Orchestrator endpoint</label>
-        <input style={s.input} value={url} onChange={(e) => setUrl(e.target.value)} placeholder="http://127.0.0.1:9235" />
+        <label style={s.label}>Mochlet MCP endpoint</label>
+        <input style={s.input} value={url} onChange={(e) => setUrl(e.target.value)} placeholder="http://127.0.0.1:9235/mcp" />
         <label style={s.label}>Token (kept in the OS keychain)</label>
         <input style={s.input} type="password" autoComplete="off" value={token} onChange={(e) => setToken(e.target.value)}
-          placeholder="Access token (optional for a local Mochlet)" />
+          placeholder="Access token (from Mochlet)" />
+        {projects.length > 0 ? (
+          <>
+            <label style={s.label}>OpenMontage project in Mochlet</label>
+            <select style={s.input} value={projectId} onChange={(e) => setProjectId(e.target.value)}>
+              {projects.map((p) => (
+                <option key={p.id} value={p.id}>{p.name || p.path || p.id}</option>
+              ))}
+            </select>
+          </>
+        ) : null}
         <div style={{ minHeight: 18, marginTop: 12, fontSize: 12, color: status.kind === "ok" ? "#4fc283" : status.kind === "err" ? "#e5544b" : "#a0a0a9" }}>
           {status.msg}
         </div>
         <div style={{ display: "flex", gap: 10, marginTop: 14 }}>
-          <button style={s.primary} disabled={busy} onClick={() => void doConnect()}>Connect &amp; verify</button>
+          <button style={s.primary} disabled={busy} onClick={() => void doConnect(projects.length > 0)}>
+            {projects.length > 0 ? "Connect to project" : "Connect & verify"}
+          </button>
+          <button style={s.btnGhost} disabled={busy} onClick={() => void doConnect(false)}>Test connection</button>
           <button style={s.btnGhost} onClick={onClose}>Cancel</button>
         </div>
       </div>

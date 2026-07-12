@@ -37,6 +37,7 @@
         "run_completed",
         "run_failed",
         "run_cancelled",
+        "external_handle_updated",
         "note"
       ]
     },

@@ -705,43 +705,68 @@ function openConnectModal(view) {
   const card = el("div", { class: "cmd-modal" });
   card.append(el("h3", {}, "Connect Hermes"));
   card.append(el("p", { class: "hint" },
-    "OpenMontage runs production through the Hermes brain. Point it at your local "
-    + "Mochlet orchestrator (recommended) or an approved endpoint. Your token is stored "
-    + "only in the OS keychain — never printed or written to disk."));
+    "OpenMontage runs production through the Hermes brain (Mochlet). It verifies "
+    + "the local MCP orchestrator's capabilities and the project. Your token is "
+    + "stored only in the OS keychain — never printed or written to disk."));
   const urlIn = el("input", { class: "cmd-input", type: "text",
-    value: conn.suggested_endpoint || conn.endpoint || "http://127.0.0.1:9235",
-    placeholder: "http://127.0.0.1:9235" });
+    value: conn.suggested_endpoint || conn.endpoint || "http://127.0.0.1:9235/mcp",
+    placeholder: "http://127.0.0.1:9235/mcp" });
   const tokIn = el("input", { class: "cmd-input", type: "password", autocomplete: "off",
-    placeholder: "Access token (optional for a local Mochlet)" });
-  card.append(el("label", { class: "cmd-label" }, "Orchestrator endpoint"), urlIn);
+    placeholder: "Access token (from Mochlet)" });
+  card.append(el("label", { class: "cmd-label" }, "Mochlet MCP endpoint"), urlIn);
   card.append(el("label", { class: "cmd-label" }, "Token (kept in the OS keychain)"), tokIn);
+  // Project chooser (revealed when Mochlet reports multiple projects).
+  const projectWrap = el("div", { style: "display:none" });
+  const projectLabel = el("label", { class: "cmd-label" }, "OpenMontage project in Mochlet");
+  const projectSel = el("select", { class: "cmd-input" });
+  projectWrap.append(projectLabel, projectSel);
   const status = el("div", { class: "cmd-modal-status" });
+  const testBtn = el("button", { class: "cmd-btn ghost", type: "button" }, "Test connection");
   const connectBtn = el("button", { class: "cmd-primary", type: "button" }, "Connect & verify");
   const cancelBtn = el("button", { class: "cmd-btn ghost", type: "button" }, "Cancel");
   cancelBtn.onclick = () => modal.classList.remove("open");
-  connectBtn.onclick = async () => {
-    connectBtn.disabled = true;
+
+  const showProjects = (projects) => {
+    projectSel.textContent = "";
+    for (const p of projects) {
+      projectSel.append(el("option", { value: p.id }, p.name || p.path || p.id));
+    }
+    projectWrap.style.display = "";
+    connectBtn.textContent = "Connect to project";
+  };
+
+  const doConnect = async (withProject) => {
+    connectBtn.disabled = true; testBtn.disabled = true;
     status.className = "cmd-modal-status";
-    status.textContent = "Verifying local Hermes…";
+    status.textContent = "Verifying Hermes (MCP capabilities + project)…";
+    const body = { url: urlIn.value.trim(), token: tokIn.value || undefined };
+    if (withProject && projectSel.value) body.project_id = projectSel.value;
     try {
-      const res = await mpost(`/api/hermes/connect`,
-        { url: urlIn.value.trim(), token: tokIn.value || undefined });
+      const res = await mpost(`/api/hermes/connect`, body);
       if (res.available) {
         status.className = "cmd-modal-status ok";
         status.textContent = "✓ " + (res.headline || "Connected");
         setTimeout(() => { modal.classList.remove("open"); _statusRepaint(); }, 700);
+      } else if (res.status === "needs_project" && Array.isArray(res.projects) && res.projects.length) {
+        showProjects(res.projects);
+        status.className = "cmd-modal-status";
+        status.textContent = res.detail || "Choose the OpenMontage project in Mochlet.";
+        connectBtn.disabled = false; testBtn.disabled = false;
       } else {
         status.className = "cmd-modal-status err";
         status.textContent = (res.headline || "Couldn't connect") + (res.detail ? " — " + res.detail : "");
-        connectBtn.disabled = false;
+        connectBtn.disabled = false; testBtn.disabled = false;
       }
     } catch (e) {
       status.className = "cmd-modal-status err";
       status.textContent = e.message || "Connection failed.";
-      connectBtn.disabled = false;
+      connectBtn.disabled = false; testBtn.disabled = false;
     }
   };
-  card.append(status, el("div", { class: "cmd-modal-actions" }, connectBtn, cancelBtn));
+  testBtn.onclick = () => doConnect(false);
+  connectBtn.onclick = () => doConnect(projectWrap.style.display !== "none");
+  card.append(projectWrap, status,
+    el("div", { class: "cmd-modal-actions" }, connectBtn, testBtn, cancelBtn));
   modal.append(card);
 }
 

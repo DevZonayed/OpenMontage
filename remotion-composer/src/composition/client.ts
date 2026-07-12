@@ -260,7 +260,7 @@ export class BacklotClient {
     }
     return this.getJSON<ConnectionView>(`/api/hermes/connection`);
   }
-  async connectHermes(body: { url?: string; token?: string }): Promise<ConnectionView> {
+  async connectHermes(body: { url?: string; token?: string; project_id?: string }): Promise<ConnectionView> {
     this.assertOnline("connect Hermes");
     return this.postJSON<ConnectionView>(`/api/hermes/connect`, body);
   }

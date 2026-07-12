@@ -124,17 +124,24 @@ def hermes_connection(*, transport: Optional[Callable[..., Any]] = None) -> dict
 
 
 def hermes_connect(body: dict, *, transport: Optional[Callable[..., Any]] = None) -> dict:
-    """Guided connect. Body: {url?, token?}. Never echoes the token."""
+    """Guided connect. Body: {url?, token?, project_id?, kind?}. Never echoes the token.
+
+    Returns a connection-status dict; ``status == "needs_project"`` carries the
+    discovered ``projects`` for the UI to choose from (then re-POST with project_id).
+    """
     from lib.production_brain.connection import ConnectionError, connect
 
     url = body.get("url")
     token = body.get("token")
-    if url is not None and not isinstance(url, str):
-        raise StatusApiError("url must be a string", status=400)
-    if token is not None and not isinstance(token, str):
-        raise StatusApiError("token must be a string", status=400)
+    project_id = body.get("project_id")
+    kind = body.get("kind")
+    for name, val in (("url", url), ("token", token), ("project_id", project_id), ("kind", kind)):
+        if val is not None and not isinstance(val, str):
+            raise StatusApiError(f"{name} must be a string", status=400)
     try:
-        result = connect(url=url or None, token=token or None, transport=transport)
+        result = connect(url=url or None, token=token or None,
+                         project_id=project_id or None, kind=kind or None,
+                         transport=transport)
     except ConnectionError as exc:
         raise StatusApiError(str(exc), status=exc.status) from exc
     _invalidate_conn_cache()

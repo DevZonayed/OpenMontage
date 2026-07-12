@@ -51,13 +51,23 @@ export interface StatusAction {
   hint?: string | null;
 }
 
+export interface MochletProject {
+  id: string;
+  name?: string | null;
+  path?: string | null;
+}
+
 export interface ConnectionView {
   status: string;
   available: boolean;
   endpoint?: string | null;
+  endpoint_kind?: string;
   suggested_endpoint?: string;
   loopback?: boolean;
   token_configured?: boolean;
+  server_name?: string | null;
+  project?: string | null;
+  projects?: MochletProject[];
   headline?: string;
   detail?: string;
   actions?: Array<{ id: string; label: string }>;
