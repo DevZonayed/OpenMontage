@@ -1,4 +1,5 @@
 import { el, fmtAgo, getJSON, subscribe, thumbURL } from "/ui/lib.js";
+import { wireNewProjectButtons } from "/ui/newproject.js";
 
 const grid = document.getElementById("grid");
 
@@ -54,11 +55,13 @@ async function render() {
   badge.classList.toggle("idle", liveCount === 0);
   document.getElementById("liveText").textContent = liveCount ? `${liveCount} LIVE` : "IDLE";
   grid.innerHTML = "";
-  document.getElementById("empty").style.display = projects.length ? "none" : "block";
+  document.getElementById("empty").style.display = projects.length ? "none" : "flex";
   for (const p of projects) grid.append(card(p));
+  wireNewProjectButtons();
 }
 
 render().catch(console.error);
+wireNewProjectButtons();
 if (!new URLSearchParams(location.search).has("static")) {
   subscribe("/api/library/events", () => render().catch(console.error));
 }

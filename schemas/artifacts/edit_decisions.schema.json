@@ -57,7 +57,22 @@
             "minimum": 0,
             "description": "Duration of transition in seconds"
           },
-          "reason": { "type": "string" }
+          "text": {
+            "type": "string",
+            "description": "Explicit on-screen display copy for a text/caption cut. This is the ONLY field a renderer may draw as visible text — never `reason` (which is internal editorial rationale)."
+          },
+          "title": {
+            "type": "string",
+            "description": "Optional heading display copy for a text/caption cut."
+          },
+          "subtitle": {
+            "type": "string",
+            "description": "Optional secondary display copy for a text/caption cut."
+          },
+          "reason": {
+            "type": "string",
+            "description": "Internal editorial rationale for this cut. NOT display copy — renderers must never draw this on screen."
+          }
         },
         "additionalProperties": false
       }

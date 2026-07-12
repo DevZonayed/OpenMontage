@@ -293,7 +293,14 @@ def test_provider_menu_summary_returns_expected_shape():
         "capabilities",
         "setup_offers",
         "runtime_warnings",
+        "provider_preferences",
     }
+    # F1: saved provider/engine preferences are surfaced in the canonical
+    # preflight so the agent honors them (subscription-first, per-purpose engine,
+    # image/video provider). Defaults present even with no providers.yaml.
+    prefs = s["provider_preferences"]
+    assert prefs is not None
+    assert "subscription_first" in prefs and "purposes" in prefs
     # Composition runtimes MUST include all three engines so the HARD RULE
     # presentation has the data it needs.
     for engine in ("ffmpeg", "remotion", "hyperframes"):
@@ -1003,6 +1010,44 @@ def test_scaffold_workspace_generates_html_and_assets(tmp_path: Path):
     assert design.is_file()
     design_text = design.read_text(encoding="utf-8")
     assert "#0B0F1A" in design_text or "test-playbook" in design_text
+
+
+def test_reason_never_renders_as_caption(tmp_path: Path):
+    """F8 regression: `cut.reason` is internal editorial rationale and must NEVER
+    appear on screen. Only the explicit `text`/`title` display fields may render."""
+    hf = HyperFramesCompose()
+    secret_reason = "INTERNAL: chosen because the client hates blue — do not show"
+    # A cut carrying ONLY reason (no display text) must render a neutral placeholder.
+    html, _tween = hf._cut_to_html(0, {"reason": secret_reason}, 1920, 1080)
+    assert secret_reason not in html
+    assert "Scene 1" in html  # neutral placeholder, not the rationale
+
+    # A cut with explicit display text renders THAT, still never the reason.
+    html2, _t2 = hf._cut_to_html(
+        1, {"text": "Hello World", "reason": secret_reason}, 1920, 1080
+    )
+    assert "Hello World" in html2
+    assert secret_reason not in html2
+
+
+def test_reason_never_renders_via_full_scaffold(tmp_path: Path):
+    """End-to-end through scaffold: an edit_decisions cut with reason (no text)
+    must not leak the reason into the generated index.html."""
+    secret = "INTERNAL RATIONALE THAT MUST NOT SHOW"
+    result = HyperFramesCompose().execute({
+        "operation": "scaffold_workspace",
+        "workspace_path": str(tmp_path / "hf"),
+        "edit_decisions": {
+            "version": "1.0",
+            "render_runtime": "hyperframes",
+            "cuts": [{"id": "c1", "source": "beat-1", "in_seconds": 0,
+                      "out_seconds": 2, "reason": secret}],
+        },
+        "asset_manifest": {"version": "1.0", "assets": []},
+    })
+    assert result.success, result.error
+    html = (tmp_path / "hf" / "index.html").read_text(encoding="utf-8")
+    assert secret not in html
 
 
 def test_scaffold_rejects_empty_cuts(tmp_path: Path):
