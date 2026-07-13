@@ -1,13 +1,12 @@
 // Learned-style preferences panel (Studio "Style" tab) + blocker-option intent.
 //
-// Extracted from the former BrainPanel: production RUN status now lives entirely
-// in the canonical <ProductionInspector> / <CommandCenter> (fed by /status). This
-// file carries ONLY the style-learning UI and the blocker-intent classifier — no
-// independent brain/run state labels or driver fixture names.
+// This file carries ONLY the style-learning UI and the blocker-intent classifier.
+// The Studio is a manual-first editor — there is no production run status, agent
+// connection, or automation surface here.
 
 import React, { useCallback, useEffect, useState } from "react";
 import { BacklotClient } from "../composition/client";
-import { prefId, PreferencesPayload, StylePreference } from "../composition/brain";
+import { prefId, PreferencesPayload, StylePreference } from "../composition/preferences";
 
 const C = {
   border: "#232329",

@@ -21,11 +21,22 @@ from pathlib import Path
 from typing import Any, Optional
 
 from lib import duration as _dur
-from lib import production_run as _pr
 from lib import project_intake as _pi
 from lib import timeline as _tl
 
 _STRATEGIES = ("trim", "extend", "replan")
+
+
+def _read_run_json(project_dir: Path) -> dict:
+    """Best-effort read of a legacy ``run.json`` (edit-safety only). Returns ``{}``
+    when absent — OpenMontage is manual-first, so a run file normally never exists."""
+    import json
+
+    try:
+        data = json.loads((Path(project_dir) / "run.json").read_text(encoding="utf-8"))
+        return data if isinstance(data, dict) else {}
+    except (OSError, ValueError):
+        return {}
 
 
 class DurationEditConflict(Exception):
@@ -76,7 +87,7 @@ def change_target_duration(project_dir: Path, new_value: Any, *,
     intake = _pi.read_intake(d) or {}
     old_secs = _dur.infer_target_seconds(intake)
     tl, tag = _tl.read_timeline(d)
-    run = _pr.read_run(d) or {}
+    run = _read_run_json(d)
     fps = int((tl or {}).get("fps") or _dur.DEFAULT_FPS)
 
     has_layers = bool(tl and tl.get("layers"))

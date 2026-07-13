@@ -609,7 +609,7 @@ def reduce_event(state: dict, ev: dict, *, strict: bool = False) -> dict:
         st["activity"] = ev.get("message") or "Production run cancelled. Completed work is preserved."
 
     elif etype == "external_handle_updated":
-        # Mochlet implements retry/resume as a SUCCESSOR job; record the new
+        # Some orchestrators implement retry/resume as a SUCCESSOR job; record the new
         # canonical handle so the UI shows the job that is actually running (we
         # never pretend the old job resumed). Lineage is preserved in the log.
         brain = st.setdefault("brain", {})
