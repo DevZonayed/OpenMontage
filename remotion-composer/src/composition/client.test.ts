@@ -73,18 +73,6 @@ describe("BacklotClient", () => {
     ).rejects.toThrow("Timeline changed on disk");
   });
 
-  it("queues a revision with the backend's `prompt` field (not `instructions`)", async () => {
-    let body: Record<string, unknown> | null = null;
-    const fetchImpl: FetchLike = async (url, init) => {
-      if (url.endsWith("/api/csrf")) return jsonRes({ csrf: "TOK" });
-      body = JSON.parse(init!.body!) as Record<string, unknown>;
-      return jsonRes({ ok: true });
-    };
-    const c = new BacklotClient({ projectId: "demo", fetchImpl });
-    await c.queueRevision("hero1", "make it warmer");
-    expect(body).toEqual({ layer_id: "hero1", prompt: "make it warmer", constraints: undefined });
-  });
-
   it("refuses to fake a mutation in fixture/offline mode", async () => {
     const c = new BacklotClient({ projectId: "demo", forceFixtures: true });
     await expect(c.renderTimeline()).rejects.toBeInstanceOf(OfflineError);

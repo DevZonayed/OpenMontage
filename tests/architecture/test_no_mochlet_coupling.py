@@ -41,6 +41,14 @@ FORBIDDEN = [
     (re.compile(r"hermes_connection\.json"), "the removed Mochlet connection config"),
     (re.compile(r"mcp_client"), "the removed Mochlet MCP client module"),
     (re.compile(r"MochletProject"), "a Mochlet project type"),
+    # Orphaned agent-automation "regenerate/queue" language (asset regen queue).
+    # NB: intentionally the SPECIFIC agent-queue phrases only — a bare "regenerat"
+    # substring would wrongly flag legitimate manual asset *replacement*/versioning.
+    (re.compile(r"Queue regeneration", re.IGNORECASE), "the 'Queue regeneration' agent action"),
+    (re.compile(r"Selective regeneration", re.IGNORECASE), "the 'Selective regeneration' agent UI"),
+    (re.compile(r"queueRevision"), "the queueRevision agent-queue client call"),
+    (re.compile(r"revision_requests"), "the removed revision-queue module"),
+    (re.compile(r"/timeline/revision"), "the removed layer-revision agent route"),
 ]
 
 

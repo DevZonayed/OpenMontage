@@ -41,6 +41,23 @@ export function addLayer(c: CanonicalComposition, layer: Layer): CanonicalCompos
   return next;
 }
 
+/** Set a text/title layer's on-screen content (Content / Scene title / subtitle).
+ *  A direct, manual model edit — no automation. Trims to a sane bound. */
+export function setLayerText(
+  c: CanonicalComposition,
+  id: string,
+  patch: { text?: string; title?: string; subtitle?: string },
+): CanonicalComposition {
+  const next = cloneComposition(c);
+  const layer = next.layers.find((l) => l.id === id);
+  if (!layer) throw new OperationError(`no layer "${id}"`);
+  const clamp = (s: string) => s.slice(0, 500);
+  if (patch.text !== undefined) layer.text = clamp(patch.text);
+  if (patch.title !== undefined) layer.title = clamp(patch.title);
+  if (patch.subtitle !== undefined) layer.subtitle = clamp(patch.subtitle);
+  return next;
+}
+
 /** Remove a layer by id. */
 export function removeLayer(c: CanonicalComposition, id: string): CanonicalComposition {
   const next = cloneComposition(c);
@@ -192,10 +209,10 @@ export function addScene(c: CanonicalComposition, scene: Scene): CanonicalCompos
 }
 
 /**
- * Selective regeneration: replace the media backing a layer WITHOUT rebuilding
- * anything else and WITHOUT changing the stable asset id. The prior url/version
- * are archived on `previousVersions` so the editor can visually compare/revert.
- * The `approved` flag is preserved by default (caller may reset explicitly).
+ * Direct asset replacement (manual): swap the media backing a layer WITHOUT
+ * rebuilding anything else and WITHOUT changing the stable asset id. The prior
+ * url/version are archived on `previousVersions` so the editor can visually
+ * compare/revert. The `approved` flag is preserved by default (caller may reset).
  */
 export interface ReplaceAssetPatch {
   url: string | null;

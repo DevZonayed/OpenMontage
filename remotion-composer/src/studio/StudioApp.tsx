@@ -30,6 +30,7 @@ import {
   resizeLayer,
   revertAsset,
   setAssetApproval,
+  setLayerText,
   setVolume,
   splitLayer,
   trimLayer,
@@ -365,7 +366,11 @@ export const StudioApp: React.FC<StudioAppProps> = ({ client }) => {
         <div style={{ display: "flex", alignItems: "baseline", gap: 10, minWidth: 0 }}>
           <strong style={{ fontSize: 14 }}>{overview?.title || model.meta.title || client.projectId}</strong>
           <span style={{ fontSize: 12, color: "#a0a0a9", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }} data-testid="workspace-guidance">
-            {overview?.guidance || (hasLayers ? "Edit, preview, and render your timeline." : "Add your first scene to start editing.")}
+            {/* Derived from the LIVE model — never the stale server overview. Once a
+                layer exists we never claim "no timeline". */}
+            {hasLayers
+              ? `${model.layers.length} scene${model.layers.length === 1 ? "" : "s"} on the timeline · edit, preview, and render`
+              : (overview?.guidance || "Add your first scene to start editing.")}
           </span>
         </div>
         <span style={pill} data-testid="workspace-duration">{durationText}</span>
@@ -568,14 +573,7 @@ export const StudioApp: React.FC<StudioAppProps> = ({ client }) => {
                     apply((c) => removeLayer(c, selectedLayer.id));
                     setSelected(null);
                   }}
-                  onRegen={async (instr) => {
-                    try {
-                      await client.queueRevision(selectedLayer.id, instr);
-                      setNotice(`Queued regeneration for ${selectedLayer.id}. Its stable id + approval are preserved.`);
-                    } catch (e) {
-                      setNotice(`Could not queue: ${e instanceof Error ? e.message : String(e)}`);
-                    }
-                  }}
+                  onContentChange={(patch) => apply((c) => setLayerText(c, selectedLayer.id, patch))}
                 />
               ) : (
                 <div style={{ color: "#5f5f68", fontSize: 13 }}>Select a layer to edit it.</div>
@@ -729,7 +727,8 @@ const TimelineLanes: React.FC<{
                   style={{
                     position: "absolute",
                     left: l.startFrame * pxPerFrame,
-                    width: Math.max(3, l.durationFrames * pxPerFrame),
+                    // Keep blocks legible — never a 2-char clipped sliver.
+                    width: Math.max(44, l.durationFrames * pxPerFrame),
                     height: 22,
                     top: 2,
                     borderRadius: 4,
@@ -764,14 +763,26 @@ const Inspector: React.FC<{
   onRevert: (assetId: string, version: number) => void;
   onApprove: (assetId: string, approved: boolean) => void;
   onDelete: () => void;
-  onRegen: (instr: string) => void;
-}> = ({ layer, asset, onEdit, onMove, onResize, onVolume, onSplit, onRevert, onApprove, onDelete, onRegen }) => {
-  const [instr, setInstr] = useState("");
+  onContentChange: (patch: { text?: string; title?: string }) => void;
+}> = ({ layer, asset, onEdit, onMove, onResize, onVolume, onSplit, onRevert, onApprove, onDelete, onContentChange }) => {
+  const isTextLayer = layer.type === "text" || layer.type === "caption";
   return (
     <div>
       <div style={{ fontSize: 12, color: "#a0a0a9", marginBottom: 8 }}>
         LAYER · {layer.type} · {layer.id}
       </div>
+      {isTextLayer && (
+        <Field label="Content">
+          <textarea
+            key={`content-${layer.id}`}
+            data-testid="inspector-content"
+            defaultValue={layer.title || layer.text || ""}
+            placeholder="Scene text (shown on screen)"
+            onChange={(e) => onContentChange({ text: e.target.value, title: e.target.value })}
+            style={{ ...inp, height: 60, resize: "vertical", fontSize: 14 }}
+          />
+        </Field>
+      )}
       <AssetPanel asset={asset} onRevert={onRevert} onApprove={onApprove} />
       <Field label="Start frame">
         <input
@@ -808,23 +819,6 @@ const Inspector: React.FC<{
         </button>
         <button style={{ ...miniBtn, color: "#e5544b" }} onClick={onDelete}>
           Delete
-        </button>
-      </div>
-      <div style={{ marginTop: 14 }}>
-        <div style={{ fontSize: 12, color: "#a0a0a9", marginBottom: 6 }}>SELECTIVE REGENERATION</div>
-        <textarea
-          value={instr}
-          onChange={(e) => setInstr(e.target.value)}
-          placeholder="How should this asset change? (id + approval preserved)"
-          style={{ ...inp, height: 52, resize: "vertical" }}
-        />
-        <button
-          style={{ ...miniBtn, marginTop: 6 }}
-          onClick={() => {
-            if (instr.trim()) onRegen(instr.trim());
-          }}
-        >
-          Queue regeneration
         </button>
       </div>
     </div>
@@ -962,17 +956,24 @@ function addNewLayer(
 ) {
   const type: LayerType = "text";
   const id = makeId(`layer`, model.layers.length + 1 + model.totalFrames);
+  const isFirst = model.layers.length === 0;
+  // The FIRST scene spans the whole timeline so it is visible in the preview at
+  // any playhead (and reads as a legible block, not a 2-char sliver). Subsequent
+  // scenes get a sensible default chunk the user can move/resize.
+  const total = Math.max(1, model.totalFrames);
+  const durationFrames = isFirst ? total : Math.min(150, total);
   const layer: Layer = {
     id,
     type,
     trackId: trackKindForType(type),
     startFrame: 0,
-    durationFrames: Math.min(90, model.totalFrames),
+    durationFrames,
     z: (model.layers.reduce((m, l) => Math.max(m, l.z), 0) || 0) + 1,
     enabled: true,
     locked: false,
     opacity: 1,
-    text: "New layer",
+    // A visible, centered, high-contrast default the user edits in the Inspector.
+    text: "New scene",
   };
   apply((c) => addLayer(c, layer));
   setSelected(id);

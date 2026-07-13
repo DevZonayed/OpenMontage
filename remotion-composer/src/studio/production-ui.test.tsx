@@ -85,6 +85,7 @@ function mount(): HTMLElement {
 const FORBIDDEN = [
   "AgentPanel", "Connect Hermes", "Hermes Agent", "Hermes", "Mochlet", "mochlet",
   "9235", "Production Agent", "Command center", "Start production", "connectAgent",
+  "Queue regeneration", "Selective regeneration", "regeneration", "regenerate",
 ];
 
 describe("manual-first Studio — empty project", () => {
@@ -166,5 +167,36 @@ describe("manual-first Studio — empty project", () => {
     expect(container.querySelector('[data-testid="tl-add-layer"]')).toBeTruthy();
     // and no second "Add first scene" primary lingers
     expect(container.querySelectorAll('[data-testid="add-first-scene"]').length).toBe(0);
+  });
+
+  it("refreshes the summary after adding a scene — never claims 'no timeline'", async () => {
+    const container = mount();
+    await settle(container, "Add first scene");
+    (container.querySelector('[data-testid="add-first-scene"]') as HTMLButtonElement).click();
+    await settle(container, "+ Add layer");
+    const text = container.textContent || "";
+    // The stale server guidance must be replaced by the live-model summary.
+    expect(text).not.toMatch(/no timeline yet/i);
+    expect(text).not.toMatch(/add your first scene/i);
+    expect(container.querySelector('[data-testid="workspace-guidance"]')!.textContent || "")
+      .toMatch(/1 scene on the timeline/i);
+  });
+
+  it("the first scene is real, visible content and editable in the Inspector", async () => {
+    const container = mount();
+    await settle(container, "Add first scene");
+    (container.querySelector('[data-testid="add-first-scene"]') as HTMLButtonElement).click();
+    await settle(container, "+ Add layer");
+    // The new text layer carries a visible default ("New scene") — in the timeline
+    // block label and the editable Inspector Content field.
+    const content = container.querySelector('[data-testid="inspector-content"]') as HTMLTextAreaElement;
+    expect(content).toBeTruthy();
+    expect(content.value).toContain("New scene");
+    // Editing the content is wired to the model (no crash / stays selected).
+    content.value = "How Lightning Forms";
+    content.dispatchEvent(new Event("input", { bubbles: true }));
+    await settle(container, "How Lightning Forms");
+    const content2 = container.querySelector('[data-testid="inspector-content"]') as HTMLTextAreaElement;
+    expect(content2).toBeTruthy();
   });
 });

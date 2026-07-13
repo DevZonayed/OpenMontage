@@ -37,7 +37,7 @@ PREFS_PATH = REPO_ROOT / "providers.yaml"
 # same-origin page via GET /api/csrf, and required (in a custom header) on EVERY
 # state-changing request. A cross-site page can't read it (same-origin policy)
 # and the custom header forces a CORS preflight we never permit — so a
-# cross-site POST cannot forge a mutation. Regenerated per process (per restart).
+# cross-site POST cannot forge a mutation. Rotated per process (per restart).
 _CSRF_TOKEN = secrets.token_urlsafe(32)
 _CSRF_HEADER = "x-openmontage-csrf"
 _MAX_MUTATION_BYTES = 16 * 1024  # generous for a key + small JSON; blocks abuse
@@ -472,23 +472,6 @@ def create_app(*, render_base_url: Optional[str] = None) -> FastAPI:
             raise HTTPException(status_code=400, detail=res.get("reason") or "Timeline render failed.")
         return res
 
-    @app.post("/api/project/{project_id}/timeline/revision")
-    async def project_layer_revision(project_id: str, request: Request) -> dict:
-        """Queue an honest AI-regeneration request for ONE layer (agent-driven).
-        Does NOT generate anything — appends a versioned request + marks queued."""
-        from lib.revision_requests import RevisionError, queue_revision
-        project_dir = _safe_project_dir(project_id)
-        body = await _guarded_json_body(request)
-        _enforce_rate(request, "timeline")
-        layer_id = body.get("layer_id")
-        prompt = body.get("prompt")
-        if not isinstance(layer_id, str) or not layer_id:
-            raise HTTPException(status_code=400, detail="layer_id is required")
-        try:
-            return await asyncio.to_thread(
-                queue_revision, project_dir, layer_id, prompt, constraints=body.get("constraints"))
-        except RevisionError as exc:
-            raise HTTPException(status_code=getattr(exc, "status", 400), detail=str(exc))
 
     @app.post("/api/project/{project_id}/duration")
     async def project_duration_set(project_id: str, request: Request) -> dict:

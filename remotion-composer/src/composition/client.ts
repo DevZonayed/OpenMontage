@@ -176,21 +176,6 @@ export class BacklotClient {
     return this.postJSON<RenderResult>(`/api/project/${this.projectId}/frame`, { frame });
   }
 
-  async queueRevision(
-    layerId: string,
-    prompt: string,
-    constraints?: Record<string, unknown>,
-  ): Promise<Record<string, unknown>> {
-    this.assertOnline("queue a revision");
-    // Backend contract (backlot/server.py::project_layer_revision) reads `layer_id`
-    // and `prompt` (+ optional `constraints`).
-    return this.postJSON(`/api/project/${this.projectId}/timeline/revision`, {
-      layer_id: layerId,
-      prompt,
-      constraints,
-    });
-  }
-
   // ── Preferences / learning (Style panel) ──
   async getPreferences(scope: "all" | "global" | "project" = "all", category?: string): Promise<PreferencesPayload> {
     const q = category ? `?scope=${scope}&category=${encodeURIComponent(category)}` : `?scope=${scope}`;
