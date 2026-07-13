@@ -79,8 +79,8 @@ def render_timeline_preview(project_dir: Path, *,
     layers = timeline.get("layers")
     if not isinstance(layers, list) or len(layers) == 0:
         return {"ok": False,
-                "reason": "The timeline has no layers to render yet. Hermes builds the "
-                          "timeline during production — there is nothing to render."}
+                "reason": "The timeline has no layers to render yet. Add scenes to the "
+                          "timeline in the Studio — there is nothing to render."}
 
     total = int(timeline.get("total_frames") or 0)
     if total <= 0:

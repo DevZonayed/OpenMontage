@@ -2,13 +2,15 @@
 //
 // REAL integration: load the SHIPPED /ui/studio.bundle.js into jsdom and mount it
 // via window.BacklotStudio.mount with a stubbed fetch returning the canonical
-// /status + timeline for the exact rejected fixture (research/proposal approved,
-// plan approved, no timeline, requested 150s, Hermes disconnected). Asserts the
-// FULL rendered document has NO legacy leakage, exactly one primary, sanitized
-// short job id when live, and the truthful 2:30 target — the "tests passed / real
-// browser failed" gap the component-markup test could not cover.
+// timeline + read-only /status overview for an EMPTY project (no timeline, a
+// truthful requested target of 2:30). Asserts the manual-first Studio contract:
+// NO agent / Hermes / Mochlet / automation leakage anywhere, a single prominent
+// "Add first scene" primary that runs the real add-layer flow, the grouped domain
+// regions, a truthful target duration (never the composer's 1800/1:00 default),
+// and a scrubber that advances against the target.
 
 import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
+import { spring } from "remotion";
 import fs from "node:fs";
 import path from "node:path";
 import vm from "node:vm";
@@ -16,64 +18,49 @@ import vm from "node:vm";
 const BUNDLE = path.resolve(__dirname, "../../../backlot/ui/studio.bundle.js");
 const PID = "the-electricity-bulb";
 
+let fetchCalls: string[] = [];
+
+// The composer's internal safe minimum (1800f / 60s) is present in the timeline
+// payload ON PURPOSE — the Studio must never surface it as the user's duration.
 function emptyTimelinePayload() {
   return {
     timeline: { version: "1.0", fps: 30, target_duration_seconds: 60, total_frames: 1800, width: 1920, height: 1080, layers: [] },
     etag: "e1", persisted: true, fps: 30, total_frames: 1800,
     target_duration_seconds: 60, target_formatted: "1:00", word_budget: 100,
     measured_output_seconds: null, remotion_render_ready: false,
-    remotion_reason: "not ready", layer_types: ["video", "image", "text"],
+    remotion_reason: "no layers", layer_types: ["video", "image", "text"],
   };
 }
 
-function statusPayload(over: Record<string, unknown> = {}) {
+function overviewPayload(over: Record<string, unknown> = {}) {
   return {
-    version: "1.0", kind: "production_status_view", project_id: PID, mode: "local",
-    authoritative_source: "checkpoints", overall_state: "ready_to_produce",
-    current_stage: "assets", current_stage_label: "Asset generation",
-    stage_index: 4, stage_number: 5, stage_count: 11,
-    headline: "Waiting for Hermes to begin asset generation",
-    active_task: "Plan approved — production has not started yet.", owner: "user",
-    why_waiting: "Local Hermes (Mochlet) detected — connect to start production",
-    primary_action: { id: "connect_hermes", label: "Connect Hermes to continue", owner: "user", kind: "connect", advances_production: true },
-    secondary_actions: [{ id: "preview", label: "Preview approved plan locally", owner: "user", kind: "preview", advances_production: false }],
-    latest_event: { label: "No production run has started for this project." },
-    elapsed_seconds: null, progress: 0.36, completed_stages: 4,
-    stages: [
-      { id: "research", index: 0, label: "Research", status: "completed", progress: 1 },
-      { id: "proposal", index: 1, label: "Proposal", status: "completed", progress: 1 },
-      { id: "script", index: 2, label: "Script", status: "completed", progress: 1 },
-      { id: "scene_plan", index: 3, label: "Scene planning", status: "completed", progress: 1 },
-      { id: "assets", index: 4, label: "Asset generation", status: "current", progress: 0 },
-      { id: "complete", index: 10, label: "Completion", status: "upcoming", progress: 0 },
-    ],
-    identity: { agent: null, job: null, session: null, engine: null, tool: null, provider: null },
-    run_id: "run_eb_001", stop_available: false,
-    render: { renderable: false, active: false, reason: "The plan is approved but no assets exist yet.", layer_count: 0 },
+    version: "2.0", kind: "project_overview", project_id: PID, title: "The Electricity Bulb",
+    owner: "you", mode: "local",
+    headline: "Set up your first scene",
+    guidance: "This project has no timeline yet. Add your first scene to start editing.",
+    has_timeline: false, layer_count: 0,
+    milestones: [], milestone_progress: { completed: 0, total: 0 },
+    last_saved: null, blockers: [],
+    outputs: { renders: [], render_count: 0, latest_render: null, asset_count: 0 },
+    // A truthful REQUESTED target of 2:30 (4500 frames) — never the composer default.
     target: { available: true, duration_seconds: 150, formatted: "2:30", frames: 4500, fps: 30, source: "requested", is_target: true, label: "target 2:30 · 4500 target frames" },
-    connection: { status: "detected", available: false, headline: "Local Hermes (Mochlet) detected — connect to start production", detail: "Mochlet is running on this Mac." },
-    diagnostics: [], sources: { brain_state: "not_started", brain_run_id: null, run_state: "waiting_for_approval", plan_approved: true, has_checkpoints: true },
-    stale: false, is_demo: false, is_live: false, is_fixture: false,
+    render: { renderable: false, active: false, reason: "Add scenes to the timeline in the Studio to enable rendering.", layer_count: 0 },
+    primary_action: { id: "open_studio", label: "Open Production Studio" },
+    diagnostics: [], stale: false, is_demo: false, is_fixture: false,
     ...over,
   };
 }
-
-let statusOverride: Record<string, unknown> = {};
 
 function installFetch() {
   const routes: Array<[RegExp, () => unknown]> = [
     [/\/api\/csrf$/, () => ({ csrf: "TOK" })],
     [/\/timeline$/, () => emptyTimelinePayload()],
-    [/\/status(\?|$)/, () => statusPayload(statusOverride)],
-    [/\/brain\/events/, () => ({ events: [], cursor: 0, next_cursor: 0, latest_seq: 0, count: 0, has_more: false })],
-    [/\/brain\/assets/, () => ({ outputs: [], count: 0, run_id: null, actual_duration_seconds: null })],
-    [/\/brain(\?|$)/, () => ({ state: "not_started", stages: [], brain: {} })],
+    [/\/status(\?|$)/, () => overviewPayload()],
     [/\/preferences/, () => ({ categories: [] })],
-    [/\/run(\?|$)/, () => ({ state: "waiting_for_approval" })],
-    [/\/agent-inbox/, () => ({ items: [] })],
   ];
   const impl = async (input: string) => {
     const url = String(input);
+    fetchCalls.push(url);
     const match = routes.find(([re]) => re.test(url));
     const body = match ? match[1]() : {};
     return {
@@ -97,7 +84,7 @@ function mountBundle(): HTMLElement {
   return container;
 }
 
-async function settle(container: HTMLElement, needle: string, tries = 60): Promise<string> {
+async function settle(container: HTMLElement, needle: string, tries = 80): Promise<string> {
   for (let i = 0; i < tries; i++) {
     // eslint-disable-next-line no-await-in-loop
     await new Promise((r) => setTimeout(r, 25));
@@ -107,11 +94,15 @@ async function settle(container: HTMLElement, needle: string, tries = 60): Promi
   return container.textContent || "";
 }
 
-const FORBIDDEN = ["fake_driver", "NO LIVE RUN", "NOT STARTED", "brain: —", "DETERMINISTIC FIXTURE", "OFFLINE DRIVER"];
+// No agent / Hermes / Mochlet / automation surface may leak into the served document.
+const FORBIDDEN = [
+  "AgentPanel", "Connect Hermes", "Hermes Agent", "Hermes", "Mochlet", "mochlet",
+  "9235", "/api/agent", "/api/hermes", "Production Agent", "Command center", "Start production",
+];
 
-describe("shipped studio.bundle.js — real mount, canonical UI, no legacy leakage", () => {
+describe("shipped studio.bundle.js — manual-first editor, no automation leakage", () => {
   beforeEach(() => {
-    statusOverride = {};
+    fetchCalls = [];
     installFetch();
     (globalThis as unknown as { EventSource: unknown }).EventSource = class { close() {} } as unknown;
     if (!fs.existsSync(BUNDLE)) throw new Error("build the studio bundle first (npm run build:studio)");
@@ -121,44 +112,34 @@ describe("shipped studio.bundle.js — real mount, canonical UI, no legacy leaka
     vi.restoreAllMocks();
   });
 
-  it("renders the canonical Studio (command center + inspector) with no legacy state", async () => {
+  it("renders the empty-state editor with one 'Add first scene' primary, grouped domains, and a truthful target", async () => {
     const container = mountBundle();
-    const text = await settle(container, "Asset generation");
-    // canonical stage/headline/owner present
-    expect(text).toContain("Asset generation");
-    expect(text).toContain("Waiting for Hermes to begin asset generation");
-    expect(text).toContain("Owner: You");
-    // truthful target duration, never the composer default 1:00/1800 — ANYWHERE
-    // in the full document (header, empty card, AND the transport scrubber).
+    const text = await settle(container, "Add first scene");
+    // empty-timeline card + a single prominent CTA
+    expect(container.querySelector('[data-testid="empty-timeline"]')).toBeTruthy();
+    expect(container.querySelectorAll('[data-testid="add-first-scene"]').length).toBe(1);
+    // truthful requested target, never the composer default 1:00 / 1800 — ANYWHERE
     expect(text).toContain("target 2:30 · 4500 target frames");
     expect(text).toContain("f0/4500");                 // scrubber agrees with the target
     expect(text).not.toMatch(/\b1800\b/);              // no internal composer frame count
     expect(text).not.toMatch(/\b1:00\b/);
-    // NO legacy leakage anywhere in the served document
+    // NO agent / Hermes / Mochlet / automation leakage in the served document
     for (const bad of FORBIDDEN) expect(text).not.toContain(bad);
-    // exactly ONE production-next action across the whole page (the cc-primary);
-    // no enabled Start, no duplicate Connect, no "go to next step" button.
-    expect(container.querySelectorAll('[data-testid="cc-primary"]').length).toBe(1);
-    const buttons = [...container.querySelectorAll("button")] as HTMLButtonElement[];
-    const enabledText = buttons.filter((b) => !b.disabled).map((b) => (b.textContent || "").trim());
-    expect(enabledText.filter((t) => /start production/i.test(t)).length).toBe(0);
-    expect(enabledText.filter((t) => /go to the next step/i.test(t)).length).toBe(0);
-    expect(enabledText.filter((t) => /connect hermes/i.test(t)).length).toBe(1); // exactly one Connect
-    // the inspector references the next step as static text, not a button
-    expect(container.querySelector('[data-testid="pi-next-ref"]')).toBeTruthy();
-    expect(container.querySelector('[data-testid="pi-goto-action"]')).toBeNull();
-    // empty-timeline card present (no misleading blank preview)
-    expect(container.querySelector('[data-testid="empty-timeline"]')).toBeTruthy();
-    // connection banner is status text only (no button inside)
-    const conn = container.querySelector('[data-testid="cc-conn"]');
-    expect(conn).toBeTruthy();
-    expect(conn?.querySelector("button")).toBeNull();
+    // NO credential inputs anywhere
+    expect(container.querySelectorAll("input[type=password]").length).toBe(0);
+    // grouped, labelled domain regions
+    expect(container.querySelector('[data-testid="domain-timeline"]')).toBeTruthy();
+    expect(container.querySelector('[data-testid="domain-preview"]')).toBeTruthy();
+    expect(container.querySelector('[data-testid="domain-renderer"]')).toBeTruthy();
+    expect(container.querySelector('[data-testid="domain-inspector"]')).toBeTruthy();
+    // never a start/connect production control
+    const enabled = [...container.querySelectorAll("button")].filter((b) => !(b as HTMLButtonElement).disabled).map((b) => (b.textContent || "").trim());
+    expect(enabled.filter((t) => /start production|connect/i.test(t)).length).toBe(0);
   });
 
-  it("scrubber advances on an empty timeline (no Player) using the target duration", async () => {
+  it("scrubber advances on the empty timeline (no Player) using the target duration", async () => {
     const container = mountBundle();
     await settle(container, "f0/4500");
-    // step forward — with no Player, `seek` must still move the playhead/timecode.
     const nextBtn = [...container.querySelectorAll("button")].find(
       (b) => (b.getAttribute("aria-label") || "") === "Next frame") as HTMLButtonElement | undefined;
     expect(nextBtn).toBeTruthy();
@@ -168,19 +149,32 @@ describe("shipped studio.bundle.js — real mount, canonical UI, no legacy leaka
     expect(after).not.toMatch(/\b1800\b/);
   });
 
-  it("live run shows a SANITIZED short job id (never the raw handle)", async () => {
-    const FULL_JOB = "11111111-1111-4111-8111-111111111111";
-    statusOverride = {
-      is_live: true, mode: "live", overall_state: "producing", owner: "hermes",
-      headline: "Hermes is working on Asset generation",
-      primary_action: { id: "monitor", label: "Hermes is producing", owner: "hermes", kind: "status", advances_production: false },
-      identity: { agent: "a", job: FULL_JOB, session: "22222222-2222-4222-8222-222222222222", engine: "mochlet", tool: "image_selector", provider: "flux" },
-      connection: { status: "connected", available: true, headline: "Connected to Hermes" },
-    };
+  it("clicking 'Add first scene' runs the real add-layer flow", async () => {
     const container = mountBundle();
-    const text = await settle(container, "image_selector");
-    expect(text).toContain("job 11111111");        // short id chip
-    expect(text).not.toContain(FULL_JOB);           // never the raw handle
-    expect(text).toContain("image_selector");
+    await settle(container, "Add first scene");
+    const cta = container.querySelector('[data-testid="add-first-scene"]') as HTMLButtonElement;
+    expect(cta).toBeTruthy();
+    cta.click();
+    await settle(container, "+ Add layer");
+    expect(container.querySelector('[data-testid="empty-timeline"]')).toBeNull();
+    expect(container.querySelector('[data-testid="tl-add-layer"]')).toBeTruthy();
+  });
+
+  it("post-create seeks the preview to a visibly-legible frame (not blank at 0)", async () => {
+    const container = mountBundle();
+    await settle(container, "Add first scene");
+    (container.querySelector('[data-testid="add-first-scene"]') as HTMLButtonElement).click();
+    await settle(container, "+ Add layer");
+    await new Promise((r) => setTimeout(r, 120)); // deferred rAF seek
+    const readout = container.querySelector('[data-testid="scrub-readout"]')?.textContent || "";
+    const m = readout.match(/f(\d+)\//);
+    expect(m).toBeTruthy();
+    const seekedFrame = Number(m![1]);
+    expect(seekedFrame).toBeGreaterThan(0); // playhead advanced off frame 0
+    // The title's entrance (spring, damping 200 — same as the composition) is
+    // transparent at frame 0 and legibly visible at the seek target.
+    const entranceOpacity = (f: number) => spring({ frame: f, fps: 30, config: { damping: 200 } });
+    expect(entranceOpacity(0)).toBeLessThan(0.05);
+    expect(entranceOpacity(seekedFrame)).toBeGreaterThan(0.5);
   });
 });
