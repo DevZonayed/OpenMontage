@@ -410,3 +410,55 @@ def test_build_live_client_unavailable_when_not_ready(tmp_path):
     HA._write_config(tmp_path, {"enabled": True})
     client = build_live_client(base_dir=tmp_path, detector=not_ready)
     assert isinstance(client, _UnavailableAgentClient)
+
+
+# --------------------------------------------------------------------------- #
+# Fail-closed run start / cancel (reviewer fixes: never fabricate an active run
+# or an unconfirmed cancel through an ephemeral probe).
+# --------------------------------------------------------------------------- #
+def test_default_session_factory_fails_closed(tmp_path):
+    """The default (ephemeral-probe) starter must NOT return a session id — it can't
+    keep Hermes alive for the run, so it fails closed instead of fabricating one."""
+    agent = _install_hermes(tmp_path)
+    argv = [str(agent / "venv" / "bin" / "python"), "-m", "acp_adapter"]
+    with pytest.raises(OrchestratorUnavailable):
+        HA._default_session_factory(str(REPO_ROOT), "OM-RUN:r do it", argv=argv)
+
+
+def test_create_job_with_default_starter_opens_no_run(tmp_path):
+    """A ready+enabled native client with NO injected runner fails closed on start
+    (so start_run can never persist an 'active' run Hermes never accepted), and no
+    idempotency handle is written."""
+    det = _ready_detector(tmp_path)
+    connect(detector=det, base_dir=tmp_path)
+    client = build_live_client(base_dir=tmp_path, detector=det)  # default starter
+    assert isinstance(client, NativeHermesAgentClient)
+    assert client.available() is True
+    with pytest.raises(OrchestratorUnavailable):
+        client.create_job(project_id="p", run_id="r",
+                          requested_duration_seconds=1, idempotency_key="p:r")
+    assert HA._session_store(tmp_path).get("p:r") is None
+
+
+def test_default_cancel_reports_unconfirmed(tmp_path):
+    """The default canceller cannot confirm a cancel against a live session, so it
+    raises (callers surface it as UNCONFIRMED / retryable) instead of pretending."""
+    det = _ready_detector(tmp_path)
+    client = NativeHermesAgentClient(detector=det, enabled=True, base_dir=tmp_path)
+    with pytest.raises(OrchestratorUnavailable):
+        client.cancel_job(job_id=CANON_SID)
+
+
+def test_launch_argv_rejects_sibling_home_prefix(tmp_path, monkeypatch):
+    """A console script in a SIBLING dir (~/.hermes-evil) must not pass the
+    ~/.hermes path-boundary check (no string-prefix bypass)."""
+    home = tmp_path / ".hermes"
+    home.mkdir()
+    (home / "hermes-agent").mkdir()  # dir exists, but no venv/acp_adapter → console path
+    evil = tmp_path / ".hermes-evil"
+    evil.mkdir()
+    evil_script = evil / "hermes-acp"
+    evil_script.write_text("#!/bin/sh\n")
+    monkeypatch.setattr(HA.shutil, "which", lambda name: str(evil_script))
+    det = HermesAgentDetector(home=home, runner=_Runner())
+    assert det.launch_argv() is None  # sibling rejected → not installed

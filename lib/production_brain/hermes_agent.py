@@ -14,13 +14,16 @@ Design (a narrow OpenMontage-owned adapter so the backend can evolve):
     install plus a bounded, side-effect-free readiness probe (``hermes-acp
     --check`` / ``--version``). No network, no credentials, no state.db access.
   * :class:`NativeHermesAgentClient` — implements the
-    :class:`~lib.production_brain.orchestrator.HermesOrchestratorClient` port by
-    opening a **genuine** Hermes ACP session scoped to the OpenMontage repo and
-    returning Hermes's own session id (never fabricated). ``session_factory`` and
-    ``canceller`` are injectable so the whole thing is unit-tested offline; the
-    real transport (:func:`_default_session_factory`) spawns the allowlisted local
-    Hermes binary with an argv list (never a shell), bounded timeouts, and a
-    minimal environment.
+    :class:`~lib.production_brain.orchestrator.HermesOrchestratorClient` port. A run
+    over ACP only lives while the Hermes process owning its session is alive, so the
+    default (ephemeral-probe) run starter **fails closed** rather than fabricate an
+    "active" run behind an already-exited process (:func:`_default_session_factory`).
+    A durable session runner is wired by injecting ``session_factory`` /
+    ``canceller`` (also how the offline unit tests drive it); that runner opens a
+    genuine Hermes session, keeps the process alive, and returns Hermes's own
+    session id (never fabricated). The real ACP wire client (:class:`_AcpStdioClient`)
+    spawns the allowlisted local Hermes binary with an argv list (never a shell),
+    bounded timeouts, and a minimal environment.
   * :func:`agent_status` — the plain-language connection view the board/Studio
     render. It NEVER contains an endpoint, token, project, or job field.
 
@@ -154,7 +157,10 @@ class HermesAgentDetector:
         if script:
             try:
                 resolved = Path(script).resolve()
-                if str(resolved).startswith(str(self._home.resolve())):
+                home = self._home.resolve()
+                # A true path-boundary check — NOT a string prefix, which would let a
+                # sibling like ``~/.hermes-evil/hermes-acp`` pass the ``~/.hermes`` prefix.
+                if resolved.is_relative_to(home):
                     return [str(resolved)]
             except OSError:
                 return None
@@ -313,42 +319,47 @@ class _AcpStdioClient:
             raise OrchestratorUnavailable("Hermes Agent returned no session id.")
         return sid
 
-    def prompt(self, session_id: str, text: str) -> None:
-        # Fire the production instruction. We do not block for the whole run — the
-        # request returns when the turn ends; for a long production the caller
-        # tears the probe down after delivery and relies on the persisted session
-        # handle. (Live run streaming is a documented follow-up boundary.)
-        self._send("session/prompt", {
+    def prompt(self, session_id: str, text: str) -> dict:
+        """Deliver the production instruction as a REAL request and return Hermes's
+        authoritative ``PromptResponse`` (``{stopReason: ...}``).
+
+        This blocks (bounded by ``timeout``) until Hermes finishes the turn — so a
+        caller must only use it from a runner that keeps the ACP process alive for
+        the run's duration. A refusal / error / timeout raises
+        :class:`OrchestratorUnavailable` (fail closed), never a silent success."""
+        res = self._request("session/prompt", {
             "sessionId": session_id,
             "prompt": [{"type": "text", "text": text}],
-        }, is_request=True, _id=(self._next_id + 1))
+        })
+        stop = res.get("stopReason") or res.get("stop_reason")
+        if stop == "refusal":
+            raise OrchestratorUnavailable("Hermes Agent refused the production prompt.")
+        return res
 
 
-def _default_session_factory(cwd: str, instruction: str, *, argv: list[str],
-                             deliver_prompt: bool = True) -> dict:
-    """Open a genuine Hermes ACP session scoped to ``cwd`` and return its id.
+def _default_session_factory(cwd: str, instruction: str, *, argv: list[str]) -> dict:
+    """The default (ephemeral-probe) run starter — deliberately **fail-closed**.
 
-    Spawns the allowlisted Hermes binary, performs the ACP handshake, creates a
-    session bound to the OpenMontage repo, and (best-effort) delivers the
-    production instruction. Returns ``{"sessionId": <real id>}``. Raises
-    :class:`OrchestratorUnavailable` on any failure (fail closed)."""
-    try:
-        with _AcpStdioClient(argv, cwd=cwd) as client:
-            client.initialize()
-            session_id = client.new_session(cwd)
-            if deliver_prompt:
-                try:
-                    client.prompt(session_id, instruction)
-                except Exception:
-                    # The session exists and is real; instruction delivery is
-                    # best-effort. Do not fabricate failure of a created session.
-                    pass
-            return {"sessionId": session_id}
-    except OrchestratorUnavailable:
-        raise
-    except Exception as exc:  # spawn / io / protocol fault → fail closed
-        raise OrchestratorUnavailable(
-            f"Hermes Agent session could not be started ({exc.__class__.__name__}).") from exc
+    A run started over ACP only stays alive while the Hermes process that owns its
+    session is alive. This default transport is an ephemeral probe: it cannot keep
+    the Hermes process running for the length of a production, so it must NOT return
+    a session id that callers would persist as an *active* run while Hermes has
+    already exited (that would fabricate success). Native in-app run *execution*
+    therefore fails closed here — the agent is still genuinely detected, verified,
+    and connected (see :class:`HermesAgentDetector` / :func:`agent_status`), and the
+    real ACP session/prompt/cancel machinery in :class:`_AcpStdioClient` is exercised
+    by the gated live smoke and by tests through an injected ``session_factory``.
+
+    A future durable session runner (one that supervises a long-lived ACP process
+    and streams ``session/update``) is wired by injecting ``session_factory`` into
+    :class:`NativeHermesAgentClient`; it should call ``_AcpStdioClient.initialize`` →
+    ``new_session`` → ``prompt`` (a real request) and keep the process alive.
+    """
+    raise OrchestratorUnavailable(
+        "Native Hermes Agent run execution requires a durable ACP session runner, "
+        "which is not enabled in this build. The Hermes Agent is detected and ready "
+        "— you can drive this production from the Hermes Agent directly, and manual "
+        "timeline editing / rendering remain available here. No run was opened.")
 
 
 # --------------------------------------------------------------------------- #
@@ -431,16 +442,17 @@ class NativeHermesAgentClient:
         canceller(job_id)
 
     def _default_cancel(self, session_id: str) -> None:
-        argv = self._detector.detect().get("launch")
-        if not argv:
-            raise OrchestratorUnavailable("Hermes Agent launch target is unavailable.")
-        try:
-            with _AcpStdioClient(argv, cwd=self._cwd) as client:
-                client.initialize()
-                client._send("session/cancel", {"sessionId": session_id}, is_request=False)
-        except Exception as exc:
-            raise OrchestratorUnavailable(
-                f"Hermes Agent cancel could not be delivered ({exc.__class__.__name__}).") from exc
+        # ``session/cancel`` only means anything to the Hermes process that owns the
+        # LIVE session. A fresh ephemeral process has no handle on that run, and the
+        # notification is unacknowledged — so we cannot truthfully confirm the cancel
+        # from here. Fail closed (raise) so callers report the cancellation as
+        # UNCONFIRMED / retryable rather than marking the run terminally cancelled.
+        # A durable runner injects a ``canceller`` that cancels the live session and
+        # confirms it.
+        raise OrchestratorUnavailable(
+            "Hermes Agent cancellation could not be confirmed: there is no durable "
+            "Hermes session runner to deliver and acknowledge session/cancel against "
+            "the live run. Cancel the run from the Hermes Agent directly.")
 
     def control_job(self, *, job_id: str, action: str, idempotency_key: str) -> None:
         if action == "cancel":
