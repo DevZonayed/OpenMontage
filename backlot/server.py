@@ -37,7 +37,7 @@ PREFS_PATH = REPO_ROOT / "providers.yaml"
 # same-origin page via GET /api/csrf, and required (in a custom header) on EVERY
 # state-changing request. A cross-site page can't read it (same-origin policy)
 # and the custom header forces a CORS preflight we never permit — so a
-# cross-site POST cannot forge a mutation. Regenerated per process (per restart).
+# cross-site POST cannot forge a mutation. Rotated per process (per restart).
 _CSRF_TOKEN = secrets.token_urlsafe(32)
 _CSRF_HEADER = "x-openmontage-csrf"
 _MAX_MUTATION_BYTES = 16 * 1024  # generous for a key + small JSON; blocks abuse
@@ -63,12 +63,8 @@ _RATE_LIMITS = {
     "projects": (12, 10.0),
     "runtime": (6, 60.0),  # runtime install/repair/verify are expensive + rare
     "timeline": (30, 10.0),  # editor saves — frequent but bounded
-    "run": (10, 60.0),       # start/cancel a production run — spawns a worker
     "render": (12, 60.0),    # single-frame stills — a subprocess each, but scrub-and-render is interactive
-    "inbox": (40, 10.0),     # agent-queue READ polled ~every 2s by the board — own bucket, never drains 'projects'
-    "brain": (60, 10.0),     # production-brain control (approve/cancel/retry/resume) — bursty on a live run
     "preferences": (30, 10.0),  # learned-style read/update/reset — user-driven, infrequent
-    "hermes": (12, 60.0),        # guided Hermes/Mochlet connect — user-driven, rare
 }
 _RATE_MAX_KEYS = 4096  # hard cap on tracked buckets (memory bound)
 
@@ -476,33 +472,6 @@ def create_app(*, render_base_url: Optional[str] = None) -> FastAPI:
             raise HTTPException(status_code=400, detail=res.get("reason") or "Timeline render failed.")
         return res
 
-    @app.get("/api/project/{project_id}/agent-inbox")
-    async def project_agent_inbox(project_id: str, request: Request) -> dict:
-        """Read-only: everything currently queued for the agent (or awaiting the
-        user) — queued layer regenerations, a pending duration re-plan, and the
-        run approval state. Honest visibility, no generation (Rule Zero)."""
-        from lib.agent_inbox import pending_agent_work
-        project_dir = _safe_project_dir(project_id)
-        _enforce_rate(request, "inbox")
-        return await asyncio.to_thread(pending_agent_work, project_dir)
-
-    @app.post("/api/project/{project_id}/timeline/revision")
-    async def project_layer_revision(project_id: str, request: Request) -> dict:
-        """Queue an honest AI-regeneration request for ONE layer (agent-driven).
-        Does NOT generate anything — appends a versioned request + marks queued."""
-        from lib.revision_requests import RevisionError, queue_revision
-        project_dir = _safe_project_dir(project_id)
-        body = await _guarded_json_body(request)
-        _enforce_rate(request, "timeline")
-        layer_id = body.get("layer_id")
-        prompt = body.get("prompt")
-        if not isinstance(layer_id, str) or not layer_id:
-            raise HTTPException(status_code=400, detail="layer_id is required")
-        try:
-            return await asyncio.to_thread(
-                queue_revision, project_dir, layer_id, prompt, constraints=body.get("constraints"))
-        except RevisionError as exc:
-            raise HTTPException(status_code=getattr(exc, "status", 400), detail=str(exc))
 
     @app.post("/api/project/{project_id}/duration")
     async def project_duration_set(project_id: str, request: Request) -> dict:
@@ -542,127 +511,9 @@ def create_app(*, render_base_url: Optional[str] = None) -> FastAPI:
 
     # ---- Production run lifecycle (real bounded free preflight/planning worker) --
 
-    @app.get("/api/project/{project_id}/run")
-    async def project_run_get(project_id: str) -> dict:
-        """Reconciled production-run state + the free preflight plan (run_plan.json)."""
-        from lib.production_run import get_run, read_plan
-        project_dir = _safe_project_dir(project_id)
-
-        def _payload():
-            run = get_run(project_dir)
-            run["plan"] = read_plan(project_dir)
-            return run
-        return await asyncio.to_thread(_payload)
-
-    @app.post("/api/project/{project_id}/run/approve")
-    async def project_run_approve(project_id: str, request: Request) -> dict:
-        """Record human approval of the preflight plan (does NOT auto-generate)."""
-        from lib.production_run import RunError, approve_plan
-        project_dir = _safe_project_dir(project_id)
-        body = await _guarded_json_body(request)
-        _enforce_rate(request, "run")
-        run_id = body.get("run_id")
-        if not isinstance(run_id, str) or not run_id:
-            raise HTTPException(status_code=400, detail="run_id is required")
-        try:
-            return await asyncio.to_thread(approve_plan, project_dir, run_id)
-        except RunError as exc:
-            raise HTTPException(status_code=getattr(exc, "status", 400), detail=str(exc))
-
-    @app.post("/api/project/{project_id}/run")
-    async def project_run_start(project_id: str, request: Request) -> dict:
-        """Start a real production run (idempotent — returns the active run if one
-        is already in progress). Spawns a fixed argv-only worker."""
-        from lib.production_run import RunError, start_run
-        from lib.project_intake import read_intake
-        project_dir = _safe_project_dir(project_id)
-        await _guarded_json_body(request)
-        _enforce_rate(request, "run")
-        intake = await asyncio.to_thread(read_intake, project_dir)
-        target = (intake or {}).get("target_duration_seconds")
-        try:
-            return await asyncio.to_thread(
-                start_run, project_dir, project_id, target_duration_seconds=target)
-        except RunError as exc:
-            raise HTTPException(status_code=getattr(exc, "status", 400), detail=str(exc))
-
-    @app.post("/api/project/{project_id}/run/preview")
-    async def project_run_preview(project_id: str, request: Request) -> dict:
-        """Render a FREE Remotion preview animatic of the plan (no paid media)."""
-        from lib.preview_render import generate_and_record
-        project_dir = _safe_project_dir(project_id)
-        await _guarded_json_body(request)
-        _enforce_rate(request, "run")
-        res = await asyncio.to_thread(generate_and_record, project_dir)
-        if not res.get("ok"):
-            raise HTTPException(status_code=400, detail=res.get("reason") or "Preview render failed.")
-        return res
-
-    @app.post("/api/project/{project_id}/run/cancel")
-    async def project_run_cancel(project_id: str, request: Request) -> dict:
-        """Cancel the EXACT active run (by run_id) — stops only that worker."""
-        from lib.production_run import RunError, cancel_run
-        project_dir = _safe_project_dir(project_id)
-        body = await _guarded_json_body(request)
-        _enforce_rate(request, "run")
-        run_id = body.get("run_id")
-        if not isinstance(run_id, str) or not run_id:
-            raise HTTPException(status_code=400, detail="run_id is required")
-        try:
-            return await asyncio.to_thread(cancel_run, project_dir, run_id)
-        except RunError as exc:
-            raise HTTPException(status_code=getattr(exc, "status", 400), detail=str(exc))
-
-    # ---- Production brain (canonical run state + append-only event history) ----
-    # The Hermes brain's observable telemetry: which agent/job/tool/provider is
-    # doing which task, current stage, progress, elapsed time, latest event,
-    # outputs, approvals, blockers, errors. Reads are non-blocking snapshots
-    # (the board polls, like it polls /run); control is CSRF + rate guarded.
-
-    @app.get("/api/project/{project_id}/brain")
-    async def project_brain_state(project_id: str) -> dict:
-        from backlot.brain_api import build_run_payload
-        project_dir = _safe_project_dir(project_id)
-        return await asyncio.to_thread(build_run_payload, project_dir)
-
-    @app.get("/api/project/{project_id}/brain/events")
-    async def project_brain_events(project_id: str, after: int = 0, limit: int = 200) -> dict:
-        """Cursor page of the append-only event history (non-blocking snapshot)."""
-        from backlot.brain_api import read_events_payload
-        project_dir = _safe_project_dir(project_id)
-        return await asyncio.to_thread(read_events_payload, project_dir, after=after, limit=limit)
-
-    @app.get("/api/project/{project_id}/brain/assets")
-    async def project_brain_assets(project_id: str) -> dict:
-        from backlot.brain_api import assets_payload
-        project_dir = _safe_project_dir(project_id)
-        return await asyncio.to_thread(assets_payload, project_dir)
-
-    def _brain_control(handler_name: str):
-        async def _route(project_id: str, request: Request) -> dict:
-            import backlot.brain_api as brain_api
-            from backlot.brain_api import BrainApiError
-            project_dir = _safe_project_dir(project_id)
-            body = await _guarded_json_body(request)
-            _enforce_rate(request, "brain")
-            handler = getattr(brain_api, handler_name)
-            try:
-                return await asyncio.to_thread(handler, project_dir, body)
-            except BrainApiError as exc:
-                raise HTTPException(status_code=getattr(exc, "status", 400), detail=str(exc))
-        _route.__name__ = f"project_brain_{handler_name}"
-        return _route
-
-    app.post("/api/project/{project_id}/brain/start")(_brain_control("start_run"))
-    app.post("/api/project/{project_id}/brain/approve")(_brain_control("grant_approval"))
-    app.post("/api/project/{project_id}/brain/reject")(_brain_control("reject_approval"))
-    app.post("/api/project/{project_id}/brain/cancel")(_brain_control("cancel_run"))
-    app.post("/api/project/{project_id}/brain/retry")(_brain_control("retry_stage"))
-    app.post("/api/project/{project_id}/brain/resume")(_brain_control("resume_run"))
-
-    # ---- Canonical production status (ONE view model: board + studio share it) --
-    # Reconciles brain + coarse run + checkpoints + timeline + Hermes connection
-    # into a single command-center view so the two surfaces never disagree.
+    # ---- Read-only project overview (the Board's single view model) ----------
+    # OpenMontage is manual-first: no autonomous worker. This folds the on-disk
+    # checkpoint milestones + timeline + rendered outputs into one overview.
 
     @app.get("/api/project/{project_id}/status")
     async def project_status(project_id: str, demo: int = 0, stale: int = 0) -> dict:
@@ -671,53 +522,29 @@ def create_app(*, render_base_url: Optional[str] = None) -> FastAPI:
         return await asyncio.to_thread(
             build_status_payload, project_dir, demo=bool(demo), stale=bool(stale))
 
-    # ---- Hermes / Mochlet connection (guided, secure) ------------------------
-
-    @app.get("/api/hermes/connection")
-    async def hermes_connection_get() -> dict:
-        from backlot.status_api import hermes_connection
-        return await asyncio.to_thread(hermes_connection)
-
-    @app.post("/api/hermes/connect")
-    async def hermes_connect_post(request: Request) -> dict:
-        from backlot.status_api import StatusApiError, hermes_connect
-        body = await _guarded_json_body(request)
-        _enforce_rate(request, "hermes")
-        try:
-            return await asyncio.to_thread(hermes_connect, body)
-        except StatusApiError as exc:
-            raise HTTPException(status_code=getattr(exc, "status", 400), detail=str(exc))
-
-    @app.post("/api/hermes/disconnect")
-    async def hermes_disconnect_post(request: Request) -> dict:
-        from backlot.status_api import hermes_disconnect
-        body = await _guarded_json_body(request)
-        _enforce_rate(request, "hermes")
-        return await asyncio.to_thread(hermes_disconnect, body)
-
     # ---- Learned style preferences (visible, auditable, reversible) ----------
 
     @app.get("/api/project/{project_id}/preferences")
     async def project_preferences_get(project_id: str, scope: str = "all",
                                       category: Optional[str] = None) -> dict:
-        from backlot.brain_api import read_preferences
+        from backlot.preferences_api import read_preferences
         project_dir = _safe_project_dir(project_id)
         return await asyncio.to_thread(read_preferences, project_dir, scope=scope, category=category)
 
     @app.post("/api/project/{project_id}/preferences")
     async def project_preferences_post(project_id: str, request: Request) -> dict:
-        from backlot.brain_api import BrainApiError, update_preference
+        from backlot.preferences_api import PreferencesApiError, update_preference
         project_dir = _safe_project_dir(project_id)
         body = await _guarded_json_body(request)
         _enforce_rate(request, "preferences")
         try:
             return await asyncio.to_thread(update_preference, body, project_dir=project_dir)
-        except BrainApiError as exc:
+        except PreferencesApiError as exc:
             raise HTTPException(status_code=getattr(exc, "status", 400), detail=str(exc))
 
     @app.post("/api/project/{project_id}/preferences/reset")
     async def project_preferences_reset(project_id: str, request: Request) -> dict:
-        from backlot.brain_api import reset_preferences
+        from backlot.preferences_api import reset_preferences
         project_dir = _safe_project_dir(project_id)
         body = await _guarded_json_body(request)
         _enforce_rate(request, "preferences")
@@ -726,19 +553,17 @@ def create_app(*, render_base_url: Optional[str] = None) -> FastAPI:
     @app.get("/api/preferences")
     async def preferences_get(scope: str = "global", category: Optional[str] = None) -> dict:
         """Global learned-style preferences (cross-project defaults)."""
-        from backlot.brain_api import read_preferences
-        return await asyncio.to_thread(read_preferences, None,
-                                      scope="global" if scope != "project" else "global",
-                                      category=category)
+        from backlot.preferences_api import read_preferences
+        return await asyncio.to_thread(read_preferences, None, scope="global", category=category)
 
     @app.post("/api/preferences")
     async def preferences_post(request: Request) -> dict:
-        from backlot.brain_api import BrainApiError, update_preference
+        from backlot.preferences_api import PreferencesApiError, update_preference
         body = await _guarded_json_body(request)
         _enforce_rate(request, "preferences")
         try:
             return await asyncio.to_thread(update_preference, body, project_dir=None)
-        except BrainApiError as exc:
+        except PreferencesApiError as exc:
             raise HTTPException(status_code=getattr(exc, "status", 400), detail=str(exc))
 
     @app.get("/api/project/{project_id}/events")

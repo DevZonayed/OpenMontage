@@ -30,15 +30,14 @@ import {
   resizeLayer,
   revertAsset,
   setAssetApproval,
+  setLayerText,
   setVolume,
   splitLayer,
   trimLayer,
 } from "../composition/operations";
 import { BacklotClient } from "../composition/client";
+import { ProjectOverview } from "../composition/status";
 import { PreferencesPanel } from "./PreferencesPanel";
-import { CommandCenter } from "./CommandCenter";
-import { ProductionInspector } from "./ProductionInspector";
-import { useStatusView } from "./useStatusView";
 
 // ── helpers ──
 function timecode(frame: number, fps: number): string {
@@ -84,17 +83,27 @@ export const StudioApp: React.FC<StudioAppProps> = ({ client }) => {
   const [renderReason, setRenderReason] = useState("");
   const [rendering, setRendering] = useState(false);
   const [notice, setNotice] = useState<string | null>(null);
-  const [rightTab, setRightTab] = useState<"production" | "inspector" | "style">("production");
+  const [rightTab, setRightTab] = useState<"inspector" | "style">("inspector");
 
-  // Single canonical /status controller shared by the command center AND the
-  // Production inspector — one poll, one primary action, guaranteed same stage.
-  const status = useStatusView(client);
+  // Read-only project overview: a truthful duration + a short guidance line for
+  // the workspace strip. It is NOT an automation controller — the Studio is the
+  // editor. A failure here never breaks editing.
+  const [overview, setOverview] = useState<ProjectOverview | null>(null);
 
   const playerRef = useRef<PlayerRef>(null);
 
   const model = histRef.current?.present ?? null;
 
   // ── load ──
+  const loadOverview = useCallback(async () => {
+    try {
+      setOverview(await client.getStatus());
+    } catch {
+      // Manual-first: the overview is advisory. Keep the last known value and
+      // never block the editor on it.
+    }
+  }, [client]);
+
   const load = useCallback(async () => {
     setLoading(true);
     setError(null);
@@ -109,19 +118,17 @@ export const StudioApp: React.FC<StudioAppProps> = ({ client }) => {
       setDirty(false);
       setSelected(c.layers[0]?.id ?? null);
       rerender();
+      void loadOverview();
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e));
     } finally {
       setLoading(false);
     }
-  }, [client, rerender]);
+  }, [client, rerender, loadOverview]);
 
   useEffect(() => {
     void load();
   }, [load]);
-
-  // Live production status is owned by the shared <CommandCenter> (it polls the
-  // canonical /status view), so StudioApp no longer polls /run separately.
 
   // ── player frame tracking ──
   useEffect(() => {
@@ -184,18 +191,19 @@ export const StudioApp: React.FC<StudioAppProps> = ({ client }) => {
       setEtag(res.etag);
       setDirty(false);
       setNotice("Saved.");
+      void loadOverview();
     } catch (e) {
       const msg = e instanceof Error ? e.message : String(e);
       setNotice(msg.includes("changed") ? `Conflict: ${msg}. Reload to merge.` : `Save failed: ${msg}`);
     } finally {
       setSaving(false);
     }
-  }, [client, etag]);
+  }, [client, etag, loadOverview]);
 
   const renderFinal = useCallback(async () => {
     const layerCount = histRef.current?.present.layers.length ?? 0;
     if (layerCount === 0) {
-      setNotice("Nothing to render yet — the timeline has no layers. Hermes builds the timeline during production; a blank render is disabled on purpose.");
+      setNotice("Nothing to render yet — add a first scene to the timeline. A blank render is disabled on purpose.");
       return;
     }
     if (dirty) {
@@ -220,22 +228,40 @@ export const StudioApp: React.FC<StudioAppProps> = ({ client }) => {
     }
   }, [client, dirty]);
 
+  const target = overview?.target ?? null;
+
   // ── transport ──
   // Clamp to the EFFECTIVE duration (real layers → the composition; empty → the
-  // canonical target frames), and always update `frame` so the scrubber works even
-  // when there is no Player yet (empty timeline shows the placeholder, not a Player).
+  // truthful target frames when known, otherwise a safe internal count that is
+  // NEVER shown as the user's duration). Always update `frame` so the scrubber
+  // works even when there is no Player yet (empty timeline shows the placeholder).
   const seek = useCallback((f: number) => {
     if (!model) return;
     const effectiveFrames = model.layers.length > 0
       ? model.totalFrames
-      : (status.view?.target?.frames || model.totalFrames);
+      : (target?.frames || model.totalFrames);
     const clamped = Math.max(0, Math.min(effectiveFrames - 1, Math.round(f)));
     playerRef.current?.seekTo(clamped);   // seek only if a Player exists
     setFrame(clamped);                     // but always move the playhead/timecode
-  }, [model, status.view]);
+  }, [model, target]);
 
   const togglePlay = useCallback(() => playerRef.current?.toggle(), []);
   const step = useCallback((delta: number) => seek(frame + delta), [frame, seek]);
+
+  const addFirstScene = useCallback(() => {
+    if (!model) return;
+    const visibleFrame = addNewLayer(model, apply, setSelected);
+    // The Player only mounts once a layer exists; defer the seek two frames so the
+    // just-created title lands on a frame where its entrance is fully visible
+    // (creation never looks blank). The final render is untouched (starts at 0).
+    const raf = typeof window !== "undefined" ? window.requestAnimationFrame : null;
+    const run = () => {
+      playerRef.current?.seekTo(visibleFrame);
+      setFrame(visibleFrame);
+    };
+    if (raf) raf(() => raf(run));
+    else setTimeout(run, 32);
+  }, [model, apply]);
 
   // ── keyboard access ──
   useEffect(() => {
@@ -293,7 +319,7 @@ export const StudioApp: React.FC<StudioAppProps> = ({ client }) => {
   );
 
   if (loading) {
-    return <Centered>Loading production studio…</Centered>;
+    return <Centered>Loading studio…</Centered>;
   }
   if (error || !model || !inputProps) {
     return (
@@ -312,27 +338,60 @@ export const StudioApp: React.FC<StudioAppProps> = ({ client }) => {
   const validation = validateComposition(model);
   const selectedLayer = model.layers.find((l) => l.id === selected) ?? null;
   const hasLayers = model.layers.length > 0;
-  // For an EMPTY timeline the composer's internal frame count (a 60s default) must
-  // never surface in the scrub UI. Use the canonical TARGET frames so the scrubber
-  // agrees with the header (2:30 · 4500). A real timeline with layers is authoritative.
+
+  // TRUTHFUL DURATION. Never surface the composer's internal minimum (e.g.
+  // 1800 frames / 1:00) as the user's duration. A real timeline is authoritative;
+  // an empty timeline shows the truthful target, or the pending guidance label.
+  let durationText: string;
+  if (hasLayers) {
+    durationText = `${model.totalFrames} frames · ${model.meta.targetFormatted || `${model.targetDurationSeconds}s`}`;
+  } else if (target?.available) {
+    durationText = target.label;
+  } else {
+    durationText = "Duration set after first scene";
+  }
+
+  // Scrubber denominator: authoritative frames with layers; truthful target
+  // frames when empty; a safe internal count only as a last resort (never shown
+  // in the readout when the duration is still pending).
   const displayTotalFrames = hasLayers
     ? model.totalFrames
-    : (status.view?.target?.frames || model.totalFrames);
+    : (target?.frames || model.totalFrames);
+
+  const scrubReadout = hasLayers
+    ? `${timecode(frame, model.fps)} · f${frame}/${model.totalFrames}`
+    : target?.available
+      ? `f${frame}/${target.frames}`
+      : "Duration set after first scene";
+
+  const renderable = hasLayers;
+  const renderDisabledReason = overview?.render?.reason
+    ?? "Add a first scene to the timeline to enable rendering.";
 
   return (
     <div style={{ display: "flex", flexDirection: "column", height: "100%", color: "#ececef" }}>
-      {/* PRIMARY: the shared command-center card (same view model as the board). */}
-      <CommandCenter status={status} client={client} />
+      {/* COMPACT WORKSPACE-GUIDANCE STRIP — title · short guidance · truthful
+          duration. No connect / start / stop / agent controls: this is a manual
+          editor, not a command center. */}
+      <div style={workspaceStrip} data-testid="workspace-strip">
+        <div style={{ display: "flex", alignItems: "baseline", gap: 10, minWidth: 0 }}>
+          <strong style={{ fontSize: 14 }}>{overview?.title || model.meta.title || client.projectId}</strong>
+          <span style={{ fontSize: 12, color: "#a0a0a9", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }} data-testid="workspace-guidance">
+            {/* Derived from the LIVE model — never the stale server overview. Once a
+                layer exists we never claim "no timeline". */}
+            {hasLayers
+              ? `${model.layers.length} scene${model.layers.length === 1 ? "" : "s"} on the timeline · edit, preview, and render`
+              : (overview?.guidance || "Add your first scene to start editing.")}
+          </span>
+        </div>
+        <span style={pill} data-testid="workspace-duration">{durationText}</span>
+      </div>
 
       {/* Header / actions */}
       <div style={header}>
         <div style={{ display: "flex", alignItems: "center", gap: 12 }}>
-          <strong style={{ fontSize: 15 }}>{model.meta.title || client.projectId}</strong>
           <span style={pill} data-testid="tl-meta">
-            {model.width}×{model.height} · {model.fps}fps ·{" "}
-            {hasLayers
-              ? `${model.totalFrames} frames · ${model.meta.targetFormatted || `${model.targetDurationSeconds}s`}`
-              : (status.view?.target?.available ? status.view.target.label : "duration pending")}
+            {model.width}×{model.height} · {model.fps}fps · {durationText}
           </span>
           {usedFixture ? <span style={{ ...pill, borderColor: "#e8c07d", color: "#e8c07d" }}>◐ demo data</span> : null}
           <span
@@ -342,7 +401,9 @@ export const StudioApp: React.FC<StudioAppProps> = ({ client }) => {
             {renderReady ? "Remotion ready" : "Remotion not ready"}
           </span>
         </div>
-        <div style={{ display: "flex", gap: 8, alignItems: "center" }}>
+        {/* DOMAIN · RENDERER — save + final render controls. */}
+        <div style={{ display: "flex", gap: 8, alignItems: "center" }} data-testid="domain-renderer">
+          <span style={domainTag}>Renderer</span>
           <button style={btn} onClick={undo} disabled={!histRef.current?.canUndo} aria-label="Undo">
             Undo
           </button>
@@ -353,10 +414,10 @@ export const StudioApp: React.FC<StudioAppProps> = ({ client }) => {
             {saving ? "Saving…" : dirty ? "Save*" : "Saved"}
           </button>
           <button
-            style={{ ...btnAccent, opacity: rendering || !hasLayers ? 0.5 : 1, cursor: hasLayers ? "pointer" : "not-allowed" }}
+            style={{ ...btnAccent, opacity: rendering || !renderable ? 0.5 : 1, cursor: renderable ? "pointer" : "not-allowed" }}
             onClick={() => void renderFinal()}
-            disabled={rendering || !hasLayers}
-            title={!hasLayers ? "No renderable layers yet — Hermes builds the timeline during production." : "Render the final film"}
+            disabled={rendering || !renderable}
+            title={!renderable ? renderDisabledReason : "Render the final film"}
           >
             {rendering ? "Rendering…" : "▶ Render final film"}
           </button>
@@ -366,9 +427,9 @@ export const StudioApp: React.FC<StudioAppProps> = ({ client }) => {
       {notice ? <div style={noticeBar}>{notice}</div> : null}
 
       <div style={{ display: "flex", flex: 1, minHeight: 0 }}>
-        {/* Scene rail / tracks / layers */}
-        <div style={rail}>
-          <div style={railTitle}>SCENES · TRACKS · SEQUENCES</div>
+        {/* DOMAIN · TIMELINE / ASSETS — scenes, tracks, sequences. */}
+        <div style={rail} data-testid="domain-timeline">
+          <div style={railTitle}>TIMELINE &amp; ASSETS · SCENES · TRACKS</div>
           {model.tracks.map((t) => (
             <div key={t.id} style={{ marginBottom: 12 }}>
               <div style={trackHeader}>
@@ -396,16 +457,28 @@ export const StudioApp: React.FC<StudioAppProps> = ({ client }) => {
                 ))}
             </div>
           ))}
-          <button style={{ ...miniBtn, marginTop: 8 }} onClick={() => addNewLayer(model, apply, setSelected)}>
-            + Add layer
-          </button>
+          {/* The ongoing add control — only once there are layers. On an empty
+              timeline the single prominent CTA is "Add first scene" (below). */}
+          {hasLayers ? (
+            <button
+              style={{ ...miniBtn, marginTop: 8 }}
+              data-testid="tl-add-layer"
+              onClick={addFirstScene}
+            >
+              + Add layer
+            </button>
+          ) : null}
         </div>
 
-        {/* Player + transport */}
-        <div style={{ flex: 1, display: "flex", flexDirection: "column", minWidth: 0 }}>
+        {/* DOMAIN · PREVIEW — the @remotion/player Player + transport. */}
+        <div style={{ flex: 1, display: "flex", flexDirection: "column", minWidth: 0 }} data-testid="domain-preview">
+          <div style={domainStrip}>
+            <span style={domainTag}>Preview</span>
+            <span style={{ fontSize: 11, color: "#5f5f68" }}>preview = render</span>
+          </div>
           {!hasLayers ? (
             <div style={stage}>
-              <EmptyTimelineCard view={status.view} usedFixture={usedFixture} />
+              <EmptyTimelineCard target={target} usedFixture={usedFixture} onAddFirstScene={addFirstScene} />
             </div>
           ) : (
           <div style={stage}>
@@ -437,9 +510,9 @@ export const StudioApp: React.FC<StudioAppProps> = ({ client }) => {
           )}
 
           <Transport
+            readout={scrubReadout}
             frame={frame}
             totalFrames={displayTotalFrames}
-            fps={model.fps}
             playing={playing}
             previewZoom={previewZoom}
             onZoom={setPreviewZoom}
@@ -463,10 +536,10 @@ export const StudioApp: React.FC<StudioAppProps> = ({ client }) => {
           />
         </div>
 
-        {/* Tabbed right column: Production (Hermes brain) · Inspector · Style */}
+        {/* Tabbed right column: Inspector · Style */}
         <div style={inspector}>
           <div style={{ display: "flex", gap: 4, marginBottom: 10 }}>
-            {(["production", "inspector", "style"] as const).map((t) => (
+            {(["inspector", "style"] as const).map((t) => (
               <button
                 key={t}
                 onClick={() => setRightTab(t)}
@@ -482,15 +555,19 @@ export const StudioApp: React.FC<StudioAppProps> = ({ client }) => {
                   cursor: "pointer",
                 }}
               >
-                {t === "production" ? "Production" : t === "inspector" ? "Inspector" : "Style"}
+                {t === "inspector" ? "Inspector" : "Style"}
               </button>
             ))}
           </div>
 
-          {rightTab === "production" ? <ProductionInspector status={status} /> : null}
-          {rightTab === "style" ? <PreferencesPanel client={client} /> : null}
-          {rightTab === "inspector" ? (
-            <>
+          {rightTab === "style" ? (
+            <div data-testid="domain-style">
+              <div style={railTitle}>STYLE · LEARNED PREFERENCES</div>
+              <PreferencesPanel client={client} />
+            </div>
+          ) : (
+            <div data-testid="domain-inspector">
+              <div style={railTitle}>INSPECTOR · SELECTED LAYER</div>
               {selectedLayer ? (
                 <Inspector
                   key={selectedLayer.id}
@@ -507,22 +584,15 @@ export const StudioApp: React.FC<StudioAppProps> = ({ client }) => {
                     apply((c) => removeLayer(c, selectedLayer.id));
                     setSelected(null);
                   }}
-                  onRegen={async (instr) => {
-                    try {
-                      await client.queueRevision(selectedLayer.id, instr);
-                      setNotice(`Queued regeneration for ${selectedLayer.id}. Its stable id + approval are preserved.`);
-                    } catch (e) {
-                      setNotice(`Could not queue: ${e instanceof Error ? e.message : String(e)}`);
-                    }
-                  }}
+                  onContentChange={(patch) => apply((c) => setLayerText(c, selectedLayer.id, patch))}
                 />
               ) : (
                 <div style={{ color: "#5f5f68", fontSize: 13 }}>Select a layer to edit it.</div>
               )}
               <div style={{ height: 1, background: "#232329", margin: "12px 0" }} />
               <ValidationPanel result={validation} />
-            </>
-          ) : null}
+            </div>
+          )}
         </div>
       </div>
     </div>
@@ -567,16 +637,16 @@ const LayerRow: React.FC<{ layer: Layer; selected: boolean; onSelect: () => void
 );
 
 const Transport: React.FC<{
+  readout: string;
   frame: number;
   totalFrames: number;
-  fps: number;
   playing: boolean;
   previewZoom: number;
   onZoom: (z: number) => void;
   onToggle: () => void;
   onSeek: (f: number) => void;
   onStep: (d: number) => void;
-}> = ({ frame, totalFrames, fps, playing, previewZoom, onZoom, onToggle, onSeek, onStep }) => (
+}> = ({ readout, frame, totalFrames, playing, previewZoom, onZoom, onToggle, onSeek, onStep }) => (
   <div style={transport}>
     <button style={btn} onClick={() => onStep(-1)} aria-label="Previous frame">
       ◂
@@ -596,8 +666,8 @@ const Transport: React.FC<{
       style={{ flex: 1 }}
       aria-label="Scrub"
     />
-    <span style={{ fontFamily: "ui-monospace, monospace", fontSize: 12, minWidth: 150, textAlign: "right" }}>
-      {timecode(frame, fps)} · f{frame}/{totalFrames}
+    <span style={{ fontFamily: "ui-monospace, monospace", fontSize: 12, minWidth: 200, textAlign: "right" }} data-testid="scrub-readout">
+      {readout}
     </span>
     <span style={{ fontSize: 11, color: "#a0a0a9" }}>zoom</span>
     <input
@@ -668,7 +738,8 @@ const TimelineLanes: React.FC<{
                   style={{
                     position: "absolute",
                     left: l.startFrame * pxPerFrame,
-                    width: Math.max(3, l.durationFrames * pxPerFrame),
+                    // Keep blocks legible — never a 2-char clipped sliver.
+                    width: Math.max(44, l.durationFrames * pxPerFrame),
                     height: 22,
                     top: 2,
                     borderRadius: 4,
@@ -703,14 +774,26 @@ const Inspector: React.FC<{
   onRevert: (assetId: string, version: number) => void;
   onApprove: (assetId: string, approved: boolean) => void;
   onDelete: () => void;
-  onRegen: (instr: string) => void;
-}> = ({ layer, asset, onEdit, onMove, onResize, onVolume, onSplit, onRevert, onApprove, onDelete, onRegen }) => {
-  const [instr, setInstr] = useState("");
+  onContentChange: (patch: { text?: string; title?: string }) => void;
+}> = ({ layer, asset, onEdit, onMove, onResize, onVolume, onSplit, onRevert, onApprove, onDelete, onContentChange }) => {
+  const isTextLayer = layer.type === "text" || layer.type === "caption";
   return (
     <div>
       <div style={{ fontSize: 12, color: "#a0a0a9", marginBottom: 8 }}>
         LAYER · {layer.type} · {layer.id}
       </div>
+      {isTextLayer && (
+        <Field label="Content">
+          <textarea
+            key={`content-${layer.id}`}
+            data-testid="inspector-content"
+            defaultValue={layer.title || layer.text || ""}
+            placeholder="Scene text (shown on screen)"
+            onChange={(e) => onContentChange({ text: e.target.value, title: e.target.value })}
+            style={{ ...inp, height: 60, resize: "vertical", fontSize: 14 }}
+          />
+        </Field>
+      )}
       <AssetPanel asset={asset} onRevert={onRevert} onApprove={onApprove} />
       <Field label="Start frame">
         <input
@@ -747,23 +830,6 @@ const Inspector: React.FC<{
         </button>
         <button style={{ ...miniBtn, color: "#e5544b" }} onClick={onDelete}>
           Delete
-        </button>
-      </div>
-      <div style={{ marginTop: 14 }}>
-        <div style={{ fontSize: 12, color: "#a0a0a9", marginBottom: 6 }}>SELECTIVE REGENERATION</div>
-        <textarea
-          value={instr}
-          onChange={(e) => setInstr(e.target.value)}
-          placeholder="How should this asset change? (id + approval preserved)"
-          style={{ ...inp, height: 52, resize: "vertical" }}
-        />
-        <button
-          style={{ ...miniBtn, marginTop: 6 }}
-          onClick={() => {
-            if (instr.trim()) onRegen(instr.trim());
-          }}
-        >
-          Queue regeneration
         </button>
       </div>
     </div>
@@ -847,35 +913,35 @@ const ValidationPanel: React.FC<{ result: ReturnType<typeof validateComposition>
   </div>
 );
 
-// Shown in place of a blank canvas when the timeline has no layers yet: an
-// intentional state card explaining the current production stage and what will
-// appear here — never a misleading empty "Rendering…" preview.
+// Shown in place of a blank canvas when the timeline has no layers yet. Its SINGLE
+// primary action is "Add first scene", wired to the SAME real add-layer flow as
+// the toolbar "+ Add layer" — a click actually creates a first layer/scene.
 const EmptyTimelineCard: React.FC<{
-  view: import("../composition/status").StatusView | null;
+  target: import("../composition/status").OverviewTarget | null;
   usedFixture: boolean;
-}> = ({ view, usedFixture }) => {
-  const stage = view?.current_stage_label ?? null;
-  const stageNo = view?.stage_number ?? null;
-  const target = view?.target;
+  onAddFirstScene: () => void;
+}> = ({ target, usedFixture, onAddFirstScene }) => {
   return (
     <div style={{ maxWidth: 560, textAlign: "center", padding: 28 }} data-testid="empty-timeline">
       <div style={{ fontSize: 42, marginBottom: 12, opacity: 0.5 }}>🎬</div>
       <div style={{ fontSize: 18, fontWeight: 650, color: "#ececef", marginBottom: 8 }}>
-        The timeline is empty
+        Your timeline is empty
       </div>
-      <div style={{ fontSize: 13.5, color: "#a0a0a9", lineHeight: 1.5, marginBottom: 14 }}>
-        {stage
-          ? `Production is at ${stageNo ? `stage ${stageNo} of 11 · ` : ""}${stage}. Hermes builds the timeline as it produces assets — scenes, narration and captions will appear here automatically.`
-          : "Hermes builds the timeline as it produces your video. Once it generates the first assets, scenes and layers will appear here."}
+      <div style={{ fontSize: 13.5, color: "#a0a0a9", lineHeight: 1.5, marginBottom: 16 }}>
+        This is a manual editor. Add your first scene to start building — then move,
+        trim, split, and layer scenes on the timeline, and render when you are ready.
       </div>
+      <button style={btnAccent} data-testid="add-first-scene" onClick={onAddFirstScene}>
+        + Add first scene
+      </button>
       {/* Truthful target duration — never the invented composer default. */}
-      <div style={{ fontSize: 12, color: "#8a93a3", fontFamily: "ui-monospace, monospace", marginBottom: 10 }} data-testid="empty-target">
-        {target?.available ? target.label : "Target duration pending"}
+      <div style={{ fontSize: 12, color: "#8a93a3", fontFamily: "ui-monospace, monospace", margin: "14px 0 6px" }} data-testid="empty-target">
+        {target?.available ? target.label : "Duration set after first scene"}
       </div>
       <div style={{ fontSize: 12, color: "#5f5f68" }}>
         {usedFixture
-          ? "Demo mode — no live production is running."
-          : "Nothing is rendering — the render button unlocks once there are layers to render."}
+          ? "Demo mode — sample data, no project on disk."
+          : "Nothing is rendering — the render button unlocks once there are scenes to render."}
       </div>
     </div>
   );
@@ -894,30 +960,54 @@ const Centered: React.FC<{ children: React.ReactNode }> = ({ children }) => (
   </div>
 );
 
+// Frames the title's spring entrance needs before it reaches a legible opacity —
+// so a post-create seek lands where the new scene is actually visible (the render
+// itself is unchanged and still starts at frame 0).
+const ENTRANCE_VISIBLE_FRAMES = 24;
+
 function addNewLayer(
   model: CanonicalComposition,
   apply: (fn: (c: CanonicalComposition) => CanonicalComposition) => void,
   setSelected: (id: string) => void,
-) {
+): number {
   const type: LayerType = "text";
   const id = makeId(`layer`, model.layers.length + 1 + model.totalFrames);
+  const isFirst = model.layers.length === 0;
+  // The FIRST scene spans the whole timeline so it is visible in the preview at
+  // any playhead (and reads as a legible block, not a 2-char sliver). Subsequent
+  // scenes get a sensible default chunk the user can move/resize.
+  const total = Math.max(1, model.totalFrames);
+  const durationFrames = isFirst ? total : Math.min(150, total);
   const layer: Layer = {
     id,
     type,
     trackId: trackKindForType(type),
     startFrame: 0,
-    durationFrames: Math.min(90, model.totalFrames),
+    durationFrames,
     z: (model.layers.reduce((m, l) => Math.max(m, l.z), 0) || 0) + 1,
     enabled: true,
     locked: false,
     opacity: 1,
-    text: "New layer",
+    // A visible, centered, high-contrast default the user edits in the Inspector.
+    text: "New scene",
   };
   apply((c) => addLayer(c, layer));
   setSelected(id);
+  // A representative visible frame INSIDE the new layer (bounded by its real
+  // effective duration) — where the title's entrance has faded fully in.
+  return Math.max(1, Math.min(ENTRANCE_VISIBLE_FRAMES, durationFrames - 1));
 }
 
 // ── styles ──
+const workspaceStrip: React.CSSProperties = {
+  display: "flex",
+  justifyContent: "space-between",
+  alignItems: "center",
+  gap: 12,
+  padding: "8px 14px",
+  borderBottom: "1px solid #232329",
+  background: "#0d0d10",
+};
 const header: React.CSSProperties = {
   display: "flex",
   justifyContent: "space-between",
@@ -936,6 +1026,22 @@ const rail: React.CSSProperties = {
   overflowY: "auto",
 };
 const railTitle: React.CSSProperties = { fontSize: 11, color: "#5f5f68", letterSpacing: "0.08em", marginBottom: 10 };
+const domainTag: React.CSSProperties = {
+  fontFamily: "ui-monospace, monospace",
+  fontSize: 9,
+  letterSpacing: "0.18em",
+  textTransform: "uppercase",
+  color: "#6aa1ff",
+  marginRight: 4,
+};
+const domainStrip: React.CSSProperties = {
+  display: "flex",
+  alignItems: "center",
+  gap: 8,
+  padding: "6px 12px",
+  borderBottom: "1px solid #232329",
+  background: "#0c0c0f",
+};
 const trackHeader: React.CSSProperties = {
   display: "flex",
   justifyContent: "space-between",

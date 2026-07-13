@@ -249,16 +249,44 @@ class TestPersistence:
 
 
 class TestBrainLogEvidenceIntegration:
+    # The adapter/FakeBrain is gone; seed a real run by driving the store's
+    # public API directly so the produced approval/correction events are genuine
+    # event-log evidence (the same surface BrainLogEvidence reads).
+    _PLAN = [
+        ("research", "web_research", "local", False),
+        ("proposal", "proposal_writer", "hermes", True),
+        ("script", "script_writer", "hermes", False),
+        ("scene_plan", "scene_planner", "hermes", False),
+        ("assets", "image_selector", "stub-image", False),
+    ]
+
     def _seed_run(self, tmp_path, *, reject=False, add_correction=False):
-        from lib.production_brain.adapter import FakeBrain
         from lib.production_brain.store import ProductionBrainStore
 
         d = tmp_path / "proj"
         d.mkdir()
         store = ProductionBrainStore(d, gen_id=lambda: "run_e")
-        FakeBrain().drive(store, requested_duration_seconds=60, run_id="run_e",
-                          approver=(lambda st: False) if reject else "auto",
-                          stop_after="assets" if add_correction else None)
+        state = store.start_provisioned(
+            provision=lambda rid: (f"sess-{rid}", f"job-{rid}", {"external": False},
+                                   "Production run started.", None),
+            run_id="run_e", requested_duration_seconds=60)
+        rid = state["run_id"]
+        stop_after = "assets" if add_correction else None
+        for stage, tool, provider, approval in self._PLAN:
+            store.enter_stage(stage, message=f"Working on {stage}.")
+            if tool:
+                store.tool_call(stage, tool, provider=provider, message=f"Calling {tool}")
+            if approval:
+                store.request_approval(stage, prompt="Approve the concept?")
+                if reject:
+                    store.reject_approval(rid, stage=stage, by="user")
+                    store.fail_run(rid, error=f"Approval rejected at {stage}.")
+                    break
+                store.grant_approval(rid, stage=stage, by="user")
+            store.complete_stage(stage, message=f"Completed {stage}.")
+            if stop_after and stage == stop_after:
+                break
+
         appr = None
         wanted = "approval_rejected" if reject else "approval_granted"
         for e in store.read_events_raw():

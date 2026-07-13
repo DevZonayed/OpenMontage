@@ -1,8 +1,15 @@
-"""Canonical /status endpoint + guided Hermes connection routes.
+"""Canonical /status endpoint — the read-only project OVERVIEW.
 
-Covers the single-view-model contract and the guarded connect flow. Uses the
-session-global in-memory keyring (root conftest) — never the OS keychain — and
-never hits a live orchestrator (connection probing is stubbed out where needed).
+OpenMontage is manual-first: there is NO autonomous production worker, NO agent
+connection, and NO production-run automation surface. This pins:
+
+  * GET /api/project/{id}/status returns the read-only overview (headline,
+    target, single ``open_studio`` action, NO ``connection`` block).
+  * The removed agent/brain automation routes now 404.
+  * The learned-Style preferences routes still work (they moved to
+    ``backlot.preferences_api``).
+
+Uses the session-global in-memory keyring (root conftest) — never the OS keychain.
 """
 
 from __future__ import annotations
@@ -13,24 +20,6 @@ import pytest
 from fastapi.testclient import TestClient
 
 from backlot import server as server_mod
-from backlot import status_api
-from lib.production_brain import connection as conn_mod
-from lib.production_brain.adapter import FakeBrain
-from lib.production_brain.store import ProductionBrainStore
-
-
-@pytest.fixture(autouse=True)
-def _no_conn_probe(monkeypatch):
-    """Default: Hermes not connected, no network probe (deterministic)."""
-    status_api._invalidate_conn_cache()
-    monkeypatch.setattr(
-        conn_mod, "connection_status",
-        lambda **kw: {"status": "needs_setup", "available": False,
-                      "headline": "Hermes isn't connected yet", "detail": "",
-                      "actions": [{"id": "connect_hermes", "label": "Connect Hermes"}],
-                      "token_configured": False, "endpoint": None})
-    yield
-    status_api._invalidate_conn_cache()
 
 
 @pytest.fixture
@@ -60,87 +49,141 @@ def _post(client, url, body=None):
 
 
 # --------------------------------------------------------------------------- #
-# /status shape + reconciliation
+# /status shape — read-only overview
 # --------------------------------------------------------------------------- #
-def test_status_new_project_not_started(client):
+def test_status_returns_project_overview(client):
     r = client.get("/api/project/the-electricity-bulb/status")
     assert r.status_code == 200
     v = r.json()
-    assert v["kind"] == "production_status_view"
-    assert v["stage_count"] == 11
-    assert len(v["stages"]) == 11
-    assert v["overall_state"] == "not_started"
-    assert isinstance(v["primary_action"], dict) and v["primary_action"]["id"]
-    assert v["stop_available"] is False
+    assert v["kind"] == "project_overview"
+    assert v["version"] == "2.0"
+    assert v["project_id"] == "the-electricity-bulb"
+    assert v["title"] == "The Electricity Bulb"
+    assert v["owner"] == "you"
+    assert v["primary_action"]["id"] == "open_studio"
+    assert isinstance(v["headline"], str) and v["headline"]
 
 
-def test_status_reflects_live_brain_run(client):
-    store = ProductionBrainStore(client._proj)
-    FakeBrain().drive(store, requested_duration_seconds=150, run_id="run1",
-                      approver=None)  # stop at first approval gate
+def test_status_has_no_connection_or_automation_surface(client):
     v = client.get("/api/project/the-electricity-bulb/status").json()
-    # fake driver → fixture mode, never "live"
-    assert v["is_live"] is False
-    assert v["overall_state"] in ("awaiting_approval", "producing")
-    assert v["run_id"] == "run1"
+    for forbidden in ("connection", "overall_state", "identity", "is_live",
+                      "stop_available"):
+        assert forbidden not in v
+    blob = json.dumps(v).lower()
+    assert "mochlet" not in blob
+    assert "hermes" not in blob
+
+
+def test_status_target_uses_intake_requested_duration(client):
+    # intake target_duration_seconds=150, no timeline yet → target 2:30 / 4500.
+    v = client.get("/api/project/the-electricity-bulb/status").json()
+    t = v["target"]
+    assert t["available"] is True
+    assert t["is_target"] is True
+    assert t["formatted"] == "2:30"
+    assert t["frames"] == 4500
 
 
 def test_status_render_not_renderable_without_layers(client):
     v = client.get("/api/project/the-electricity-bulb/status").json()
     assert v["render"]["renderable"] is False
     assert v["render"]["reason"]
+    assert v["render"]["active"] is False
 
 
 def test_status_demo_flag_only_when_requested(client):
-    store = ProductionBrainStore(client._proj)
-    FakeBrain().drive(store, requested_duration_seconds=150, run_id="run1", approver=None)
     plain = client.get("/api/project/the-electricity-bulb/status").json()
     assert plain["is_demo"] is False
     demo = client.get("/api/project/the-electricity-bulb/status?demo=1").json()
     assert demo["is_demo"] is True
 
 
-def test_status_includes_connection_block(client):
-    v = client.get("/api/project/the-electricity-bulb/status").json()
-    assert v["connection"]["status"] == "needs_setup"
-    assert v["connection"]["available"] is False
+def test_status_stale_flag_adds_diagnostic(client):
+    stale = client.get("/api/project/the-electricity-bulb/status?stale=1").json()
+    assert stale["stale"] is True
+    assert any(d["kind"] == "stale" for d in stale["diagnostics"])
 
 
 # --------------------------------------------------------------------------- #
-# Direct-API bypass: controls must stay guarded / fail-closed
+# The removed agent / brain automation routes are GONE (404)
 # --------------------------------------------------------------------------- #
-def test_brain_start_without_connection_fails_closed(client):
-    # No orchestrator connected → Start must 409, not fabricate a run.
-    r = _post(client, "/api/project/the-electricity-bulb/brain/start")
-    assert r.status_code == 409
+def test_legacy_agent_routes_are_gone(client):
+    assert client.get("/api/agent/connection").status_code == 404
+    assert _post(client, "/api/agent/connect", {}).status_code == 404
+    assert _post(client, "/api/agent/disconnect", {}).status_code == 404
 
 
-def test_hermes_connect_requires_csrf(client):
+def test_legacy_brain_routes_are_gone(client):
+    assert client.get("/api/project/the-electricity-bulb/brain").status_code == 404
+    assert _post(client, "/api/project/the-electricity-bulb/brain/start", {}).status_code == 404
+    assert _post(client, "/api/project/the-electricity-bulb/brain/cancel", {}).status_code == 404
+
+
+# --------------------------------------------------------------------------- #
+# Learned-Style preferences routes still work (backlot.preferences_api)
+# --------------------------------------------------------------------------- #
+def test_project_preferences_get(client):
+    r = client.get("/api/project/the-electricity-bulb/preferences")
+    assert r.status_code == 200
+    body = r.json()
+    assert "categories" in body
+    assert body["project"]["opted_out"] is False
+    assert body["project"]["preferences"] == []
+
+
+def test_global_preferences_get(client):
+    r = client.get("/api/preferences")
+    assert r.status_code == 200
+    body = r.json()
+    assert "categories" in body
+    assert "global" in body
+
+
+def test_project_preferences_opt_out_round_trip(client):
+    r = _post(client, "/api/project/the-electricity-bulb/preferences",
+              {"action": "opt_out", "scope": "project", "opted_out": True})
+    assert r.status_code == 200
+    after = client.get("/api/project/the-electricity-bulb/preferences").json()
+    assert after["project"]["opted_out"] is True
+
+
+def test_preferences_post_requires_csrf(client):
     # Cross-site POST without the CSRF header is rejected.
-    r = client.post("/api/hermes/connect", json={"url": "http://127.0.0.1:9235"})
+    r = client.post("/api/project/the-electricity-bulb/preferences",
+                    json={"action": "opt_out", "scope": "project"})
     assert r.status_code in (400, 403)
 
 
-def test_hermes_connect_rejects_bad_endpoint(client, monkeypatch):
-    # A non-loopback plain-HTTP endpoint is refused fail-closed (400).
-    r = _post(client, "/api/hermes/connect", {"url": "http://evil.example.com"})
-    assert r.status_code == 400
+# --------------------------------------------------------------------------- #
+# Board timeline truth — the overview reads the SAME saved timeline.json the
+# Studio does. One saved layer must never read as "no timeline".
+# --------------------------------------------------------------------------- #
+def test_status_reflects_a_saved_timeline_layer(client):
+    # Before saving a timeline: empty overview.
+    v0 = client.get("/api/project/the-electricity-bulb/status").json()
+    assert v0["has_timeline"] is False
+    assert v0["layer_count"] == 0
+    assert "Set up your first scene" in v0["headline"]
 
+    # Save a canonical timeline.json with exactly one text layer (as the Studio does).
+    tl = {
+        "fps": 30, "target_duration_seconds": 150, "total_frames": 4500,
+        "width": 1920, "height": 1080,
+        "layers": [{
+            "id": "layer_1", "type": "text", "trackId": "text",
+            "start_frame": 0, "duration_frames": 4500, "z": 1,
+            "enabled": True, "opacity": 1,
+            "text": "How Lightning Forms", "title": "How Lightning Forms",
+        }],
+    }
+    (client._proj / "timeline.json").write_text(json.dumps(tl))
 
-def test_hermes_connection_route(client):
-    r = client.get("/api/hermes/connection")
-    assert r.status_code == 200
-    assert r.json()["status"] == "needs_setup"
-
-
-def test_status_never_leaks_a_token(client, monkeypatch):
-    # Even with a token configured, the payload must not contain its value.
-    monkeypatch.setattr(
-        conn_mod, "connection_status",
-        lambda **kw: {"status": "connected", "available": True,
-                      "headline": "Connected to Hermes", "detail": "",
-                      "actions": [], "token_configured": True, "endpoint": "http://127.0.0.1:9235"})
-    status_api._invalidate_conn_cache()
-    v = client.get("/api/project/the-electricity-bulb/status").json()
-    assert "token" not in json.dumps(v).lower() or "token_configured" in json.dumps(v)
-    assert v["connection"]["available"] is True
+    v1 = client.get("/api/project/the-electricity-bulb/status").json()
+    assert v1["has_timeline"] is True
+    assert v1["layer_count"] == 1
+    assert "no timeline" not in v1["headline"].lower()
+    assert "set up your first scene" not in v1["headline"].lower()
+    assert "ready to edit" in v1["headline"].lower()
+    # truthful — no invented renders/assets from a text-only timeline
+    assert v1["outputs"]["render_count"] == 0
+    assert v1["render"]["renderable"] is True

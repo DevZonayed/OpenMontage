@@ -22,46 +22,24 @@
     </div>
     <span class="chip" id="edTarget">Remotion · live preview = final render</span>
     <div class="spacer"></div>
-    <a class="chip nav-chip" id="edClassic" href="#">Classic editor</a>
     <a class="chip nav-chip" id="edBoardLink" href="#">← BOARD</a>
   </header>
 
-  <!-- The real @remotion/player production studio mounts here. -->
+  <!-- The real @remotion/player manual editor mounts here. -->
   <div id="studio-root"></div>
-  <!-- Classic deterministic editor (fallback via ?classic=1). Legacy editor.js paints into #edBody. -->
-  <div id="edBody" style="display:none;padding:16px 24px 60px"></div>
 
   <script>
   (function () {
     // Parse project id from /p/<id>/editor
     var m = location.pathname.match(/\/p\/([^/]+)\/editor/);
     var projectId = m ? decodeURIComponent(m[1]) : "";
-    var classic = new URLSearchParams(location.search).get("classic") === "1";
-    // Wire the header links.
+    // Wire the header link back to the board.
     var boardLink = document.getElementById("edBoardLink");
     if (boardLink) boardLink.href = "/p/" + encodeURIComponent(projectId);
-    var classicLink = document.getElementById("edClassic");
-    if (classicLink) {
-      classicLink.href = classic
-        ? "/p/" + encodeURIComponent(projectId) + "/editor"
-        : "/p/" + encodeURIComponent(projectId) + "/editor?classic=1";
-      classicLink.textContent = classic ? "Studio" : "Classic editor";
-    }
 
-    if (classic) {
-      // Load the legacy deterministic editor into the fallback container.
-      document.getElementById("studio-root").style.display = "none";
-      document.getElementById("edBody").style.display = "block";
-      var s = document.createElement("script");
-      s.type = "module";
-      s.src = "/ui/editor.js?v=film-render-1";
-      document.body.appendChild(s);
-      return;
-    }
-
-    // Default: the real Remotion production studio.
+    // The Remotion manual editor (the only editor surface).
     var bundle = document.createElement("script");
-    bundle.src = "/ui/studio.bundle.js?v=3bca361fe0d2";
+    bundle.src = "/ui/studio.bundle.js?v=cec88d2f4e99";
     bundle.onload = function () {
       if (window.BacklotStudio && window.BacklotStudio.mount) {
         window.BacklotStudio.mount(document.getElementById("studio-root"), {
