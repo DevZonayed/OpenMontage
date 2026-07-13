@@ -231,8 +231,9 @@ def build_status_view(
 
     # Plain-language, manual headline + guidance — never an automation claim.
     if layers > 0:
-        headline = f"{layers} scene{'s' if layers != 1 else ''} on the timeline"
-        guidance = "Open the Studio to keep editing, preview, and render."
+        headline = f"{layers} scene{'s' if layers != 1 else ''} ready to edit"
+        guidance = ("Open Production Studio to continue editing, preview, and render "
+                    f"— {layers} scene{'s' if layers != 1 else ''} on the timeline.")
     elif milestones:
         headline = "Ready to edit"
         guidance = ("Planning notes exist for this project — open the Studio to "

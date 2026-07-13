@@ -249,7 +249,18 @@ export const StudioApp: React.FC<StudioAppProps> = ({ client }) => {
   const step = useCallback((delta: number) => seek(frame + delta), [frame, seek]);
 
   const addFirstScene = useCallback(() => {
-    if (model) addNewLayer(model, apply, setSelected);
+    if (!model) return;
+    const visibleFrame = addNewLayer(model, apply, setSelected);
+    // The Player only mounts once a layer exists; defer the seek two frames so the
+    // just-created title lands on a frame where its entrance is fully visible
+    // (creation never looks blank). The final render is untouched (starts at 0).
+    const raf = typeof window !== "undefined" ? window.requestAnimationFrame : null;
+    const run = () => {
+      playerRef.current?.seekTo(visibleFrame);
+      setFrame(visibleFrame);
+    };
+    if (raf) raf(() => raf(run));
+    else setTimeout(run, 32);
   }, [model, apply]);
 
   // ── keyboard access ──
@@ -949,11 +960,16 @@ const Centered: React.FC<{ children: React.ReactNode }> = ({ children }) => (
   </div>
 );
 
+// Frames the title's spring entrance needs before it reaches a legible opacity —
+// so a post-create seek lands where the new scene is actually visible (the render
+// itself is unchanged and still starts at frame 0).
+const ENTRANCE_VISIBLE_FRAMES = 24;
+
 function addNewLayer(
   model: CanonicalComposition,
   apply: (fn: (c: CanonicalComposition) => CanonicalComposition) => void,
   setSelected: (id: string) => void,
-) {
+): number {
   const type: LayerType = "text";
   const id = makeId(`layer`, model.layers.length + 1 + model.totalFrames);
   const isFirst = model.layers.length === 0;
@@ -977,6 +993,9 @@ function addNewLayer(
   };
   apply((c) => addLayer(c, layer));
   setSelected(id);
+  // A representative visible frame INSIDE the new layer (bounded by its real
+  // effective duration) — where the title's entrance has faded fully in.
+  return Math.max(1, Math.min(ENTRANCE_VISIBLE_FRAMES, durationFrames - 1));
 }
 
 // ── styles ──

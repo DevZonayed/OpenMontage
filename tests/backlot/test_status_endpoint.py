@@ -152,3 +152,38 @@ def test_preferences_post_requires_csrf(client):
     r = client.post("/api/project/the-electricity-bulb/preferences",
                     json={"action": "opt_out", "scope": "project"})
     assert r.status_code in (400, 403)
+
+
+# --------------------------------------------------------------------------- #
+# Board timeline truth — the overview reads the SAME saved timeline.json the
+# Studio does. One saved layer must never read as "no timeline".
+# --------------------------------------------------------------------------- #
+def test_status_reflects_a_saved_timeline_layer(client):
+    # Before saving a timeline: empty overview.
+    v0 = client.get("/api/project/the-electricity-bulb/status").json()
+    assert v0["has_timeline"] is False
+    assert v0["layer_count"] == 0
+    assert "Set up your first scene" in v0["headline"]
+
+    # Save a canonical timeline.json with exactly one text layer (as the Studio does).
+    tl = {
+        "fps": 30, "target_duration_seconds": 150, "total_frames": 4500,
+        "width": 1920, "height": 1080,
+        "layers": [{
+            "id": "layer_1", "type": "text", "trackId": "text",
+            "start_frame": 0, "duration_frames": 4500, "z": 1,
+            "enabled": True, "opacity": 1,
+            "text": "How Lightning Forms", "title": "How Lightning Forms",
+        }],
+    }
+    (client._proj / "timeline.json").write_text(json.dumps(tl))
+
+    v1 = client.get("/api/project/the-electricity-bulb/status").json()
+    assert v1["has_timeline"] is True
+    assert v1["layer_count"] == 1
+    assert "no timeline" not in v1["headline"].lower()
+    assert "set up your first scene" not in v1["headline"].lower()
+    assert "ready to edit" in v1["headline"].lower()
+    # truthful — no invented renders/assets from a text-only timeline
+    assert v1["outputs"]["render_count"] == 0
+    assert v1["render"]["renderable"] is True

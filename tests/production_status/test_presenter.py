@@ -105,9 +105,9 @@ def test_headline_ready_to_edit_when_milestones_but_no_layers():
 
 def test_headline_counts_scenes_when_layers_exist():
     v1 = build_status_view(timeline={"layer_count": 1})
-    assert v1["headline"] == "1 scene on the timeline"
+    assert v1["headline"] == "1 scene ready to edit"
     v3 = build_status_view(timeline={"layers": [{"id": "a"}, {"id": "b"}, {"id": "c"}]})
-    assert v3["headline"] == "3 scenes on the timeline"
+    assert v3["headline"] == "3 scenes ready to edit"
     assert v3["has_timeline"] is True
     assert v3["layer_count"] == 3
 
@@ -279,4 +279,4 @@ def test_stale_flag_adds_diagnostic_and_preserves_view():
     v = build_status_view(timeline={"layer_count": 2}, stale=True)
     assert v["stale"] is True
     assert any(d["kind"] == "stale" for d in v["diagnostics"])
-    assert v["headline"] == "2 scenes on the timeline"  # state preserved
+    assert v["headline"] == "2 scenes ready to edit"  # state preserved

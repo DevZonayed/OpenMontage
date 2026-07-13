@@ -182,6 +182,20 @@ describe("manual-first Studio — empty project", () => {
       .toMatch(/1 scene on the timeline/i);
   });
 
+  it("seeks the preview to a visible frame after add (creation never looks blank)", async () => {
+    const container = mount();
+    await settle(container, "Add first scene");
+    (container.querySelector('[data-testid="add-first-scene"]') as HTMLButtonElement).click();
+    await settle(container, "+ Add layer");
+    // The playhead advanced off frame 0 (where the title entrance opacity is 0) to
+    // a representative visible frame inside the new layer.
+    await new Promise((r) => setTimeout(r, 80)); // let the deferred rAF seek run
+    const readout = container.querySelector('[data-testid="scrub-readout"]')?.textContent || "";
+    const m = readout.match(/f(\d+)\//);
+    expect(m).toBeTruthy();
+    expect(Number(m![1])).toBeGreaterThan(0);
+  });
+
   it("the first scene is real, visible content and editable in the Inspector", async () => {
     const container = mount();
     await settle(container, "Add first scene");

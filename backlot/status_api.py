@@ -30,7 +30,10 @@ def _safe(fn: Callable[[], Any], default: Any) -> Any:
 
 def _load_timeline_lite(project_dir: Path) -> Optional[dict]:
     def _load():
-        from lib.timeline import load_or_build_timeline
+        # The SAME canonical source the Studio reads (backlot.timeline_api), so the
+        # Board's overview reflects the saved timeline.json exactly — one saved layer
+        # must never read as "no timeline".
+        from backlot.timeline_api import load_or_build_timeline
 
         tl, _tag = load_or_build_timeline(project_dir)
         return tl
