@@ -6,7 +6,7 @@
 
 import React, { useCallback, useEffect, useState } from "react";
 import { BacklotClient } from "../composition/client";
-import { prefId, PreferencesPayload, StylePreference } from "../composition/brain";
+import { prefId, PreferencesPayload, StylePreference } from "../composition/preferences";
 
 const C = {
   border: "#232329",

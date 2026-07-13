@@ -84,8 +84,38 @@ def test_agent_and_adapter_modules_are_gone():
                  "lib/production_brain/orchestrator.py",
                  "lib/production_brain/adapter.py",
                  "backlot/brain_api.py",
-                 "remotion-composer/src/studio/AgentPanel.tsx"):
+                 # Production-run automation subsystem (start/stop/preview/queue).
+                 "lib/production_run.py",
+                 "lib/production_worker.py",
+                 "lib/preview_render.py",
+                 "lib/agent_inbox.py",
+                 # Legacy classic editor with agent/replan copy + its Hermes brain fixture.
+                 "backlot/ui/editor.js",
+                 "remotion-composer/src/composition/brain.ts",
+                 "remotion-composer/src/studio/AgentPanel.tsx",
+                 "remotion-composer/src/studio/CommandCenter.tsx",
+                 "remotion-composer/src/studio/ProductionInspector.tsx",
+                 "remotion-composer/src/studio/useStatusView.tsx"):
         assert not (REPO_ROOT / gone).exists(), f"{gone} must be deleted"
+
+
+def test_no_production_run_lifecycle_routes():
+    """server.py must expose no start/stop/preview production-run automation routes
+    and no agent-inbox route — OpenMontage is manual-first."""
+    server = (REPO_ROOT / "backlot" / "server.py").read_text(encoding="utf-8")
+    for banned in ('/run/preview', '/run/cancel', '/run/approve', '/agent-inbox',
+                   'agent_inbox', 'production_worker', 'preview_render',
+                   'import start_run', 'import cancel_run'):
+        assert banned not in server, f"server.py must not reference {banned!r}"
+    # No `POST /api/project/{id}/run` (the run-start route).
+    assert 'project_id}/run"' not in server, "server.py must not expose a run-start route"
+
+
+def test_no_classic_editor_agent_surface():
+    """The classic editor (agent/replan copy) must be unreachable."""
+    editor_html = (REPO_ROOT / "backlot" / "ui" / "editor.html").read_text(encoding="utf-8")
+    for banned in ("classic=1", "editor.js", "Classic editor"):
+        assert banned not in editor_html, f"editor.html must not reference {banned!r}"
 
 
 def test_status_view_has_no_connection_or_worker_inference():

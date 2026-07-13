@@ -16,7 +16,7 @@
 
 import { BackendTimelineDoc, BackendTimelinePayload } from "./adapter";
 import { deterministicTimelinePayload } from "./fixtures";
-import { PreferencesPayload } from "./brain";
+import { PreferencesPayload } from "./preferences";
 import { ProjectOverview, deterministicOverview } from "./status";
 
 export type FetchLike = (

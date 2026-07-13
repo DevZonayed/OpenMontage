@@ -63,9 +63,7 @@ _RATE_LIMITS = {
     "projects": (12, 10.0),
     "runtime": (6, 60.0),  # runtime install/repair/verify are expensive + rare
     "timeline": (30, 10.0),  # editor saves — frequent but bounded
-    "run": (10, 60.0),       # start/cancel a production run — spawns a worker
     "render": (12, 60.0),    # single-frame stills — a subprocess each, but scrub-and-render is interactive
-    "inbox": (40, 10.0),     # agent-queue READ polled ~every 2s by the board — own bucket, never drains 'projects'
     "preferences": (30, 10.0),  # learned-style read/update/reset — user-driven, infrequent
 }
 _RATE_MAX_KEYS = 4096  # hard cap on tracked buckets (memory bound)
@@ -474,16 +472,6 @@ def create_app(*, render_base_url: Optional[str] = None) -> FastAPI:
             raise HTTPException(status_code=400, detail=res.get("reason") or "Timeline render failed.")
         return res
 
-    @app.get("/api/project/{project_id}/agent-inbox")
-    async def project_agent_inbox(project_id: str, request: Request) -> dict:
-        """Read-only: everything currently queued for the agent (or awaiting the
-        user) — queued layer regenerations, a pending duration re-plan, and the
-        run approval state. Honest visibility, no generation (Rule Zero)."""
-        from lib.agent_inbox import pending_agent_work
-        project_dir = _safe_project_dir(project_id)
-        _enforce_rate(request, "inbox")
-        return await asyncio.to_thread(pending_agent_work, project_dir)
-
     @app.post("/api/project/{project_id}/timeline/revision")
     async def project_layer_revision(project_id: str, request: Request) -> dict:
         """Queue an honest AI-regeneration request for ONE layer (agent-driven).
@@ -539,77 +527,6 @@ def create_app(*, render_base_url: Optional[str] = None) -> FastAPI:
             raise HTTPException(status_code=getattr(exc, "status", 400), detail=str(exc))
 
     # ---- Production run lifecycle (real bounded free preflight/planning worker) --
-
-    @app.get("/api/project/{project_id}/run")
-    async def project_run_get(project_id: str) -> dict:
-        """Reconciled production-run state + the free preflight plan (run_plan.json)."""
-        from lib.production_run import get_run, read_plan
-        project_dir = _safe_project_dir(project_id)
-
-        def _payload():
-            run = get_run(project_dir)
-            run["plan"] = read_plan(project_dir)
-            return run
-        return await asyncio.to_thread(_payload)
-
-    @app.post("/api/project/{project_id}/run/approve")
-    async def project_run_approve(project_id: str, request: Request) -> dict:
-        """Record human approval of the preflight plan (does NOT auto-generate)."""
-        from lib.production_run import RunError, approve_plan
-        project_dir = _safe_project_dir(project_id)
-        body = await _guarded_json_body(request)
-        _enforce_rate(request, "run")
-        run_id = body.get("run_id")
-        if not isinstance(run_id, str) or not run_id:
-            raise HTTPException(status_code=400, detail="run_id is required")
-        try:
-            return await asyncio.to_thread(approve_plan, project_dir, run_id)
-        except RunError as exc:
-            raise HTTPException(status_code=getattr(exc, "status", 400), detail=str(exc))
-
-    @app.post("/api/project/{project_id}/run")
-    async def project_run_start(project_id: str, request: Request) -> dict:
-        """Start a real production run (idempotent — returns the active run if one
-        is already in progress). Spawns a fixed argv-only worker."""
-        from lib.production_run import RunError, start_run
-        from lib.project_intake import read_intake
-        project_dir = _safe_project_dir(project_id)
-        await _guarded_json_body(request)
-        _enforce_rate(request, "run")
-        intake = await asyncio.to_thread(read_intake, project_dir)
-        target = (intake or {}).get("target_duration_seconds")
-        try:
-            return await asyncio.to_thread(
-                start_run, project_dir, project_id, target_duration_seconds=target)
-        except RunError as exc:
-            raise HTTPException(status_code=getattr(exc, "status", 400), detail=str(exc))
-
-    @app.post("/api/project/{project_id}/run/preview")
-    async def project_run_preview(project_id: str, request: Request) -> dict:
-        """Render a FREE Remotion preview animatic of the plan (no paid media)."""
-        from lib.preview_render import generate_and_record
-        project_dir = _safe_project_dir(project_id)
-        await _guarded_json_body(request)
-        _enforce_rate(request, "run")
-        res = await asyncio.to_thread(generate_and_record, project_dir)
-        if not res.get("ok"):
-            raise HTTPException(status_code=400, detail=res.get("reason") or "Preview render failed.")
-        return res
-
-    @app.post("/api/project/{project_id}/run/cancel")
-    async def project_run_cancel(project_id: str, request: Request) -> dict:
-        """Cancel the EXACT active run (by run_id) — stops only that worker."""
-        from lib.production_run import RunError, cancel_run
-        project_dir = _safe_project_dir(project_id)
-        body = await _guarded_json_body(request)
-        _enforce_rate(request, "run")
-        run_id = body.get("run_id")
-        if not isinstance(run_id, str) or not run_id:
-            raise HTTPException(status_code=400, detail="run_id is required")
-        try:
-            return await asyncio.to_thread(cancel_run, project_dir, run_id)
-        except RunError as exc:
-            raise HTTPException(status_code=getattr(exc, "status", 400), detail=str(exc))
 
     # ---- Read-only project overview (the Board's single view model) ----------
     # OpenMontage is manual-first: no autonomous worker. This folds the on-disk
