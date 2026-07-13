@@ -10,6 +10,7 @@
 // and a scrubber that advances against the target.
 
 import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
+import { spring } from "remotion";
 import fs from "node:fs";
 import path from "node:path";
 import vm from "node:vm";
@@ -157,5 +158,23 @@ describe("shipped studio.bundle.js — manual-first editor, no automation leakag
     await settle(container, "+ Add layer");
     expect(container.querySelector('[data-testid="empty-timeline"]')).toBeNull();
     expect(container.querySelector('[data-testid="tl-add-layer"]')).toBeTruthy();
+  });
+
+  it("post-create seeks the preview to a visibly-legible frame (not blank at 0)", async () => {
+    const container = mountBundle();
+    await settle(container, "Add first scene");
+    (container.querySelector('[data-testid="add-first-scene"]') as HTMLButtonElement).click();
+    await settle(container, "+ Add layer");
+    await new Promise((r) => setTimeout(r, 120)); // deferred rAF seek
+    const readout = container.querySelector('[data-testid="scrub-readout"]')?.textContent || "";
+    const m = readout.match(/f(\d+)\//);
+    expect(m).toBeTruthy();
+    const seekedFrame = Number(m![1]);
+    expect(seekedFrame).toBeGreaterThan(0); // playhead advanced off frame 0
+    // The title's entrance (spring, damping 200 — same as the composition) is
+    // transparent at frame 0 and legibly visible at the seek target.
+    const entranceOpacity = (f: number) => spring({ frame: f, fps: 30, config: { damping: 200 } });
+    expect(entranceOpacity(0)).toBeLessThan(0.05);
+    expect(entranceOpacity(seekedFrame)).toBeGreaterThan(0.5);
   });
 });

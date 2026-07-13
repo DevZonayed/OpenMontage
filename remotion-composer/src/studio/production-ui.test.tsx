@@ -14,6 +14,7 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
 import React from "react";
 import { createRoot } from "react-dom/client";
+import { spring } from "remotion";
 import { StudioApp } from "./StudioApp";
 import { BacklotClient, FetchLike } from "../composition/client";
 
@@ -79,6 +80,14 @@ function mount(): HTMLElement {
   document.body.appendChild(container);
   createRoot(container).render(React.createElement(StudioApp, { client }));
   return container;
+}
+
+// The title's on-screen entrance opacity at a given frame — the SAME envelope the
+// composition renders (TimelineComposition.useEnvelope → spring, damping 200). Used
+// to assert the post-add seek lands on a legibly-visible frame while frame 0 is
+// blank, deterministically (jsdom's Player cannot rasterize a seeked frame).
+export function entranceOpacity(frame: number, fps = 30): number {
+  return spring({ frame, fps, config: { damping: 200 } });
 }
 
 // No agent / Hermes / Mochlet / automation surface may ever leak into the editor.
@@ -187,13 +196,19 @@ describe("manual-first Studio — empty project", () => {
     await settle(container, "Add first scene");
     (container.querySelector('[data-testid="add-first-scene"]') as HTMLButtonElement).click();
     await settle(container, "+ Add layer");
-    // The playhead advanced off frame 0 (where the title entrance opacity is 0) to
-    // a representative visible frame inside the new layer.
-    await new Promise((r) => setTimeout(r, 80)); // let the deferred rAF seek run
+    // The playhead advanced off frame 0 to a representative frame inside the layer.
+    await new Promise((r) => setTimeout(r, 120)); // let the deferred rAF seek run
     const readout = container.querySelector('[data-testid="scrub-readout"]')?.textContent || "";
     const m = readout.match(/f(\d+)\//);
     expect(m).toBeTruthy();
-    expect(Number(m![1])).toBeGreaterThan(0);
+    const seekedFrame = Number(m![1]);
+    expect(seekedFrame).toBeGreaterThan(0);
+    // AND that frame is one where the title's entrance is legibly VISIBLE — while
+    // frame 0 (the blank-preview bug) is fully transparent. Uses the SAME entrance
+    // math the composition renders (jsdom's Player can't rasterize a seeked frame,
+    // so we assert the real opacity envelope rather than a hidden DOM text node).
+    expect(entranceOpacity(0)).toBeLessThan(0.05); // frame 0 is blank
+    expect(entranceOpacity(seekedFrame)).toBeGreaterThan(0.5); // the seek target is visible
   });
 
   it("the first scene is real, visible content and editable in the Inspector", async () => {

@@ -176,15 +176,18 @@ def _target_block(*, timeline: Optional[dict], requested_duration_seconds) -> di
     A pending target is ``available: False`` with the guidance label — we never
     present the composer's internal minimum (e.g. 60s / 1800 frames) as the user's
     chosen duration."""
-    fps = _TARGET_FPS
     layers = _timeline_layers(timeline)
     tl = timeline or {}
+    # A saved timeline carries its OWN fps — use it so the Board's frame metadata
+    # never drifts from the Studio's saved timeline.json (non-30fps timelines).
+    tl_fps = tl.get("fps")
+    fps = int(tl_fps) if isinstance(tl_fps, (int, float)) and tl_fps > 0 else _TARGET_FPS
     if layers > 0 and tl.get("target_duration_seconds"):
         return _target(tl["target_duration_seconds"], fps, "timeline", is_target=False)
     if requested_duration_seconds:
-        return _target(requested_duration_seconds, fps, "requested", is_target=True)
+        return _target(requested_duration_seconds, _TARGET_FPS, "requested", is_target=True)
     return {"available": False, "duration_seconds": None, "formatted": None,
-            "frames": None, "fps": fps, "source": "pending", "is_target": True,
+            "frames": None, "fps": _TARGET_FPS, "source": "pending", "is_target": True,
             "label": "Duration set after first scene"}
 
 

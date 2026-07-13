@@ -280,3 +280,14 @@ def test_stale_flag_adds_diagnostic_and_preserves_view():
     assert v["stale"] is True
     assert any(d["kind"] == "stale" for d in v["diagnostics"])
     assert v["headline"] == "2 scenes ready to edit"  # state preserved
+
+
+def test_target_uses_the_saved_timeline_fps_not_a_hardcoded_30():
+    """A saved 24fps timeline must drive the Board's frame metadata (no drift from
+    the Studio's saved timeline.json)."""
+    tl = {"fps": 24, "target_duration_seconds": 10, "total_frames": 240,
+          "layers": [{"id": "l1", "type": "text", "start_frame": 0, "duration_frames": 240}]}
+    v = build_status_view(project={"id": "p"}, timeline=tl)
+    assert v["target"]["fps"] == 24
+    assert v["target"]["frames"] == 240          # 10s * 24fps, NOT 300
+    assert v["has_timeline"] is True
