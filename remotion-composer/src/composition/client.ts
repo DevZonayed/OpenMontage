@@ -9,23 +9,15 @@
 //   known live state and show a "reconnecting" indicator, never silently replace
 //   real state with fabricated data. Mutations never succeed against fixtures.
 //
-// This is a small ADAPTER over the Backlot HTTP contract. It does not implement
-// any backend state machine; it only speaks the documented contract.
+// This is a small ADAPTER over the Backlot HTTP contract. The Studio is a
+// MANUAL-FIRST editor: this client speaks only the timeline/render/overview/
+// preferences contract. There is NO agent connection and NO run/brain
+// automation — those endpoints were removed with the Hermes/agent concept.
 
 import { BackendTimelineDoc, BackendTimelinePayload } from "./adapter";
 import { deterministicTimelinePayload } from "./fixtures";
-import {
-  BrainAssetsPayload,
-  BrainEventsPage,
-  BrainState,
-  deterministicBrainState,
-  PreferencesPayload,
-} from "./brain";
-import {
-  AgentConnection,
-  StatusView,
-  deterministicStatusView,
-} from "./status";
+import { PreferencesPayload } from "./brain";
+import { ProjectOverview, deterministicOverview } from "./status";
 
 export type FetchLike = (
   input: string,
@@ -138,27 +130,18 @@ export class BacklotClient {
     return p;
   }
 
-  // The canonical, reconciled command-center view (shared with the board).
-  async getStatus(): Promise<StatusView> {
+  // The read-only project overview (shared with the board): a truthful duration,
+  // a guidance line, milestones and outputs. Never an automation controller.
+  async getStatus(): Promise<ProjectOverview> {
     if (this.forceFixtures) {
       this.usedFixture = true;
-      return deterministicStatusView(this.projectId);
+      return deterministicOverview(this.projectId);
     }
-    const v = await this.getJSON<StatusView>(
+    const v = await this.getJSON<ProjectOverview>(
       `/api/project/${this.projectId}/status`,
     );
     this.usedFixture = false;
     return v;
-  }
-
-  async getState(): Promise<Record<string, unknown>> {
-    return this.demoOrGet(`/api/project/${this.projectId}/state`, {});
-  }
-  async getRun(): Promise<Record<string, unknown>> {
-    return this.demoOrGet(`/api/project/${this.projectId}/run`, { state: "not_started" });
-  }
-  async getAgentInbox(): Promise<Record<string, unknown>> {
-    return this.demoOrGet(`/api/project/${this.projectId}/agent-inbox`, { items: [] });
   }
 
   // In demo mode return the neutral placeholder; otherwise a real GET that
@@ -208,135 +191,7 @@ export class BacklotClient {
     });
   }
 
-  async setDuration(seconds: number, strategy?: string): Promise<Record<string, unknown>> {
-    this.assertOnline("change duration");
-    return this.postJSON(`/api/project/${this.projectId}/duration`, {
-      duration: seconds,
-      strategy,
-    });
-  }
-
-  // ── Production brain (Hermes) ──
-  // Demo mode → labelled fixture. Otherwise a real GET that THROWS on failure.
-  async getBrain(): Promise<BrainState> {
-    if (this.forceFixtures) {
-      this.usedFixture = true;
-      return deterministicBrainState(this.projectId);
-    }
-    const s = await this.getJSON<BrainState>(`/api/project/${this.projectId}/brain`);
-    this.usedFixture = false;
-    return s;
-  }
-
-  async getBrainEvents(after = 0, limit = 200): Promise<BrainEventsPage> {
-    const empty: BrainEventsPage = {
-      events: [],
-      cursor: after,
-      next_cursor: after,
-      latest_seq: 0,
-      count: 0,
-      has_more: false,
-    };
-    return this.demoOrGet(
-      `/api/project/${this.projectId}/brain/events?after=${after}&limit=${limit}`,
-      empty,
-    );
-  }
-
-  async getBrainAssets(): Promise<BrainAssetsPayload> {
-    return this.demoOrGet(`/api/project/${this.projectId}/brain/assets`, {
-      outputs: [],
-      count: 0,
-      run_id: null,
-      actual_duration_seconds: null,
-    });
-  }
-
-  // ── Native Hermes Agent connection (auto-detected; NO endpoint/token/project) ──
-  // The agent is discovered on this machine — there are no credential fields. The
-  // studio renders connect / disconnect / re-check purely from `status`+`available`.
-  async getAgentConnection(): Promise<AgentConnection> {
-    if (this.forceFixtures) {
-      this.usedFixture = true;
-      return deterministicStatusView(this.projectId).connection;
-    }
-    return this.getJSON<AgentConnection>(`/api/agent/connection`);
-  }
-  async connectAgent(): Promise<AgentConnection> {
-    this.assertOnline("connect the Hermes Agent");
-    return this.postJSON<AgentConnection>(`/api/agent/connect`, {});
-  }
-  async disconnectAgent(): Promise<AgentConnection> {
-    this.assertOnline("disconnect the Hermes Agent");
-    return this.postJSON<AgentConnection>(`/api/agent/disconnect`, {});
-  }
-
-  // ── Coarse preflight/planning run control (the plan-approval gate) ──
-  async approvePlan(runId: string): Promise<Record<string, unknown>> {
-    this.assertOnline("approve the plan");
-    return this.postJSON(`/api/project/${this.projectId}/run/approve`, { run_id: runId });
-  }
-  async cancelCoarseRun(runId: string): Promise<Record<string, unknown>> {
-    this.assertOnline("stop the run");
-    return this.postJSON(`/api/project/${this.projectId}/run/cancel`, { run_id: runId });
-  }
-  async previewRun(): Promise<Record<string, unknown>> {
-    this.assertOnline("render a preview");
-    return this.postJSON(`/api/project/${this.projectId}/run/preview`, {});
-  }
-
-  // ── Brain control (CSRF; never faked). `run_id`/`job_id` are sent verbatim. ──
-  async startRun(): Promise<BrainState> {
-    this.assertOnline("start a production run");
-    return this.postJSON<BrainState>(`/api/project/${this.projectId}/brain/start`, {});
-  }
-  async approveRun(
-    runId: string,
-    opts: { approvalId?: string; stage?: string; note?: string } = {},
-  ): Promise<BrainState> {
-    this.assertOnline("approve");
-    return this.postJSON<BrainState>(`/api/project/${this.projectId}/brain/approve`, {
-      run_id: runId,
-      approval_id: opts.approvalId,
-      stage: opts.stage,
-      note: opts.note,
-    });
-  }
-  async rejectRun(
-    runId: string,
-    opts: { approvalId?: string; stage?: string; note?: string } = {},
-  ): Promise<BrainState> {
-    this.assertOnline("reject");
-    return this.postJSON<BrainState>(`/api/project/${this.projectId}/brain/reject`, {
-      run_id: runId,
-      approval_id: opts.approvalId,
-      stage: opts.stage,
-      note: opts.note,
-    });
-  }
-  async cancelRun(runId: string): Promise<BrainState> {
-    this.assertOnline("cancel the run");
-    return this.postJSON<BrainState>(`/api/project/${this.projectId}/brain/cancel`, {
-      run_id: runId,
-    });
-  }
-  async retryStage(stage: string, runId?: string | null, jobId?: string | null): Promise<BrainState> {
-    this.assertOnline("retry a stage");
-    return this.postJSON<BrainState>(`/api/project/${this.projectId}/brain/retry`, {
-      stage,
-      run_id: runId ?? undefined,
-      job_id: jobId ?? undefined,
-    });
-  }
-  async resumeRun(runId?: string | null, jobId?: string | null): Promise<BrainState> {
-    this.assertOnline("resume the run");
-    return this.postJSON<BrainState>(`/api/project/${this.projectId}/brain/resume`, {
-      run_id: runId ?? undefined,
-      job_id: jobId ?? undefined,
-    });
-  }
-
-  // ── Preferences / learning ──
+  // ── Preferences / learning (Style panel) ──
   async getPreferences(scope: "all" | "global" | "project" = "all", category?: string): Promise<PreferencesPayload> {
     const q = category ? `?scope=${scope}&category=${encodeURIComponent(category)}` : `?scope=${scope}`;
     return this.demoOrGet(`/api/project/${this.projectId}/preferences${q}`, {

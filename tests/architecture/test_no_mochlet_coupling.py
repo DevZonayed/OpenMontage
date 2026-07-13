@@ -1,12 +1,10 @@
-"""Architecture guard: OpenMontage's runtime + UI must have ZERO Mochlet coupling.
+"""Architecture guard: OpenMontage is a manual-first editor with ZERO agent coupling.
 
-Mochlet is (at most) Hermes's private, internal orchestrator. OpenMontage is
-operated natively by the **Hermes Agent** through its ACP stdio surface. No
-OpenMontage runtime module or user-facing surface may reference a Mochlet
-endpoint, token, project, or job, nor call the Mochlet MCP tools
-(``sendChat``/``runJob``/…), nor expose an endpoint/token/project connect UX.
-
-This test fails loudly if any regression re-introduces that coupling.
+There is no Mochlet, and no user-facing/runtime "Hermes"/agent connection concept:
+no Mochlet endpoint/port/MCP tools, no ``/api/hermes`` or ``/api/agent`` routes, no
+"Connect Hermes" / "Hermes Agent" / ``AgentPanel`` in runtime or UI source. The
+Board is a read-only overview whose single dominant action is "Open Production
+Studio"; the Studio is a manual editor. This test fails loudly on any regression.
 """
 
 from __future__ import annotations
@@ -26,18 +24,21 @@ SCAN_DIRS = [
 
 SCAN_SUFFIXES = {".py", ".js", ".ts", ".tsx", ".jsx", ".html", ".css"}
 
-# Substrings/patterns that must never appear in runtime or UI source.
+# Patterns that must never appear in runtime or UI source.
 FORBIDDEN = [
-    (re.compile(r"mochlet", re.IGNORECASE), "Mochlet reference"),
+    (re.compile(r"mochlet", re.IGNORECASE), "a Mochlet reference"),
     (re.compile(r"\b9235\b"), "the Mochlet MCP port 9235"),
     (re.compile(r"sendChat"), "the Mochlet 'sendChat' MCP tool"),
     (re.compile(r"runJob"), "the Mochlet 'runJob' MCP tool"),
     (re.compile(r"listJobPage"), "the Mochlet 'listJobPage' MCP tool"),
-    (re.compile(r"continueSession"), "the Mochlet 'continueSession' MCP tool"),
     (re.compile(r"listProjects"), "the Mochlet 'listProjects' MCP tool"),
     (re.compile(r"/api/hermes/"), "a removed /api/hermes/* route"),
+    (re.compile(r"/api/agent/"), "a removed /api/agent/* route"),
+    (re.compile(r"Connect Hermes", re.IGNORECASE), "a 'Connect Hermes' connection UX"),
+    (re.compile(r"Hermes Agent"), "a 'Hermes Agent' label"),
+    (re.compile(r"AgentPanel"), "the removed AgentPanel component"),
+    (re.compile(r"hermes_agent"), "the removed native Hermes adapter module"),
     (re.compile(r"hermes_connection\.json"), "the removed Mochlet connection config"),
-    (re.compile(r"hermes_jobs\.json"), "the removed Mochlet job store"),
     (re.compile(r"mcp_client"), "the removed Mochlet MCP client module"),
     (re.compile(r"MochletProject"), "a Mochlet project type"),
 ]
@@ -52,15 +53,13 @@ def _iter_source_files():
                 continue
             if "node_modules" in path.parts or "__pycache__" in path.parts:
                 continue
-            # Test/spec files legitimately reference forbidden strings to ASSERT
-            # their absence — scan only shipping runtime + UI source, not tests.
             name = path.name.lower()
             if ".test." in name or ".spec." in name or "__tests__" in path.parts:
                 continue
             yield path
 
 
-def test_no_mochlet_coupling_in_runtime_or_ui():
+def test_no_agent_or_mochlet_coupling_in_runtime_or_ui():
     violations: list[str] = []
     for path in _iter_source_files():
         try:
@@ -73,40 +72,45 @@ def test_no_mochlet_coupling_in_runtime_or_ui():
                 rel = path.relative_to(REPO_ROOT)
                 violations.append(f"{rel}:{line} contains {label} ('{m.group(0)}')")
     assert not violations, (
-        "Mochlet coupling re-introduced into runtime/UI source:\n  "
+        "Agent/Mochlet coupling re-introduced into runtime/UI source:\n  "
         + "\n  ".join(violations))
 
 
-def test_no_mochlet_modules_exist():
+def test_agent_and_adapter_modules_are_gone():
     for gone in ("lib/production_brain/mochlet.py",
                  "lib/production_brain/mcp_client.py",
-                 "lib/production_brain/connection.py"):
+                 "lib/production_brain/connection.py",
+                 "lib/production_brain/hermes_agent.py",
+                 "lib/production_brain/orchestrator.py",
+                 "lib/production_brain/adapter.py",
+                 "backlot/brain_api.py",
+                 "remotion-composer/src/studio/AgentPanel.tsx"):
         assert not (REPO_ROOT / gone).exists(), f"{gone} must be deleted"
 
 
-def test_native_agent_module_is_the_live_client():
-    """The live orchestration client must be the native Hermes Agent, fail-closed."""
-    from lib.production_brain import hermes_agent
+def test_status_view_has_no_connection_or_worker_inference():
+    """The overview view model must not carry a connection block or infer an
+    autonomous worker (no 'producing'/'start'/agent owner)."""
+    from lib.production_status import build_status_view
 
-    client = hermes_agent._UnavailableAgentClient()
-    assert client.available() is False
-    # The engine label for a real connection is the native agent, never 'mochlet'.
-    assert hermes_agent.AGENT_ENGINE == "hermes-agent"
+    v = build_status_view(project={"id": "p", "title": "P"})
+    assert "connection" not in v
+    assert v["owner"] == "you"
+    assert v["primary_action"]["id"] == "open_studio"
+    # No automation/worker state field.
+    assert "overall_state" not in v
 
 
 def test_board_is_overview_with_single_studio_action():
-    """The board must offer exactly one dominant 'Open Production Studio' action and
-    no production-control buttons."""
     board = (REPO_ROOT / "backlot" / "ui" / "board.js").read_text(encoding="utf-8")
     assert "Open Production Studio" in board, "Board must offer 'Open Production Studio'"
-    # No guided-connect modal and no Mochlet connect UX on the board.
-    assert "openConnectModal" not in board
-    for banned in ("/api/hermes/", "9235", "mochlet", "Mochlet"):
+    for banned in ("openConnectModal", "/api/hermes/", "/api/agent/", "9235",
+                   "mochlet", "Mochlet", "Hermes Agent"):
         assert banned not in board, f"board.js must not contain {banned!r}"
 
 
-def test_studio_has_native_agent_endpoints_not_mochlet():
+def test_studio_client_has_no_agent_or_run_automation():
     client_ts = (REPO_ROOT / "remotion-composer" / "src" / "composition" / "client.ts").read_text(encoding="utf-8")
-    assert "/api/agent/" in client_ts, "Studio client must use the native /api/agent/* routes"
-    assert "/api/hermes/" not in client_ts
-    assert "connectHermes" not in client_ts
+    for banned in ("/api/hermes/", "/api/agent/", "connectHermes", "connectAgent",
+                   "Hermes Agent"):
+        assert banned not in client_ts, f"client.ts must not contain {banned!r}"

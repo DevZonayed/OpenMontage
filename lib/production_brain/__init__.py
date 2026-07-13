@@ -1,23 +1,20 @@
-"""Hermes production brain — canonical, observable production-run telemetry.
+"""Production checkpoint telemetry + learned Style preferences (internal library).
 
-This package turns the Hermes agent into the *persistent, transparent video-
-production brain* rather than a hidden subprocess. It owns a versioned,
-append-only run/event history per project so an observer can always answer:
-which agent/job/tool/provider is doing which task, at which stage, with what
-progress, elapsed time, latest event, outputs, approvals, blockers, and errors.
+OpenMontage is a manual-first editor — there is no autonomous production worker.
+This package remains only as internal infrastructure: an append-only checkpoint
+event log per project (``schema``/``store``) and the visible, auditable Style
+learning store (``learning``/``evidence``) that powers the Studio Style panel.
+Nothing here connects to, starts, or drives an external agent.
 
 Layout (single writer per file — no duplicate writers):
 
     projects/<id>/brain/
       run_events.jsonl   # append-only, monotonically-sequenced event history
-                         #   (AUTHORITATIVE — the state doc is a view of this)
-      state.json         # materialized production_run_state (rebuildable)
+      state.json         # materialized view of the event log (rebuildable)
       learned_style.json # project-scope learned style preferences
 
-Honesty guarantees:
-  * The brain fails CLOSED when Hermes is unavailable (see adapter.py).
+Guarantees:
   * No secrets ever enter telemetry (see schema.redact_event).
-  * Terminal states are truthful; a crashed run reconciles from the log.
   * Style is learned ONLY from explicit user approvals/corrections.
 """
 

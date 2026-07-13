@@ -1,31 +1,18 @@
-"""Backlot data layer for the CANONICAL production-status view.
+"""Backlot data layer for the read-only project OVERVIEW.
 
-One endpoint, one reconciled view model — consumed by BOTH the board (as a
-read-only overview) and the Remotion Studio (as the action center) so they can
-never disagree about where the production is or what to do next. Mirrors the
-``brain_api`` / ``timeline_api`` convention: pure, synchronous functions that take
-a ``project_dir`` and never block; the async routes in ``backlot/server.py`` add
-the guards.
-
-The heavy source reads (brain state, board state, run.json, timeline) are cheap
-filesystem reads. The one potentially-slow read — the native Hermes Agent
-readiness probe (a bounded local subprocess) — is cached with a short TTL so the
-board's frequent /status polling never re-probes the agent every cycle.
+OpenMontage is a manual-first editor: there is no autonomous production worker.
+This assembles the durable on-disk artifacts — the checkpoint milestone rail, the
+timeline (layers + duration), the intake's requested duration, and rendered
+outputs — into ONE overview the Board renders. Pure, synchronous, never blocks;
+the async route in ``backlot/server.py`` adds the guards.
 """
 
 from __future__ import annotations
 
-import time
 from pathlib import Path
 from typing import Any, Callable, Optional
 
 from lib.production_status import build_status_view
-
-# Short-lived, process-global cache for the (global, not per-project) Hermes Agent
-# connection status so the board's frequent /status polling doesn't re-probe the
-# local agent every cycle.
-_CONN_TTL_SECONDS = 5.0
-_conn_cache: dict[str, Any] = {"at": 0.0, "value": None}
 
 
 class StatusApiError(ValueError):
@@ -42,7 +29,6 @@ def _safe(fn: Callable[[], Any], default: Any) -> Any:
 
 
 def _load_timeline_lite(project_dir: Path) -> Optional[dict]:
-    """Just enough of the timeline to gate the render button (layers + rendering)."""
     def _load():
         from lib.timeline import load_or_build_timeline
 
@@ -51,31 +37,35 @@ def _load_timeline_lite(project_dir: Path) -> Optional[dict]:
     return _safe(_load, None)
 
 
-def connection_view(
-    *,
-    detector: Optional[Any] = None,
-    probe: bool = True,
-    use_cache: bool = True,
-    now: Optional[Callable[[], float]] = None,
-) -> dict:
-    """The native Hermes Agent connection status (cached). Never raises, and never
-    contains an endpoint, token, project, or job."""
-    clock = now or time.time
-    if use_cache and detector is None:
-        ts = clock()
-        if _conn_cache["value"] is not None and (ts - _conn_cache["at"]) < _CONN_TTL_SECONDS:
-            return _conn_cache["value"]
-    from lib.production_brain.hermes_agent import agent_status
+def _load_project(project_dir: Path) -> dict:
+    data = _safe(lambda: __import__("json").loads(
+        (project_dir / "project.json").read_text(encoding="utf-8")), {})
+    return data if isinstance(data, dict) else {}
 
-    value = _safe(lambda: agent_status(detector=detector, probe=probe),
-                  {"kind": "hermes_agent", "status": "unknown", "available": False,
-                   "server_name": "Hermes Agent",
-                   "headline": "Hermes Agent status is unavailable.",
-                   "detail": "", "actions": [], "installed": False, "ready": False})
-    if use_cache and detector is None:
-        _conn_cache["at"] = clock()
-        _conn_cache["value"] = value
-    return value
+
+def _requested_duration(project_dir: Path) -> Optional[float]:
+    def _load():
+        from lib.project_intake import read_intake
+
+        intake = read_intake(project_dir) or {}
+        val = intake.get("target_duration_seconds")
+        return float(val) if val is not None else None
+    return _safe(_load, None)
+
+
+def _outputs(project_dir: Path) -> dict:
+    """Rendered deliverables + a coarse asset count, scanned from disk."""
+    renders: list[dict] = []
+    rdir = project_dir / "renders"
+    if rdir.is_dir():
+        for p in sorted(rdir.glob("*.mp4")):
+            renders.append({"path": f"renders/{p.name}", "label": p.stem.replace("_", " ").title()})
+    asset_count = 0
+    for sub in ("assets/images", "assets/video", "assets/audio", "assets/music"):
+        d = project_dir / sub
+        if d.is_dir():
+            asset_count += sum(1 for _ in d.glob("*") if _.is_file())
+    return {"renders": renders, "asset_count": asset_count}
 
 
 def build_status_payload(
@@ -83,69 +73,18 @@ def build_status_payload(
     *,
     demo: bool = False,
     stale: bool = False,
-    connection_detector: Optional[Any] = None,
-    probe_connection: bool = True,
+    **_ignored: Any,
 ) -> dict:
-    """Assemble the canonical status view for one project."""
-    from backlot.brain_api import build_run_payload
+    """Assemble the read-only overview for one project."""
     from backlot.state import load_board_state
 
-    brain = _safe(lambda: build_run_payload(project_dir), None)
+    project = _load_project(project_dir)
     board = _safe(lambda: load_board_state(project_dir), None)
-    run = _safe(lambda: _load_run(project_dir), None)
-    inbox = _safe(lambda: _load_inbox(project_dir), None)
     timeline = _load_timeline_lite(project_dir)
-    connection = connection_view(detector=connection_detector, probe=probe_connection)
+    requested = _requested_duration(project_dir)
+    outputs = _outputs(project_dir)
 
     return build_status_view(
-        brain=brain, board=board, run=run, inbox=inbox, timeline=timeline,
-        connection=connection, demo=bool(demo), stale=bool(stale))
-
-
-def _load_run(project_dir: Path) -> dict:
-    from lib.production_run import get_run, read_plan
-
-    run = get_run(project_dir)
-    try:
-        run["plan"] = read_plan(project_dir)
-    except Exception:
-        pass
-    return run
-
-
-def _load_inbox(project_dir: Path) -> dict:
-    from lib.agent_inbox import pending_agent_work
-
-    return pending_agent_work(project_dir)
-
-
-# --------------------------------------------------------------------------- #
-# Native Hermes Agent connection control (invalidates the cache)
-# --------------------------------------------------------------------------- #
-def agent_connection(*, detector: Optional[Any] = None) -> dict:
-    return connection_view(detector=detector, use_cache=detector is None)
-
-
-def agent_connect(body: dict, *, detector: Optional[Any] = None) -> dict:
-    """Connect (enable) the native Hermes Agent for this workspace.
-
-    No credentials, endpoint, token, or project — the agent is auto-detected and
-    verified locally. A failed verify does NOT enable (fail closed)."""
-    from lib.production_brain.hermes_agent import connect
-
-    result = connect(detector=detector)
-    _invalidate_conn_cache()
-    return result
-
-
-def agent_disconnect(body: dict) -> dict:
-    from lib.production_brain.hermes_agent import disconnect
-
-    result = disconnect()
-    _invalidate_conn_cache()
-    return result
-
-
-def _invalidate_conn_cache() -> None:
-    _conn_cache["at"] = 0.0
-    _conn_cache["value"] = None
+        project=project, board=board, timeline=timeline,
+        requested_duration_seconds=requested, outputs=outputs,
+        demo=bool(demo), stale=bool(stale))

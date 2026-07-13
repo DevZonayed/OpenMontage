@@ -84,63 +84,43 @@ function renderSlate(s) {
 }
 
 // ===========================================================================
-// COMMAND CENTER — the single, dominant production-status card.
-// Driven by the canonical /status view model (shared with the Remotion Studio),
-// so the board and studio always show the same NOW / NEXT / LAST and stage.
+// PROJECT OVERVIEW — the single, read-only status card (manual-first).
+// Consumes the /status project_overview payload. The board performs NO
+// mutations and has NO production controls: its one dominant action is the
+// "Open Production Studio" link. All editing/rendering happens in the Studio.
 // ===========================================================================
 let statusPollTimer = null;
 let lastStatusSig = null;
 let lastStatusView = null;   // last-known-good view (preserved on network error)
 
-const OWNER_LABEL = { hermes: "Hermes Agent", user: "You", system: "System" };
-const STEP_GLYPH = {
-  completed: "✓", current: "◉", blocked: "▲", awaiting: "◈",
-  failed: "✕", skipped: "–", upcoming: "",
+// Subtle informational markers for milestone history (NEVER a live worker).
+const MILESTONE_GLYPH = {
+  done: "✓", in_progress: "◉", needs_review: "◈", failed: "✕",
 };
 
 function _statusPollMs(view) {
-  const st = view && view.overall_state;
-  if (st === "producing" || st === "planning" || st === "cancelling") return 2500;
-  if (st === "reconciling") return 2000;
-  if (["awaiting_approval", "awaiting_plan_approval", "blocked", "ready_to_produce"].includes(st)) return 4000;
-  return 8000;   // idle / terminal — still poll (connection state can change)
+  // Poll faster only while a render is genuinely active; otherwise relax.
+  if (view && view.render && view.render.active) return 2500;
+  return 8000;
 }
 
 function _statusSig(v) {
   if (!v) return "none";
-  return [v.overall_state, v.current_stage, v.owner, v.headline,
-    (v.primary_action || {}).id, v.stop_available, (v.connection || {}).status,
-    v.stale, (v.diagnostics || []).length, (v.latest_event || {}).seq,
-    v.render && v.render.renderable].join("|");
-}
-
-function _setStatusBadge(view) {
-  const badge = document.querySelector(".slate .live");
-  if (!badge) return;
-  const st = view.overall_state;
-  const label = {
-    not_started: "NOT STARTED", planning: "PREPARING",
-    awaiting_plan_approval: "REVIEW PLAN", ready_to_produce: "READY",
-    producing: "PRODUCING", awaiting_approval: "NEEDS YOU",
-    blocked: "BLOCKED", cancelling: "CANCELLING", cancelled: "CANCELLED",
-    failed: "FAILED", completed: "COMPLETE", reconciling: "RECONCILING",
-  }[st] || st.toUpperCase();
-  const live = ["producing", "planning", "cancelling"].includes(st);
-  const attention = ["awaiting_approval", "awaiting_plan_approval", "blocked", "failed"].includes(st);
-  badge.textContent = "";
-  badge.classList.remove("idle");
-  const dotStyle = attention ? "background:var(--amber,#e8c07d);animation:none" : "";
-  badge.append(el("span", { class: "dot", style: dotStyle }),
-    (view.stale ? "⟳ " : "") + label);
-  if (!live && !attention) badge.classList.add("idle");
-  badge.style.color = attention ? "var(--amber,#e8c07d)" : "";
+  const ms = (v.milestones || []).map((m) => `${m.id}:${m.status}`).join(",");
+  const t = v.target || {};
+  return [v.headline, v.guidance, v.has_timeline, v.layer_count,
+    (v.milestone_progress || {}).completed, (v.milestone_progress || {}).total,
+    (v.last_saved || {}).ts, (v.blockers || []).length,
+    (v.outputs || {}).render_count, (v.outputs || {}).asset_count,
+    t.available, t.label || t.formatted,
+    (v.render || {}).active, v.stale, (v.diagnostics || []).length, ms].join("|");
 }
 
 function renderCommandCenter(s) {
-  const wrap = el("section", { class: "cmd-center", "aria-live": "polite" });
+  const wrap = el("section", { class: "overview", "aria-live": "polite" });
   // Paint immediately from the last-known view (no flash), then refresh.
-  if (lastStatusView) renderStatusCard(wrap, lastStatusView);
-  else wrap.append(el("div", { class: "cmd-loading" }, "Loading production status…"));
+  if (lastStatusView) renderOverviewCard(wrap, lastStatusView);
+  else wrap.append(el("div", { class: "ov-loading" }, "Loading overview…"));
   refreshStatus(wrap, true);
   return wrap;
 }
@@ -154,163 +134,157 @@ async function refreshStatus(wrap, force) {
   } catch {
     // Network error: PRESERVE the last-known-good state, flag it stale +
     // reconnecting. NEVER blank the card or invent a fake state.
-    if (lastStatusView) {
-      view = Object.assign({}, lastStatusView, { stale: true });
-      view.diagnostics = (lastStatusView.diagnostics || []).concat(
-        [{ kind: "stale", message: "Reconnecting to live updates…" }]);
-    } else {
-      view = null;
-    }
+    if (lastStatusView) view = Object.assign({}, lastStatusView, { stale: true });
+    else view = null;
   }
   if (!view) {
     wrap.textContent = "";
-    wrap.append(el("div", { class: "cmd-loading" }, "Production status is temporarily unavailable — reconnecting…"));
+    wrap.append(el("div", { class: "ov-loading" }, "Overview is temporarily unavailable — reconnecting…"));
     statusPollTimer = setTimeout(() => refreshStatus(wrap, true), 3000);
     return;
   }
-  _setStatusBadge(view);
   const sig = _statusSig(view);
   if (force || sig !== lastStatusSig) {
     lastStatusSig = sig;
-    renderStatusCard(wrap, view);
+    renderOverviewCard(wrap, view);
   }
   statusPollTimer = setTimeout(() => refreshStatus(wrap, false), _statusPollMs(view));
 }
 
-function renderStatusCard(wrap, view) {
+function renderOverviewCard(wrap, view) {
   wrap.textContent = "";
-  wrap.dataset.state = view.overall_state;
-  wrap.dataset.owner = view.owner || "";
 
-  // --- connection status line (informational only — never a button) --------
-  // Never nag while a live run is already producing, or on a terminal run.
-  const conn = view.connection || {};
-  const activeRun = view.is_live || ["producing", "cancelling", "cancelled", "failed", "completed"].includes(view.overall_state);
-  if (!conn.available && conn.status && conn.status !== "unknown" && !activeRun) {
-    wrap.append(renderConnectionBanner(view));
+  // --- stale / diagnostics (informational only) ---------------------------
+  if (view.stale) {
+    wrap.append(el("div", { class: "ov-diag", role: "status" },
+      el("span", { class: "spinner" }), "Reconnecting to live updates…"));
   }
-  // --- diagnostics (reconciling / stale) ----------------------------------
   for (const d of (view.diagnostics || [])) {
-    if (d.kind === "stale") {
-      wrap.append(el("div", { class: "cmd-diag stale", role: "status" },
-        el("span", { class: "spinner" }), d.message));
-    } else if (d.kind === "source_conflict") {
-      wrap.append(el("div", { class: "cmd-diag conflict", role: "status" }, "⚠ " + d.message));
-    }
+    const msg = typeof d === "string" ? d : (d && d.message);
+    if (msg) wrap.append(el("div", { class: "ov-diag", role: "status" }, msg));
   }
 
-  // --- the three-up NOW / NEXT / LATEST -----------------------------------
-  const grid = el("div", { class: "cmd-grid" });
+  // --- headline + plain manual guidance -----------------------------------
+  const head = el("div", { class: "ov-head" });
+  head.append(el("div", { class: "ov-eyebrow" }, "Project overview"));
+  head.append(el("h2", { class: "ov-headline" }, view.headline || "—"));
+  if (view.guidance) head.append(el("p", { class: "ov-guidance" }, view.guidance));
+  const metaBits = ["Owner: You"];
+  const tt = _targetText(view.target);
+  if (tt) metaBits.push(tt);
+  head.append(el("div", { class: "ov-meta" }, metaBits.join("  ·  ")));
+  wrap.append(head);
 
-  // NOW
-  const stageTag = view.stage_number
-    ? `Stage ${view.stage_number} of ${view.stage_count} · ${view.current_stage_label || ""}`
-    : "";
-  const now = el("div", { class: "cmd-now" });
-  now.append(el("div", { class: "cmd-eyebrow" }, "NOW"));
-  if (stageTag) now.append(el("div", { class: "cmd-stagetag" }, stageTag));
-  now.append(el("h2", { class: "cmd-headline" }, view.headline || "—"));
-  if (view.active_task) now.append(el("p", { class: "cmd-task" }, view.active_task));
-  const metaBits = [];
-  if (view.owner) metaBits.push(`Owner: ${OWNER_LABEL[view.owner] || view.owner}`);
-  if (typeof view.elapsed_seconds === "number") metaBits.push(`Elapsed ${_fmtSecs(view.elapsed_seconds)}`);
-  if (metaBits.length) now.append(el("div", { class: "cmd-meta" }, metaBits.join(" · ")));
-  grid.append(now);
+  // --- the SINGLE dominant action on the whole page -----------------------
+  wrap.append(el("div", { class: "ov-cta-row" }, openStudioCTA(view)));
 
-  // NEXT — read-only description of whose move it is + the SINGLE dominant CTA.
-  // The board performs no mutations; acting on anything happens in the Studio.
-  const next = el("div", { class: "cmd-next" });
-  next.append(el("div", { class: "cmd-eyebrow" }, "NEXT"));
-  const pa = view.primary_action || {};
-  next.append(el("div", { class: "cmd-owner-line" },
-    pa.owner === "user" ? "Your move" : pa.owner === "hermes" ? "Hermes Agent's move" : "In progress"));
-  if (pa.label) next.append(el("p", { class: "cmd-task" }, pa.label));
-  if (view.why_waiting) next.append(el("p", { class: "cmd-why" }, view.why_waiting));
-  next.append(openStudioCTA());
-  grid.append(next);
-
-  // LATEST (latest completed event / output)
-  const last = el("div", { class: "cmd-last" });
-  last.append(el("div", { class: "cmd-eyebrow" }, "LATEST"));
-  const ev = view.latest_event;
-  if (ev && ev.label) {
-    last.append(el("p", { class: "cmd-lastmsg" }, ev.label));
-    const ms = ev.ts ? Date.parse(ev.ts) : NaN;
-    if (!Number.isNaN(ms)) last.append(el("div", { class: "cmd-meta" }, fmtAgo(ms / 1000)));
-  } else {
-    last.append(el("p", { class: "cmd-lastmsg dim" }, "No activity yet."));
-  }
-  // A small "agent session active" note only when a run is genuinely live —
-  // never a raw job/tool/provider handle (this is an overview, not a console).
-  if (view.is_live) {
-    const sess = (view.identity || {}).session;
-    last.append(el("div", { class: "cmd-idchips" },
-      el("span", { class: "idchip" }, "◉ Agent session active" + (sess ? " · " + _shortId(sess) : ""))));
-  }
-  if (view.is_fixture) last.append(el("div", { class: "cmd-fixture" }, "◐ Demo data — no live run"));
-  grid.append(last);
-
-  wrap.append(grid);
-
-  // --- 11-stage stepper ---------------------------------------------------
-  wrap.append(renderStepper(view));
-
-  // --- render summary (read-only) -----------------------------------------
-  // ONLY show a "Rendering…" indicator when a real render job is active.
-  const r = view.render || {};
-  if (r.active) {
-    wrap.append(el("div", { class: "cmd-rendernote" },
+  // --- rendering indicator — ONLY when a render is genuinely active -------
+  if (view.render && view.render.active) {
+    wrap.append(el("div", { class: "ov-rendering", role: "status" },
       el("span", { class: "spinner" }),
-      " Rendering" + (r.layer_count ? ` · ${r.layer_count} layers` : "") + "…"));
-  } else if (!r.renderable && r.reason && ["ready_to_produce", "producing", "awaiting_plan_approval"].includes(view.overall_state)) {
-    wrap.append(el("div", { class: "cmd-rendernote" }, "▤ " + r.reason));
+      " Rendering" + (view.render.layer_count ? ` · ${view.render.layer_count} layers` : "") + "…"));
+  }
+
+  // --- blockers (informational cards, not controls) -----------------------
+  for (const b of (view.blockers || [])) {
+    wrap.append(el("div", { class: "ov-blocker", role: "status" },
+      el("span", { class: "ov-blocker-ic" }, "▲"),
+      el("div", { class: "ov-blocker-text" },
+        el("div", { class: "ov-blocker-msg" }, b.message || ""),
+        b.stage ? el("div", { class: "ov-blocker-stage" }, b.stage) : null)));
+  }
+
+  // --- milestone history + deliverables -----------------------------------
+  wrap.append(renderMilestones(view));
+  wrap.append(renderOutputs(view));
+
+  if (view.is_demo || view.is_fixture) {
+    wrap.append(el("div", { class: "ov-demo" }, "◐ Demo data — not a live project"));
   }
 }
 
 // The single dominant navigation action on the whole page.
-function openStudioCTA() {
-  return el("a", { class: "cmd-primary", href: `/p/${encodedProjectId}/editor` },
-    "◫ Open Production Studio");
+function openStudioCTA(view) {
+  const label = (view && view.primary_action && view.primary_action.label) || "Open Production Studio";
+  return el("a", { class: "ov-primary", href: `/p/${encodedProjectId}/editor` },
+    "◫ " + label);
 }
 
-function renderStepper(view) {
-  const nav = el("nav", { class: "cmd-stepper", "aria-label": "Production stages" });
-  for (const st of (view.stages || [])) {
-    const node = el("div", { class: `cmd-step ${st.status}`, title: `${st.label} — ${st.status}` });
-    node.append(el("span", { class: "cmd-step-dot" }, STEP_GLYPH[st.status] || String(st.index + 1)));
-    node.append(el("span", { class: "cmd-step-label" }, st.label));
-    if (st.status === "current" && typeof st.progress === "number" && st.progress > 0) {
-      node.append(el("span", { class: "cmd-step-pct" }, Math.round(st.progress * 100) + "%"));
+// Truthful target/duration text — never fabricates a default placeholder.
+function _targetText(target) {
+  const t = target || {};
+  if (!t.available) return t.label || "Duration set after first scene";
+  const shown = t.formatted || t.label;
+  return shown ? "Duration " + shown : "";
+}
+
+// Milestones are an INFORMATIONAL history list, never a live autonomous worker.
+function renderMilestones(view) {
+  const box = el("div", { class: "ov-section ov-milestones" });
+  const prog = view.milestone_progress || {};
+  box.append(el("div", { class: "ov-sec-head" },
+    el("span", { class: "ov-sec-title" }, "Progress"),
+    typeof prog.total === "number" && prog.total
+      ? el("span", { class: "ov-sec-meta" }, `${prog.completed || 0} of ${prog.total} milestones`)
+      : null));
+  const list = el("div", { class: "ov-mlist" });
+  const items = view.milestones || [];
+  if (!items.length) {
+    list.append(el("div", { class: "ov-mempty" }, "No milestones yet."));
+  } else {
+    for (const m of items) {
+      const st = m.status || "";
+      list.append(el("div", { class: `ov-m ${st}` },
+        el("span", { class: "ov-m-mark" }, MILESTONE_GLYPH[st] || "·"),
+        el("span", { class: "ov-m-label" }, m.label || ""),
+        m.ts ? el("span", { class: "ov-m-ts" }, _msAgo(m.ts)) : null));
     }
-    nav.append(node);
   }
-  return nav;
+  box.append(list);
+  return box;
 }
 
-function renderConnectionBanner(view) {
-  // Status text ONLY — no button. If the agent isn't connected the user acts
-  // via the single "Open Production Studio" CTA; the board never connects.
-  const conn = view.connection || {};
-  const name = conn.server_name || "Hermes Agent";
-  const banner = el("div", { class: `cmd-conn ${conn.status || ""} statusonly`, role: "status" });
-  banner.append(el("div", { class: "cmd-conn-text" },
-    el("b", {}, `${name}: ${conn.headline || conn.status || "not connected"}`),
-    conn.detail ? el("div", { class: "cmd-conn-detail" }, conn.detail) : null,
-    el("div", { class: "cmd-conn-detail" }, "Open the Production Studio to connect and run production.")));
-  return banner;
+function renderOutputs(view) {
+  const out = view.outputs || {};
+  const box = el("div", { class: "ov-section ov-outputs" });
+  box.append(el("div", { class: "ov-sec-head" },
+    el("span", { class: "ov-sec-title" }, "Deliverables")));
+  const stats = el("div", { class: "ov-stats" });
+  const rc = out.render_count || 0;
+  const ac = out.asset_count || 0;
+  stats.append(_stat(rc, rc === 1 ? "render" : "renders"));
+  stats.append(_stat(ac, ac === 1 ? "asset" : "assets"));
+  box.append(stats);
+  const renders = out.renders || [];
+  if (renders.length) {
+    const rl = el("div", { class: "ov-renderlist" });
+    for (const r of renders) {
+      const name = r.label || (r.path ? r.path.split("/").pop() : "render");
+      rl.append(el("div", { class: "ov-renderitem" }, "▤ " + name));
+    }
+    box.append(rl);
+  }
+  if (view.last_saved && view.last_saved.label) {
+    box.append(el("div", { class: "ov-lastsaved" },
+      "Last saved: " + view.last_saved.label
+        + (view.last_saved.ts ? " · " + _msAgo(view.last_saved.ts) : "")));
+  }
+  return box;
 }
 
-// Sanitized short id — never leak a full raw job/session handle in the UI.
-function _shortId(id) {
-  if (!id) return "";
-  return String(id).length > 10 ? String(id).slice(0, 8) : String(id);
+function _stat(value, label) {
+  return el("div", { class: "ov-stat" },
+    el("div", { class: "ov-stat-num" }, String(value)),
+    el("div", { class: "ov-stat-label" }, label));
 }
 
-function _fmtSecs(secs) {
-  if (secs == null) return "";
-  const s = Math.max(0, Math.round(secs));
-  const m = Math.floor(s / 60), r = s % 60;
-  return m ? `${m}:${String(r).padStart(2, "0")}` : `${r}s`;
+// ISO timestamp → "N ago" (treat tz-naive strings as UTC, like replay does).
+function _msAgo(iso) {
+  if (!iso) return "";
+  let s = String(iso);
+  if (!/(Z|[+-]\d{2}:?\d{2})$/.test(s)) s += "Z";
+  const t = Date.parse(s);
+  return Number.isFinite(t) ? fmtAgo(t / 1000) : "";
 }
 
 // ---------------------------------------------------------------------------

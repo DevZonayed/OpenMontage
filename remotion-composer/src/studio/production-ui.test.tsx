@@ -1,161 +1,170 @@
-import { describe, it, expect } from "vitest";
+// @vitest-environment jsdom
+//
+// Manual-first Studio contract. The Studio IS the editor — there is NO Hermes /
+// agent / production-run automation surface. This mounts the REAL <StudioApp>
+// against a stubbed HTTP layer for an EMPTY project (no timeline, pending
+// duration) and asserts:
+//   * no AgentPanel / Connect / Hermes / agent / Mochlet strings anywhere;
+//   * exactly ONE "Add first scene" primary on the empty timeline, and clicking
+//     it runs the REAL add-layer flow (a first scene actually appears);
+//   * the grouped domain regions are present (timeline / preview / renderer /
+//     inspector / style);
+//   * a pending duration is NEVER shown as 1800 frames or 1:00.
+
+import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
 import React from "react";
-import { renderToStaticMarkup } from "react-dom/server";
-import { ProductionInspector } from "./ProductionInspector";
-import { CommandCenter } from "./CommandCenter";
-import { AgentConnection, StatusView } from "../composition/status";
-import { StatusController } from "./useStatusView";
+import { createRoot } from "react-dom/client";
+import { StudioApp } from "./StudioApp";
+import { BacklotClient, FetchLike } from "../composition/client";
 
-// The exact rejected fixture: research/proposal approved, plan approved, no timeline,
-// requested 150s — with the NATIVE Hermes Agent detected but not yet connected.
-// There is NO endpoint/token/project surface anywhere.
-function detectedAgent(): AgentConnection {
+// The composer's internal safe minimum (1800f / 60s) must NEVER surface as the
+// user's duration for a pending project. Include it in the timeline payload on
+// purpose so the test proves it is suppressed.
+function emptyTimelinePayload() {
   return {
-    kind: "hermes_agent",
-    status: "detected",
-    available: false,
-    server_name: "Hermes Agent",
-    headline: "Hermes Agent detected on this machine",
-    detail: "Connect the Hermes Agent to start production.",
-    actions: [{ id: "connect_agent", label: "Connect Hermes Agent" }],
-    enabled: false,
-    installed: true,
-    ready: true,
-    version: "1.4.0",
+    timeline: { version: "1.0", fps: 30, target_duration_seconds: 60, total_frames: 1800, width: 1920, height: 1080, layers: [] },
+    etag: "e1", persisted: true, fps: 30, total_frames: 1800,
+    target_duration_seconds: 60, target_formatted: "1:00", word_budget: 100,
+    measured_output_seconds: null, remotion_render_ready: false,
+    remotion_reason: "no layers", layer_types: ["video", "image", "text"],
   };
 }
 
-function fixtureView(over: Partial<StatusView> = {}): StatusView {
+// A pending overview: no timeline, duration not chosen yet.
+function pendingOverview() {
   return {
-    version: "1.0",
-    kind: "production_status_view",
-    project_id: "the-electricity-bulb",
-    mode: "local",
-    authoritative_source: "checkpoints",
-    overall_state: "ready_to_produce",
-    current_stage: "assets",
-    current_stage_label: "Asset generation",
-    stage_index: 4,
-    stage_number: 5,
-    stage_count: 11,
-    headline: "Waiting for Hermes to begin asset generation",
-    active_task: "Plan approved — production has not started yet.",
-    owner: "user",
-    why_waiting: "Hermes Agent detected — connect to start production",
-    primary_action: { id: "connect_agent", label: "Connect Hermes Agent to continue", owner: "user", kind: "connect", advances_production: true },
-    secondary_actions: [{ id: "preview", label: "Preview approved plan locally", owner: "user", kind: "preview", advances_production: false }],
-    latest_event: { label: "No production run has started for this project." },
-    elapsed_seconds: null,
-    progress: 4 / 11,
-    completed_stages: 4,
-    stages: [
-      { id: "research", index: 0, label: "Research", status: "completed", progress: 1 },
-      { id: "assets", index: 4, label: "Asset generation", status: "current", progress: 0 },
-    ],
-    identity: { agent: null, job: null, session: null, engine: null, tool: null, provider: null },
-    run_id: "run_eb_001",
-    stop_available: false,
-    render: { renderable: false, active: false, reason: "The plan is approved but no assets exist yet.", layer_count: 0 },
-    target: { available: true, duration_seconds: 150, formatted: "2:30", frames: 4500, fps: 30, source: "requested", is_target: true, label: "target 2:30 · 4500 target frames" },
-    connection: detectedAgent(),
-    diagnostics: [],
-    sources: { brain_state: "not_started", brain_run_id: null, run_state: "waiting_for_approval", plan_approved: true, has_checkpoints: true },
-    stale: false,
-    is_demo: false,
-    is_live: false,
-    is_fixture: false,
-    ...over,
+    version: "2.0", kind: "project_overview", project_id: "eb", title: "The Electricity Bulb",
+    owner: "you", mode: "local",
+    headline: "Set up your first scene",
+    guidance: "This project has no timeline yet. Add your first scene to start editing.",
+    has_timeline: false, layer_count: 0,
+    milestones: [], milestone_progress: { completed: 0, total: 0 },
+    last_saved: null, blockers: [],
+    outputs: { renders: [], render_count: 0, latest_render: null, asset_count: 0 },
+    target: { available: false, duration_seconds: null, formatted: null, frames: null, fps: 30, source: "pending", is_target: true, label: "Duration set after first scene" },
+    render: { renderable: false, active: false, reason: "Add scenes to the timeline in the Studio to enable rendering.", layer_count: 0 },
+    primary_action: { id: "open_studio", label: "Open Production Studio" },
+    diagnostics: [], stale: false, is_demo: false, is_fixture: false,
   };
 }
 
-function controller(view: StatusView | null): StatusController {
-  return {
-    view, coldError: false, busy: false, actionError: null,
-    refresh: () => {}, runAction: () => {},
-  };
+function makeFetch(): FetchLike {
+  const routes: Array<[RegExp, () => unknown]> = [
+    [/\/api\/csrf$/, () => ({ csrf: "TOK" })],
+    [/\/timeline$/, () => emptyTimelinePayload()],
+    [/\/status(\?|$)/, () => pendingOverview()],
+    [/\/preferences/, () => ({ categories: [] })],
+  ];
+  return (async (input: string) => {
+    const url = String(input);
+    const match = routes.find(([re]) => re.test(url));
+    const body = match ? match[1]() : {};
+    return { ok: true, status: 200, json: async () => body, text: async () => JSON.stringify(body) };
+  }) as unknown as FetchLike;
 }
 
-// No Mochlet / endpoint / token / MCP surface may ever leak into the UI.
-const FORBIDDEN = ["fake_driver", "NO LIVE RUN", "NOT STARTED", "brain: —", "DETERMINISTIC FIXTURE", "OFFLINE DRIVER", "Mochlet", "mochlet", "9235", "endpoint", "MCP"];
+async function settle(container: HTMLElement, needle: string, tries = 80): Promise<string> {
+  for (let i = 0; i < tries; i++) {
+    // eslint-disable-next-line no-await-in-loop
+    await new Promise((r) => setTimeout(r, 25));
+    const txt = container.textContent || "";
+    if (txt.includes(needle)) return txt;
+  }
+  return container.textContent || "";
+}
 
-describe("Production inspector — canonical, no legacy leakage", () => {
-  it("shows the canonical stage/headline/owner and NO raw brain/run/driver labels", () => {
-    const html = renderToStaticMarkup(<ProductionInspector status={controller(fixtureView())} />);
-    expect(html).toContain("Asset generation");
-    expect(html).toContain("Stage 5 of 11");
-    expect(html).toContain("Owner: You");
-    expect(html).toContain("target 2:30 · 4500 target frames");
-    for (const bad of FORBIDDEN) expect(html).not.toContain(bad);
-    // The inspector is STATUS-ONLY: no buttons at all (no second Start/Connect/goto).
-    expect(html).not.toMatch(/<button/i);
-    expect(html).toContain("Next step:");           // static reference, not a button
+function mount(): HTMLElement {
+  const client = new BacklotClient({ projectId: "eb", fetchImpl: makeFetch() });
+  const container = document.createElement("div");
+  document.body.appendChild(container);
+  createRoot(container).render(React.createElement(StudioApp, { client }));
+  return container;
+}
+
+// No agent / Hermes / Mochlet / automation surface may ever leak into the editor.
+const FORBIDDEN = [
+  "AgentPanel", "Connect Hermes", "Hermes Agent", "Hermes", "Mochlet", "mochlet",
+  "9235", "Production Agent", "Command center", "Start production", "connectAgent",
+];
+
+describe("manual-first Studio — empty project", () => {
+  beforeEach(() => {
+    (globalThis as unknown as { EventSource: unknown }).EventSource = class { close() {} } as unknown;
+  });
+  afterEach(() => {
+    document.body.innerHTML = "";
+    vi.restoreAllMocks();
   });
 
-  it("does not render a live badge or handles when there is no live run", () => {
-    const html = renderToStaticMarkup(<ProductionInspector status={controller(fixtureView())} />);
-    expect(html).not.toContain("● LIVE");
-    expect(html).not.toContain("job ");
+  it("shows exactly one 'Add first scene' primary and no agent/automation surface", async () => {
+    const container = mount();
+    const text = await settle(container, "Add first scene");
+    // exactly one prominent empty-state CTA
+    expect(container.querySelectorAll('[data-testid="add-first-scene"]').length).toBe(1);
+    // it is a real button (not a scroll target / dead link)
+    const cta = container.querySelector('[data-testid="add-first-scene"]') as HTMLButtonElement;
+    expect(cta.tagName).toBe("BUTTON");
+    // the empty-timeline card is shown (no misleading blank preview)
+    expect(container.querySelector('[data-testid="empty-timeline"]')).toBeTruthy();
+    // no agent / automation strings anywhere in the served document
+    const html = container.innerHTML;
+    for (const bad of FORBIDDEN) {
+      expect(text).not.toContain(bad);
+      expect(html).not.toContain(bad);
+    }
+    // no credential inputs
+    expect(container.querySelectorAll("input[type=password]").length).toBe(0);
   });
 
-  it("shows real sanitized handles only when live", () => {
-    const live = fixtureView({
-      is_live: true, mode: "live",
-      identity: { agent: "a", job: "11111111-1111-4111-8111-111111111111", session: "22222222-2222-4222-8222-222222222222", engine: "hermes", tool: "image_selector", provider: "flux" },
-    });
-    const html = renderToStaticMarkup(<ProductionInspector status={controller(live)} />);
-    expect(html).toContain("● LIVE");
-    expect(html).toContain("job 11111111");       // short id, sanitized
-    expect(html).not.toContain("11111111-1111-4111-8111-111111111111".slice(0, 20) + "-"); // not the full id inline
-    expect(html).toContain("image_selector");
-  });
-});
-
-describe("Command center — native Hermes Agent panel + one primary action", () => {
-  it("renders the native agent panel, exactly one primary action, and no Mochlet/credential surface", () => {
-    const html = renderToStaticMarkup(<CommandCenter status={controller(fixtureView())} />);
-    // exactly one production-primary action button on the card
-    const primaryCount = (html.match(/data-testid="cc-primary"/g) || []).length;
-    expect(primaryCount).toBe(1);
-    // the native, auto-detected agent panel is present as its own domain section
-    expect(html).toContain('data-testid="agent-panel"');
-    expect(html).toContain('data-testid="domain-agent"');
-    expect(html).toContain("Production Agent");
-    // detected → the panel offers a single native "Connect Hermes Agent" (no fields)
-    expect(html).toContain('data-testid="agent-connect"');
-    expect(html).toContain("Hermes Agent detected on this machine");
-    expect(html).toContain("v1.4.0");             // version surfaced when present
-    // absolutely no credential / endpoint / token / project inputs
-    expect(html).not.toMatch(/<input/i);
-    for (const bad of FORBIDDEN) expect(html).not.toContain(bad);
+  it("never presents the composer's internal minimum (1800 / 1:00) for a pending duration", async () => {
+    const container = mount();
+    const text = await settle(container, "Add first scene");
+    expect(text).toContain("Duration set after first scene");
+    expect(text).not.toMatch(/\b1800\b/);
+    expect(text).not.toMatch(/\b1:00\b/);
+    // the scrubber readout must not show a fabricated f0/1800 count
+    expect(text).not.toContain("f0/1800");
   });
 
-  it("connected agent shows the connected state + a Disconnect control", () => {
-    const connected = fixtureView({
-      connection: {
-        kind: "hermes_agent", status: "connected", available: true, server_name: "Hermes Agent",
-        headline: "Hermes Agent connected", detail: "", actions: [{ id: "disconnect_agent", label: "Disconnect" }],
-        enabled: true, installed: true, ready: true, version: "1.4.0",
-      },
-    });
-    const html = renderToStaticMarkup(<CommandCenter status={controller(connected)} />);
-    expect(html).toContain("Hermes Agent connected");
-    expect(html).toContain('data-testid="agent-disconnect"');
-    expect(html).not.toContain('data-testid="agent-connect"');
-    for (const bad of FORBIDDEN) expect(html).not.toContain(bad);
+  it("groups the controls under labelled domain regions", async () => {
+    const container = mount();
+    await settle(container, "Add first scene");
+    expect(container.querySelector('[data-testid="domain-timeline"]')).toBeTruthy();
+    expect(container.querySelector('[data-testid="domain-preview"]')).toBeTruthy();
+    expect(container.querySelector('[data-testid="domain-renderer"]')).toBeTruthy();
+    expect(container.querySelector('[data-testid="domain-inspector"]')).toBeTruthy();
+    // the Style region appears once its tab is selected
+    const styleTab = [...container.querySelectorAll("button")].find(
+      (b) => (b.textContent || "").trim() === "Style") as HTMLButtonElement | undefined;
+    expect(styleTab).toBeTruthy();
+    styleTab!.click();
+    await settle(container, "LEARNED PREFERENCES");
+    expect(container.querySelector('[data-testid="domain-style"]')).toBeTruthy();
   });
 
-  it("not-installed agent shows install guidance + a re-check control, editing stays available", () => {
-    const notInstalled = fixtureView({
-      connection: {
-        kind: "hermes_agent", status: "not_installed", available: false, server_name: "Hermes Agent",
-        headline: "Hermes Agent is not installed", detail: "Install the Hermes Agent to run production.",
-        actions: [{ id: "connect_agent", label: "Re-check for Hermes" }],
-        enabled: false, installed: false, ready: false, version: null,
-      },
-    });
-    const html = renderToStaticMarkup(<CommandCenter status={controller(notInstalled)} />);
-    expect(html).toContain("Hermes Agent is not installed");
-    expect(html).toContain('data-testid="agent-recheck"');
-    expect(html).toContain("Install the Hermes Agent");
+  it("Render is disabled with a reason while the timeline is empty", async () => {
+    const container = mount();
+    await settle(container, "Add first scene");
+    const renderBtn = [...container.querySelectorAll("button")].find(
+      (b) => /render final/i.test(b.textContent || "")) as HTMLButtonElement | undefined;
+    expect(renderBtn).toBeTruthy();
+    expect(renderBtn!.disabled).toBe(true);
+    // never mid-render label when nothing is rendering
+    expect(renderBtn!.textContent || "").not.toMatch(/Rendering…/);
+  });
+
+  it("clicking 'Add first scene' runs the REAL add-layer flow and creates a first scene", async () => {
+    const container = mount();
+    await settle(container, "Add first scene");
+    expect(container.querySelector('[data-testid="empty-timeline"]')).toBeTruthy();
+    const cta = container.querySelector('[data-testid="add-first-scene"]') as HTMLButtonElement;
+    cta.click();
+    // after the real addLayer() commit the empty state is gone and the ongoing
+    // "+ Add layer" control appears — the timeline now has a layer/scene.
+    await settle(container, "+ Add layer");
+    expect(container.querySelector('[data-testid="empty-timeline"]')).toBeNull();
+    expect(container.querySelector('[data-testid="tl-add-layer"]')).toBeTruthy();
+    // and no second "Add first scene" primary lingers
+    expect(container.querySelectorAll('[data-testid="add-first-scene"]').length).toBe(0);
   });
 });
