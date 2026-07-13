@@ -3,8 +3,12 @@
 Proves end-to-end, with NO paid services:
   * a fake orchestrator client returns canonical ids and RECEIVES start (create)
     + cancel through the Backlot API;
-  * production mode (unconfigured Configured client) REFUSES to open a run —
-    fail-closed with an actionable 409 — instead of fabricating ids.
+  * production mode (an unavailable native Hermes Agent client) REFUSES to open a
+    run — fail-closed with an actionable 409 — instead of fabricating ids.
+
+The retry/resume control tests use ``FakeOrchestratorClient`` deliberately: the
+NATIVE Hermes Agent has no retry/resume concept (it fails those closed), so the
+fake — which DOES support control — is what keeps that coverage honest offline.
 """
 
 from __future__ import annotations
@@ -17,10 +21,8 @@ from fastapi.testclient import TestClient
 import backlot.brain_api as brain_api
 from backlot import server as server_mod
 from lib.production_brain.adapter import HermesBrainAdapter
-from lib.production_brain.orchestrator import (
-    ConfiguredHermesOrchestratorClient,
-    FakeOrchestratorClient,
-)
+from lib.production_brain.hermes_agent import _UnavailableAgentClient
+from lib.production_brain.orchestrator import FakeOrchestratorClient
 
 
 @pytest.fixture
@@ -77,12 +79,11 @@ def test_fake_orchestrator_receives_start_and_cancel(project, monkeypatch):
 
 
 def test_production_mode_refuses_without_external_ids(project, monkeypatch):
-    # Unconfigured production client → unavailable → the API fails closed (409),
+    # Native Hermes Agent not connected → unavailable → the API fails closed (409),
     # never fabricating a run.
-    monkeypatch.delenv("OPENMONTAGE_HERMES_ORCHESTRATOR_URL", raising=False)
     monkeypatch.setattr(
         brain_api, "default_adapter",
-        lambda: HermesBrainAdapter(client=ConfiguredHermesOrchestratorClient(url=None)))
+        lambda: HermesBrainAdapter(client=_UnavailableAgentClient()))
     with TestClient(server_mod.create_app()) as c:
         r = _post(c, "/api/project/demo/brain/start", {})
         assert r.status_code == 409

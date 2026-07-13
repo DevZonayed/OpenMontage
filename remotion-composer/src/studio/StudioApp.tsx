@@ -321,8 +321,9 @@ export const StudioApp: React.FC<StudioAppProps> = ({ client }) => {
 
   return (
     <div style={{ display: "flex", flexDirection: "column", height: "100%", color: "#ececef" }}>
-      {/* PRIMARY: the shared command-center card (same view model as the board). */}
-      <CommandCenter status={status} client={client} />
+      {/* DOMAIN A · PRODUCTION AGENT — native Hermes Agent connection + run state,
+          driven by the same canonical /status view model the board uses. */}
+      <CommandCenter status={status} />
 
       {/* Header / actions */}
       <div style={header}>
@@ -342,7 +343,10 @@ export const StudioApp: React.FC<StudioAppProps> = ({ client }) => {
             {renderReady ? "Remotion ready" : "Remotion not ready"}
           </span>
         </div>
-        <div style={{ display: "flex", gap: 8, alignItems: "center" }}>
+        {/* DOMAIN C · RENDERER — local preview + final render controls, distinct
+            from the Production Agent (A) and the Timeline/Assets rail (B). */}
+        <div style={{ display: "flex", gap: 8, alignItems: "center" }} data-testid="domain-renderer">
+          <span style={domainTag}>Renderer</span>
           <button style={btn} onClick={undo} disabled={!histRef.current?.canUndo} aria-label="Undo">
             Undo
           </button>
@@ -367,8 +371,9 @@ export const StudioApp: React.FC<StudioAppProps> = ({ client }) => {
 
       <div style={{ display: "flex", flex: 1, minHeight: 0 }}>
         {/* Scene rail / tracks / layers */}
-        <div style={rail}>
-          <div style={railTitle}>SCENES · TRACKS · SEQUENCES</div>
+        {/* DOMAIN B · TIMELINE / ASSETS — scenes, tracks, sequences + inspector. */}
+        <div style={rail} data-testid="domain-timeline">
+          <div style={railTitle}>TIMELINE / ASSETS · SCENES · TRACKS · SEQUENCES</div>
           {model.tracks.map((t) => (
             <div key={t.id} style={{ marginBottom: 12 }}>
               <div style={trackHeader}>
@@ -936,6 +941,14 @@ const rail: React.CSSProperties = {
   overflowY: "auto",
 };
 const railTitle: React.CSSProperties = { fontSize: 11, color: "#5f5f68", letterSpacing: "0.08em", marginBottom: 10 };
+const domainTag: React.CSSProperties = {
+  fontFamily: "ui-monospace, monospace",
+  fontSize: 9,
+  letterSpacing: "0.18em",
+  textTransform: "uppercase",
+  color: "#6aa1ff",
+  marginRight: 4,
+};
 const trackHeader: React.CSSProperties = {
   display: "flex",
   justifyContent: "space-between",

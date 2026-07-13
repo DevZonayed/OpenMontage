@@ -22,8 +22,6 @@ export interface StatusController {
   coldError: boolean;
   busy: boolean;
   actionError: string | null;
-  connectOpen: boolean;
-  setConnectOpen: (b: boolean) => void;
   refresh: () => void;
   runAction: (a: StatusAction) => void;
 }
@@ -33,7 +31,6 @@ export function useStatusView(client: BacklotClient): StatusController {
   const [coldError, setColdError] = useState(false);
   const [busy, setBusy] = useState(false);
   const [actionError, setActionError] = useState<string | null>(null);
-  const [connectOpen, setConnectOpen] = useState(false);
   const lastGood = useRef<StatusView | null>(null);
   const timer = useRef<ReturnType<typeof setTimeout> | null>(null);
 
@@ -82,10 +79,17 @@ export function useStatusView(client: BacklotClient): StatusController {
     const brainRun = !!view?.sources?.brain_run_id;
     try {
       switch (a.id) {
-        case "connect_hermes":
-        case "retry_connect":
-          setConnectOpen(true);
-          return;
+        // Native Hermes Agent connection — auto-detected, no credentials. A
+        // "connect_agent" (or a not-installed "re-check") POSTs an empty body to
+        // /api/agent/connect which re-probes the machine; disconnect tears it down.
+        case "connect_agent":
+          setBusy(true);
+          await client.connectAgent();
+          break;
+        case "disconnect_agent":
+          setBusy(true);
+          await client.disconnectAgent();
+          break;
         case "start":
         case "continue_hermes":
         case "restart":
@@ -137,5 +141,5 @@ export function useStatusView(client: BacklotClient): StatusController {
     }
   }, [client, tick, view]);
 
-  return { view, coldError, busy, actionError, connectOpen, setConnectOpen, refresh, runAction };
+  return { view, coldError, busy, actionError, refresh, runAction };
 }

@@ -1,19 +1,14 @@
-// Backlot project board — renders BoardState and stays live via SSE.
+// Backlot project board — a READ-ONLY production OVERVIEW that stays live via SSE.
+// The board answers: current stage, what just finished, what's next, any
+// blocker/approval (informational), media/output summary, and overall progress.
+// It performs NO mutations — the single dominant action is "Open Production
+// Studio" (→ /p/<id>/editor). All production controls live in the Studio.
 
 import {
   STAGE_ICONS, el, fmtAgo, fmtClock, fmtDuration, fmtMoney,
-  getJSON, postJSON, mediaURL, subscribe, thumbURL, waveBars,
+  getJSON, mediaURL, subscribe, thumbURL, waveBars,
 } from "/ui/lib.js";
 import { wireNewProjectButtons } from "/ui/newproject.js";
-
-// CSRF-guarded POST for run lifecycle actions.
-let _CSRF = null;
-async function mpost(url, body) {
-  if (!_CSRF) _CSRF = (await getJSON("/api/csrf")).csrf;
-  return postJSON(url, body || {}, { "X-OpenMontage-CSRF": _CSRF });
-}
-let runPollTimer = null;
-let lastRunSig = null;   // only re-render the run panel when the run materially changes
 
 const rawProjectPath = location.pathname.split("/p/")[1] || "";
 const projectId = decodeURIComponent(rawProjectPath);
@@ -82,303 +77,10 @@ function renderSlate(s) {
     ),
     ...chips,
     el("div", { class: "spacer" }),
-    el("a", { class: "chip nav-chip primary", href: `/p/${encodedProjectId}/editor` }, "◫ OPEN TIMELINE"),
     el("button", { class: "chip nav-chip", type: "button", "data-new-project": "" }, "+ NEW PROJECT"),
     liveEl,
     cost,
   );
-}
-
-// ---- Production run lifecycle panel -----------------------------------------
-// Replaces the old copy-prompt dead-end. Shows the REAL run state (from
-// /api/project/<id>/run), a prominent START PRODUCTION action that launches a
-// real local preflight/planning worker, live status, and STOP. The manual
-// copy-prompt survives only inside a collapsed Advanced section.
-const _ACTIVE_RUN_STATES = new Set(["starting", "running", "waiting_for_approval", "cancelling"]);
-
-function _elapsed(startedAt) {
-  if (!startedAt) return "";
-  const secs = Math.max(0, Math.round((Date.now() - Date.parse(startedAt)) / 1000));
-  const m = Math.floor(secs / 60), sVal = secs % 60;
-  return `${m}:${String(sVal).padStart(2, "0")}`;
-}
-
-function advancedPrompt(s) {
-  const box = el("pre", { class: "prompt-box", style: "margin-top:8px" }, "Loading your brief…");
-  const copyBtn = el("button", { class: "set-mini", type: "button" }, "Copy production prompt");
-  getJSON(`/api/project/${encodedProjectId}/intake`).then((intake) => {
-    const brief = (intake && intake.brief) || "";
-    const pipeline = (intake && intake.pipeline_type) || s.pipeline.pipeline_type;
-    const prompt =
-      `Produce the OpenMontage project "${s.title}" (id: ${projectId}, pipeline: ${pipeline}).\n\n` +
-      `Brief:\n${brief || "(no brief provided — ask me)"}\n\n` +
-      `Follow AGENT_GUIDE.md: read the project's intake.json, run the mandatory preflight ` +
-      `(provider_menu_summary), present concepts + the tool/cost plan, and PRESENT BOTH available ` +
-      `composition runtimes for my approval before producing anything. Do not skip proposal/checkpoints.`;
-    box.textContent = prompt;
-    copyBtn.onclick = async () => {
-      try { await navigator.clipboard.writeText(prompt); copyBtn.textContent = "Copied ✓"; }
-      catch { copyBtn.textContent = "Copy failed — select the text"; }
-    };
-  }).catch(() => { box.textContent = "(brief unavailable)"; });
-  const det = el("details", { class: "run-advanced", style: "margin-top:16px" });
-  det.append(el("summary", { style: "cursor:pointer;color:var(--dim)" }, "Advanced — run it manually with your own agent"));
-  det.append(box, el("div", { class: "np-actions", style: "justify-content:flex-start" }, copyBtn));
-  return det;
-}
-
-function _timelineLink() {
-  return el("a", { class: "set-mini", href: `/p/${encodedProjectId}/editor` }, "◫ Open timeline");
-}
-
-// The plan the preflight/planning worker actually produced (run_plan.json).
-function renderPlanCard(plan) {
-  const card = el("div", { class: "run-plan-card",
-    style: "margin:12px 0;padding:14px 16px;background:var(--panel,#12151c);border:1px solid var(--line,#232a36);border-radius:8px" });
-  card.append(el("div", { style: "font-family:var(--mono,monospace);font-size:11px;letter-spacing:0.14em;text-transform:uppercase;color:var(--dim,#8a93a3);margin-bottom:10px" }, "Production plan"));
-  const row = el("div", { style: "display:flex;gap:28px;flex-wrap:wrap;margin-bottom:12px" });
-  const stat = (label, value) => row.append(el("div", { style: "display:flex;flex-direction:column;gap:2px" },
-    el("span", { style: "font-size:11px;color:var(--dim,#8a93a3)" }, label),
-    el("b", { style: "font-size:15px;color:var(--bone,#e9e4d6)" }, value)));
-  stat("Target length", plan.target_formatted || "—");
-  stat("Total frames", `${plan.total_frames ?? "—"} @ ${plan.fps ?? 30}fps`);
-  stat("Narration budget", `≈ ${plan.word_budget ?? "—"} words`);
-  const pr = plan.provider_readiness || {};
-  stat("Providers configured", `${pr.capabilities_configured ?? "?"} of ${pr.capabilities_total ?? "?"}`);
-  card.append(row);
-  // composition runtimes available
-  const rts = pr.composition_runtimes || {};
-  const chips = el("div", { style: "display:flex;gap:8px;flex-wrap:wrap;align-items:center" });
-  chips.append(el("span", { style: "font-size:12px;color:var(--dim,#8a93a3)" }, "Composition runtimes:"));
-  for (const [name, ok] of Object.entries(rts)) {
-    chips.append(el("span", {
-      style: `font-size:12px;padding:3px 10px;border-radius:999px;border:1px solid ${ok ? "var(--ok,#5ec27a)" : "var(--line,#232a36)"};color:${ok ? "var(--ok,#5ec27a)" : "var(--dim,#8a93a3)"}`,
-    }, `${name} ${ok ? "✓" : "✗"}`));
-  }
-  card.append(chips);
-  return card;
-}
-
-// Live activity feed — the real steps the run took (from run.log). Always visible
-// (not a <details>) so you can see exactly what the preflight/planning did.
-function renderActivityLog(run) {
-  const log = run.log || [];
-  if (!log.length) return null;
-  const box = el("div", { class: "run-log",
-    style: "margin:12px 0;max-height:150px;overflow:auto;background:var(--night-2,#0c1224);border:1px solid var(--line,#232a36);border-radius:8px;padding:10px 12px" });
-  box.append(el("div", { style: "font-family:var(--mono,monospace);font-size:11px;letter-spacing:0.14em;text-transform:uppercase;color:var(--dim,#8a93a3);margin-bottom:6px" }, "Activity — what the run did"));
-  for (const e of log.slice(-40)) {
-    const line = el("div", { class: "mono", style: "font-size:12px;color:var(--cond,#93a0b4);padding:2px 0;display:flex;gap:8px" });
-    line.append(el("span", { style: "color:var(--dim,#8a93a3);flex:0 0 auto" }, (e.ts || "").slice(11, 19)));
-    line.append(el("span", {}, e.message || ""));
-    box.append(line);
-  }
-  box.scrollTop = 1e6;
-  return box;
-}
-
-// Expandable "what the models can do" — per-capability provider readiness.
-function renderProviderDetail(plan) {
-  const media = ((plan.provider_readiness || {}).media_capabilities) || [];
-  if (!media.length) return null;
-  const det = el("details", { class: "run-providers", style: "margin:12px 0" });
-  det.append(el("summary", { style: "cursor:pointer;color:var(--dim,#8a93a3);font-size:13px" },
-    "Providers & models — what this run can and can't generate"));
-  const grid = el("div", { style: "margin-top:10px;display:grid;grid-template-columns:1fr;gap:6px" });
-  for (const m of media) {
-    const ok = m.configured > 0;
-    const row = el("div", { style: "display:flex;align-items:center;gap:10px;font-size:13px" });
-    row.append(el("span", { style: `flex:0 0 150px;color:${ok ? "var(--bone,#e9e4d6)" : "var(--dim,#8a93a3)"}` }, m.capability));
-    row.append(el("span", { style: `flex:0 0 64px;color:${ok ? "var(--ok,#5ec27a)" : "var(--warn,#e8c07d)"}` }, `${m.configured}/${m.total}`));
-    row.append(el("span", { style: "color:var(--cond,#93a0b4)" },
-      (m.available_providers && m.available_providers.length) ? m.available_providers.join(", ") : "none configured — add a key in Settings"));
-    grid.append(row);
-  }
-  det.append(grid);
-  return det;
-}
-
-// Inline player for the free preview animatic once it exists.
-function previewSection(run) {
-  if (!run.preview || !run.preview.url) return null;
-  const wrap = el("div", { style: "margin:14px 0" });
-  wrap.append(el("div", { style: "font-family:var(--mono,monospace);font-size:11px;letter-spacing:0.14em;text-transform:uppercase;color:var(--amber,#e8c07d);margin-bottom:8px" },
-    `▶ Preview animatic · ${run.preview.measured_seconds != null ? run.preview.measured_seconds + "s" : "ready"} · free`));
-  wrap.append(el("video", { controls: "true", preload: "metadata", src: run.preview.url,
-    style: "width:100%;max-width:680px;border-radius:8px;border:1px solid var(--line,#232a36);background:#000" }));
-  return wrap;
-}
-
-function _inboxSig(inbox) {
-  if (!inbox) return "";
-  return [inbox.count, inbox.replan ? 1 : 0, (inbox.approval && inbox.approval.needs) || "",
-    (inbox.revisions || []).map((r) => r.id).join(",")].join("~");
-}
-
-function _runSig(run) {
-  const st = run.state || "not_started";
-  return [st, !!run.plan_approved, run.phase || "", run.activity || "",
-    (run.log || []).length, run.error || "", (run.preview && run.preview.at) || "",
-    _inboxSig(run._inbox),
-    boardHasProduction(currentState()) ? 1 : 0].join("|");
-}
-
-function currentState() { return replay ? stateAt(state, replay.t) : state; }
-
-function renderRunPanel(s) {
-  const wrap = el("div", { class: "board-empty run-panel" });
-  const body = el("div", {});
-  wrap.append(body);
-  lastRunSig = null;               // fresh panel → force first render
-  refreshRun(s, body, wrap, true);
-  return wrap;
-}
-
-// Fetch the run; only rebuild the DOM when it MATERIALLY changed (prevents the
-// every-poll flicker + collapse of expanded sections). Always updates the badge.
-async function refreshRun(s, body, wrap, force) {
-  let run;
-  try { run = await getJSON(`/api/project/${encodedProjectId}/run`); }
-  catch {
-    if (force) { body.textContent = ""; body.append(el("p", { class: "hint" }, "Could not load run status.")); }
-    _scheduleRunPoll(s, body, wrap, "running");
-    return;
-  }
-  // Best-effort: what's queued for the agent (revisions / re-plan / approval).
-  try { run._inbox = await getJSON(`/api/project/${encodedProjectId}/agent-inbox`); }
-  catch { run._inbox = null; }
-  const st = run.state || "not_started";
-  // The command-center card (canonical /status) owns the slate badge now; the
-  // coarse run panel lives inside the collapsed technical-details section.
-  if (boardHasProduction(s) && st === "not_started") { wrap.style.display = "none"; return; }
-  wrap.style.display = "";
-
-  const sig = _runSig(run);
-  if (force || sig !== lastRunSig) {
-    lastRunSig = sig;
-    renderRunBody(s, body, wrap, run);
-  }
-  _scheduleRunPoll(s, body, wrap, st);
-}
-
-function _scheduleRunPoll(s, body, wrap, st) {
-  if (runPollTimer) { clearTimeout(runPollTimer); runPollTimer = null; }
-  if (_ACTIVE_RUN_STATES.has(st)) {
-    // slower cadence for the durable waiting state; snappier while working
-    const ms = st === "waiting_for_approval" ? 4000 : 2000;
-    runPollTimer = setTimeout(() => refreshRun(s, body, wrap, false), ms);
-  }
-}
-
-function renderRunBody(s, body, wrap, run) {
-  const st = run.state || "not_started";
-  body.textContent = "";
-  const repaint = () => { lastRunSig = null; refreshRun(s, body, wrap, true); };
-  const disableBtns = () => [...wrap.querySelectorAll("button")].forEach((b) => { b.disabled = true; });
-  const act = async (url, msg) => {
-    disableBtns();
-    try { await mpost(url, msg || {}); }
-    catch (e) { body.append(el("p", { class: "hint", style: "color:var(--red)" }, e.message || "Action failed.")); }
-    repaint();
-  };
-  const start = () => act(`/api/project/${encodedProjectId}/run`);
-  const stop = () => { if (window.confirm("Stop this production run? Completed artifacts and checkpoints are preserved.")) act(`/api/project/${encodedProjectId}/run/cancel`, { run_id: run.run_id }); };
-  const startBtn = (label) => { const b = el("button", { class: "set-btn", type: "button" }, label); b.onclick = start; return b; };
-  const stopBtn = () => { const b = el("button", { class: "set-mini", type: "button", style: "border-color:var(--red);color:var(--red)" }, "■ Stop production"); b.onclick = stop; return b; };
-  const previewBtn = () => {
-    const b = el("button", { class: "set-mini", type: "button" }, run.preview ? "↻ Re-render preview" : "▶ Generate preview animatic (free)");
-    b.onclick = async () => {
-      disableBtns();
-      const note = el("p", { class: "hint", style: "color:var(--amber,#e8c07d)" }, "Rendering a free preview animatic locally (~20–40s)…");
-      body.append(note);
-      try { await mpost(`/api/project/${encodedProjectId}/run/preview`, {}); }
-      catch (e) { note.textContent = e.message || "Preview render failed."; note.style.color = "var(--red)"; setTimeout(repaint, 1800); return; }
-      repaint();
-    };
-    return b;
-  };
-
-  if (st === "not_started") {
-    body.append(el("h3", {}, "Production not started"));
-    body.append(el("p", { class: "hint" },
-      `Your workspace, brief and ${s.target_formatted || "target"} duration are saved — nothing is generating yet. ` +
-      "Start the local preflight & planning run: it validates your intake, reads the provider menu, and plans a " +
-      "frame-accurate timeline, then stops at the first approval point. No paid generation runs automatically."));
-    body.append(el("div", { class: "np-actions", style: "justify-content:flex-start" }, startBtn("▶ START PRODUCTION")));
-    body.append(advancedPrompt(s));
-  } else if (st === "starting" || st === "running" || st === "cancelling") {
-    body.append(el("h3", {}, st === "cancelling" ? "Cancelling…" : "Production running"));
-    body.append(el("p", { class: "run-activity" }, run.activity || ""));
-    const meta = el("p", { class: "hint mono" });
-    meta.textContent = `state: ${st}${run.phase ? " · phase: " + run.phase : ""}${run.started_at ? " · elapsed " + _elapsed(run.started_at) : ""}`;
-    body.append(meta);
-    const log = renderActivityLog(run); if (log) body.append(log);
-    if (st !== "cancelling") body.append(el("div", { class: "np-actions", style: "justify-content:flex-start" }, stopBtn()));
-  } else if (st === "waiting_for_approval") {
-    const approved = !!run.plan_approved;
-    body.append(el("h3", {}, approved ? "✓ Plan approved — awaiting your agent" : "◈ Review & approve the plan"));
-    body.append(el("p", { class: "run-activity" }, run.activity || ""));
-    if (run.plan) body.append(renderPlanCard(run.plan));
-    if (run.plan) { const pd = renderProviderDetail(run.plan); if (pd) body.append(pd); }
-    const pvs = previewSection(run); if (pvs) body.append(pvs);
-    const log = renderActivityLog(run); if (log) body.append(log);
-    if (!approved) {
-      body.append(el("p", { class: "hint" },
-        "This is the provider + proposal approval point. Review the plan above, then Approve to give your go-ahead. " +
-        "You can also render a free preview animatic of the plan now. Generating the full film's assets is agent-driven " +
-        "(Backlot never auto-runs paid generation)."));
-      const approveBtn = el("button", { class: "set-btn", type: "button" }, "✓ Approve plan");
-      approveBtn.onclick = () => act(`/api/project/${encodedProjectId}/run/approve`, { run_id: run.run_id });
-      body.append(el("div", { class: "np-actions", style: "justify-content:flex-start;gap:10px;flex-wrap:wrap" }, approveBtn, previewBtn(), _timelineLink(), stopBtn()));
-    } else {
-      body.append(el("p", { class: "hint" },
-        "✓ Approved. Nothing is generating automatically right now — that's by design: Backlot never runs paid " +
-        "generation on its own (Rule Zero). Producing the full film's assets happens through your agent, using the " +
-        "handoff shown in the Agent Queue below. The run stays here (cancellable) until the agent takes over."));
-      body.append(el("p", { class: "hint", style: "color:var(--amber,#e8c07d)" },
-        "To SEE real output now — for free, locally — open the timeline and hit “▶ Render preview film” for a complete " +
-        "Remotion render you can play, or render a quick preview animatic here."));
-      body.append(el("div", { class: "np-actions", style: "justify-content:flex-start;gap:10px;flex-wrap:wrap" }, _timelineLink(), previewBtn(), stopBtn()));
-      body.append(advancedPrompt(s));
-    }
-  } else if (st === "cancelled" || st === "failed" || st === "completed") {
-    const titleMap = { cancelled: "Run cancelled", failed: "Run failed", completed: "Production complete" };
-    body.append(el("h3", {}, titleMap[st]));
-    if (st === "failed" && run.error) body.append(el("p", { class: "hint", style: "color:var(--red)" }, run.error));
-    else body.append(el("p", { class: "hint" }, run.activity || ""));
-    const log = renderActivityLog(run); if (log) body.append(log);
-    body.append(el("div", { class: "np-actions", style: "justify-content:flex-start;gap:10px" }, startBtn("▶ Start again"), _timelineLink()));
-    if (st !== "completed") body.append(advancedPrompt(s));
-  }
-  if (run._inbox && run._inbox.count) body.append(renderAgentQueueBoard(run._inbox));
-}
-
-// Consolidated, honest view of what's queued for the agent (Rule Zero) — the
-// production hub shows exactly what the agent will pick up next.
-function renderAgentQueueBoard(inbox) {
-  const card = el("div", { style: "margin-top:14px;border:1px solid var(--amber,#e8c07d);border-radius:8px;padding:10px 12px;background:#1a1710" });
-  card.append(el("div", { style: "display:flex;justify-content:space-between;align-items:center;margin-bottom:6px" },
-    el("b", { style: "color:var(--amber,#e8c07d);font-size:12px;letter-spacing:0.1em" }, "AGENT QUEUE"),
-    el("span", { class: "mono", style: "font-size:11px;color:var(--amber,#e8c07d)" }, `${inbox.count} queued`)));
-  card.append(el("p", { class: "hint", style: "margin:0 0 6px" }, inbox.summary));
-  for (const r of (inbox.revisions || [])) {
-    card.append(el("div", { style: "font-size:12px;color:var(--bone,#e9e4d6)" },
-      `✦ ${r.layer_type || "layer"} ${r.layer_id} — “${String(r.prompt || "").slice(0, 80)}”`));
-  }
-  if (inbox.replan) card.append(el("div", { style: "font-size:12px;color:var(--bone,#e9e4d6)" },
-    "⟳ Duration re-plan requested — the agent will rebuild the timeline to the new length."));
-  if (inbox.approval && inbox.approval.needs === "agent") card.append(el("div", { style: "font-size:12px;color:var(--bone,#e9e4d6)" },
-    "▶ Plan approved — awaiting the agent to produce."));
-  card.append(el("p", { class: "hint", style: "margin:8px 0 0" },
-    "Honest, machine-readable requests the agent consumes — Backlot never generates media itself (Rule Zero)."));
-  card.append(el("div", { style: "margin-top:8px" }, _timelineLink()));
-  return card;
-}
-
-function boardHasProduction(s) {
-  return (s.stages || []).some((x) => x.status === "completed" || x.status === "in_progress")
-    || (s.storyboard && (s.storyboard.scenes || []).length)
-    || (s.renders && s.renders.length);
 }
 
 // ===========================================================================
@@ -390,7 +92,7 @@ let statusPollTimer = null;
 let lastStatusSig = null;
 let lastStatusView = null;   // last-known-good view (preserved on network error)
 
-const OWNER_LABEL = { hermes: "Hermes", user: "You", system: "System" };
+const OWNER_LABEL = { hermes: "Hermes Agent", user: "You", system: "System" };
 const STEP_GLYPH = {
   completed: "✓", current: "◉", blocked: "▲", awaiting: "◈",
   failed: "✕", skipped: "–", upcoming: "",
@@ -480,9 +182,8 @@ function renderStatusCard(wrap, view) {
   wrap.dataset.state = view.overall_state;
   wrap.dataset.owner = view.owner || "";
 
-  // --- connection banner (only when connecting is the actual next step) ----
-  // Never nag to connect while a live run is already producing, or on a
-  // terminal run — the banner is for when the user must connect to proceed.
+  // --- connection status line (informational only — never a button) --------
+  // Never nag while a live run is already producing, or on a terminal run.
   const conn = view.connection || {};
   const activeRun = view.is_live || ["producing", "cancelling", "cancelled", "failed", "completed"].includes(view.overall_state);
   if (!conn.available && conn.status && conn.status !== "unknown" && !activeRun) {
@@ -498,7 +199,7 @@ function renderStatusCard(wrap, view) {
     }
   }
 
-  // --- the three-up NOW / NEXT / LAST -------------------------------------
+  // --- the three-up NOW / NEXT / LATEST -----------------------------------
   const grid = el("div", { class: "cmd-grid" });
 
   // NOW
@@ -516,26 +217,19 @@ function renderStatusCard(wrap, view) {
   if (metaBits.length) now.append(el("div", { class: "cmd-meta" }, metaBits.join(" · ")));
   grid.append(now);
 
-  // NEXT (single primary action + owner)
+  // NEXT — read-only description of whose move it is + the SINGLE dominant CTA.
+  // The board performs no mutations; acting on anything happens in the Studio.
   const next = el("div", { class: "cmd-next" });
   next.append(el("div", { class: "cmd-eyebrow" }, "NEXT"));
   const pa = view.primary_action || {};
-  const owns = OWNER_LABEL[pa.owner] || "";
   next.append(el("div", { class: "cmd-owner-line" },
-    pa.owner === "user" ? "Your move" : pa.owner === "hermes" ? "Hermes' move" : "In progress"));
-  next.append(renderPrimaryAction(view, pa));
+    pa.owner === "user" ? "Your move" : pa.owner === "hermes" ? "Hermes Agent's move" : "In progress"));
+  if (pa.label) next.append(el("p", { class: "cmd-task" }, pa.label));
   if (view.why_waiting) next.append(el("p", { class: "cmd-why" }, view.why_waiting));
-  // secondary actions
-  const secs = (view.secondary_actions || []);
-  if (secs.length || view.stop_available) {
-    const row = el("div", { class: "cmd-secondary" });
-    for (const a of secs) row.append(renderSecondaryAction(view, a));
-    if (view.stop_available) row.append(renderStopAction(view));
-    next.append(row);
-  }
+  next.append(openStudioCTA());
   grid.append(next);
 
-  // LAST (latest completed event / output)
+  // LATEST (latest completed event / output)
   const last = el("div", { class: "cmd-last" });
   last.append(el("div", { class: "cmd-eyebrow" }, "LATEST"));
   const ev = view.latest_event;
@@ -546,14 +240,12 @@ function renderStatusCard(wrap, view) {
   } else {
     last.append(el("p", { class: "cmd-lastmsg dim" }, "No activity yet."));
   }
-  // real telemetry when a live job is running (never for fixtures)
-  const id = view.identity || {};
-  if (view.is_live && (id.job || id.tool || id.provider)) {
-    const chips = el("div", { class: "cmd-idchips" });
-    if (id.tool) chips.append(el("span", { class: "idchip" }, id.tool));
-    if (id.provider) chips.append(el("span", { class: "idchip" }, id.provider));
-    if (id.job) chips.append(el("span", { class: "idchip mono", title: id.job }, "job " + _shortId(id.job)));
-    last.append(chips);
+  // A small "agent session active" note only when a run is genuinely live —
+  // never a raw job/tool/provider handle (this is an overview, not a console).
+  if (view.is_live) {
+    const sess = (view.identity || {}).session;
+    last.append(el("div", { class: "cmd-idchips" },
+      el("span", { class: "idchip" }, "◉ Agent session active" + (sess ? " · " + _shortId(sess) : ""))));
   }
   if (view.is_fixture) last.append(el("div", { class: "cmd-fixture" }, "◐ Demo data — no live run"));
   grid.append(last);
@@ -563,11 +255,22 @@ function renderStatusCard(wrap, view) {
   // --- 11-stage stepper ---------------------------------------------------
   wrap.append(renderStepper(view));
 
-  // --- render availability note (when relevant) ---------------------------
+  // --- render summary (read-only) -----------------------------------------
+  // ONLY show a "Rendering…" indicator when a real render job is active.
   const r = view.render || {};
-  if (!r.renderable && r.reason && ["ready_to_produce", "producing", "awaiting_plan_approval"].includes(view.overall_state)) {
+  if (r.active) {
+    wrap.append(el("div", { class: "cmd-rendernote" },
+      el("span", { class: "spinner" }),
+      " Rendering" + (r.layer_count ? ` · ${r.layer_count} layers` : "") + "…"));
+  } else if (!r.renderable && r.reason && ["ready_to_produce", "producing", "awaiting_plan_approval"].includes(view.overall_state)) {
     wrap.append(el("div", { class: "cmd-rendernote" }, "▤ " + r.reason));
   }
+}
+
+// The single dominant navigation action on the whole page.
+function openStudioCTA() {
+  return el("a", { class: "cmd-primary", href: `/p/${encodedProjectId}/editor` },
+    "◫ Open Production Studio");
 }
 
 function renderStepper(view) {
@@ -585,187 +288,16 @@ function renderStepper(view) {
 }
 
 function renderConnectionBanner(view) {
-  // Status text ONLY — no button. The single clickable Connect action on the
-  // page is the command-center primary below (one-action invariant).
+  // Status text ONLY — no button. If the agent isn't connected the user acts
+  // via the single "Open Production Studio" CTA; the board never connects.
   const conn = view.connection || {};
-  const banner = el("div", { class: `cmd-conn ${conn.status} statusonly`, role: "status" });
+  const name = conn.server_name || "Hermes Agent";
+  const banner = el("div", { class: `cmd-conn ${conn.status || ""} statusonly`, role: "status" });
   banner.append(el("div", { class: "cmd-conn-text" },
-    el("b", {}, conn.headline || "Hermes connection"),
-    conn.detail ? el("div", { class: "cmd-conn-detail" }, conn.detail) : null));
+    el("b", {}, `${name}: ${conn.headline || conn.status || "not connected"}`),
+    conn.detail ? el("div", { class: "cmd-conn-detail" }, conn.detail) : null,
+    el("div", { class: "cmd-conn-detail" }, "Open the Production Studio to connect and run production.")));
   return banner;
-}
-
-// ---- action wiring ---------------------------------------------------------
-function _statusRepaint(wrap) {
-  lastStatusSig = null;
-  const w = wrap || document.querySelector(".cmd-center");
-  if (w) refreshStatus(w, true);
-}
-
-function renderPrimaryAction(view, pa) {
-  const passive = pa.advances_production === false && ["status", "deliverable"].includes(pa.kind);
-  if (passive && pa.kind === "status") {
-    return el("div", { class: "cmd-primary passive", role: "status" },
-      el("span", { class: "spinner" }), pa.label);
-  }
-  const btn = el("button", { class: "cmd-primary", type: "button" }, pa.label);
-  btn.onclick = () => runStatusAction(view, pa, btn);
-  return btn;
-}
-
-function renderSecondaryAction(view, a) {
-  const btn = el("button", { class: "cmd-btn ghost", type: "button" }, a.label);
-  btn.onclick = () => runStatusAction(view, a, btn);
-  return btn;
-}
-
-function renderStopAction(view) {
-  const btn = el("button", { class: "cmd-btn danger", type: "button" }, "■ Stop production");
-  btn.onclick = () => {
-    if (!window.confirm("Stop this production run? Completed work is preserved.")) return;
-    const brain = !!view.sources.brain_run_id;
-    const url = brain
-      ? `/api/project/${encodedProjectId}/brain/cancel`
-      : `/api/project/${encodedProjectId}/run/cancel`;
-    _doStatusPost(url, { run_id: view.run_id }, btn);
-  };
-  return btn;
-}
-
-async function runStatusAction(view, a, btn) {
-  const P = `/api/project/${encodedProjectId}`;
-  switch (a.id) {
-    case "connect_hermes":
-    case "retry_connect":
-      return openConnectModal(view);
-    case "start":
-    case "continue_hermes":
-    case "restart":
-      return _doStatusPost(`${P}/brain/start`, {}, btn);
-    case "approve_plan":
-      return _doStatusPost(`${P}/run/approve`, { run_id: view.run_id }, btn);
-    case "request_changes":
-      return _doStatusPost(`${P}/run/cancel`, { run_id: view.run_id }, btn,
-        "Send the plan back for changes? The current run stops; nothing is lost.");
-    case "approve":
-      return _doStatusPost(`${P}/brain/approve`,
-        { run_id: view.run_id, approval_id: a.approval_id, stage: a.stage }, btn);
-    case "reject":
-      return _doStatusPost(`${P}/brain/reject`,
-        { run_id: view.run_id, approval_id: a.approval_id, stage: a.stage }, btn);
-    case "retry_stage":
-    case "retry_control":
-      return _doStatusPost(`${P}/brain/retry`, { run_id: view.run_id, stage: a.stage }, btn);
-    case "preview":
-      return _doPreview(btn);
-    case "view_deliverable":
-      { const el0 = document.querySelector(".renders, .render-card"); if (el0) el0.scrollIntoView({ behavior: "smooth" }); return; }
-    default:
-      return _statusRepaint();
-  }
-}
-
-async function _doStatusPost(url, body, btn, confirmMsg) {
-  if (confirmMsg && !window.confirm(confirmMsg)) return;
-  if (btn) { btn.disabled = true; }
-  try {
-    await mpost(url, body || {});
-  } catch (e) {
-    const wrap = document.querySelector(".cmd-center");
-    if (wrap) wrap.append(el("div", { class: "cmd-diag conflict" }, "⚠ " + (e.message || "Action failed.")));
-    if (btn) btn.disabled = false;
-    return;
-  }
-  _statusRepaint();
-}
-
-async function _doPreview(btn) {
-  if (btn) btn.disabled = true;
-  const wrap = document.querySelector(".cmd-center");
-  const note = el("div", { class: "cmd-diag stale" }, "Rendering a free local preview animatic (~20–40s)…");
-  if (wrap) wrap.append(note);
-  try {
-    await mpost(`/api/project/${encodedProjectId}/run/preview`, {});
-  } catch (e) {
-    note.className = "cmd-diag conflict";
-    note.textContent = "⚠ " + (e.message || "Preview render failed.");
-    if (btn) btn.disabled = false;
-    return;
-  }
-  _statusRepaint();
-}
-
-// ---- Connect Hermes guided modal ------------------------------------------
-function openConnectModal(view) {
-  const conn = view.connection || {};
-  modal.textContent = "";
-  modal.classList.add("open");
-  const card = el("div", { class: "cmd-modal" });
-  card.append(el("h3", {}, "Connect Hermes"));
-  card.append(el("p", { class: "hint" },
-    "OpenMontage runs production through the Hermes brain (Mochlet). It verifies "
-    + "the local MCP orchestrator's capabilities and the project. Your token is "
-    + "stored only in the OS keychain — never printed or written to disk."));
-  const urlIn = el("input", { class: "cmd-input", type: "text",
-    value: conn.suggested_endpoint || conn.endpoint || "http://127.0.0.1:9235/mcp",
-    placeholder: "http://127.0.0.1:9235/mcp" });
-  const tokIn = el("input", { class: "cmd-input", type: "password", autocomplete: "off",
-    placeholder: "Access token (from Mochlet)" });
-  card.append(el("label", { class: "cmd-label" }, "Mochlet MCP endpoint"), urlIn);
-  card.append(el("label", { class: "cmd-label" }, "Token (kept in the OS keychain)"), tokIn);
-  // Project chooser (revealed when Mochlet reports multiple projects).
-  const projectWrap = el("div", { style: "display:none" });
-  const projectLabel = el("label", { class: "cmd-label" }, "OpenMontage project in Mochlet");
-  const projectSel = el("select", { class: "cmd-input" });
-  projectWrap.append(projectLabel, projectSel);
-  const status = el("div", { class: "cmd-modal-status" });
-  const testBtn = el("button", { class: "cmd-btn ghost", type: "button" }, "Test connection");
-  const connectBtn = el("button", { class: "cmd-primary", type: "button" }, "Connect & verify");
-  const cancelBtn = el("button", { class: "cmd-btn ghost", type: "button" }, "Cancel");
-  cancelBtn.onclick = () => modal.classList.remove("open");
-
-  const showProjects = (projects) => {
-    projectSel.textContent = "";
-    for (const p of projects) {
-      projectSel.append(el("option", { value: p.id }, p.name || p.path || p.id));
-    }
-    projectWrap.style.display = "";
-    connectBtn.textContent = "Connect to project";
-  };
-
-  const doConnect = async (withProject) => {
-    connectBtn.disabled = true; testBtn.disabled = true;
-    status.className = "cmd-modal-status";
-    status.textContent = "Verifying Hermes (MCP capabilities + project)…";
-    const body = { url: urlIn.value.trim(), token: tokIn.value || undefined };
-    if (withProject && projectSel.value) body.project_id = projectSel.value;
-    try {
-      const res = await mpost(`/api/hermes/connect`, body);
-      if (res.available) {
-        status.className = "cmd-modal-status ok";
-        status.textContent = "✓ " + (res.headline || "Connected");
-        setTimeout(() => { modal.classList.remove("open"); _statusRepaint(); }, 700);
-      } else if (res.status === "needs_project" && Array.isArray(res.projects) && res.projects.length) {
-        showProjects(res.projects);
-        status.className = "cmd-modal-status";
-        status.textContent = res.detail || "Choose the OpenMontage project in Mochlet.";
-        connectBtn.disabled = false; testBtn.disabled = false;
-      } else {
-        status.className = "cmd-modal-status err";
-        status.textContent = (res.headline || "Couldn't connect") + (res.detail ? " — " + res.detail : "");
-        connectBtn.disabled = false; testBtn.disabled = false;
-      }
-    } catch (e) {
-      status.className = "cmd-modal-status err";
-      status.textContent = e.message || "Connection failed.";
-      connectBtn.disabled = false; testBtn.disabled = false;
-    }
-  };
-  testBtn.onclick = () => doConnect(false);
-  connectBtn.onclick = () => doConnect(projectWrap.style.display !== "none");
-  card.append(projectWrap, status,
-    el("div", { class: "cmd-modal-actions" }, connectBtn, testBtn, cancelBtn));
-  modal.append(card);
 }
 
 // Sanitized short id — never leak a full raw job/session handle in the UI.
@@ -1441,20 +973,19 @@ function render() {
   document.title = `Backlot — ${s.title}`;
   document.body.classList.toggle("first", firstPaint);
   firstPaint = false;
-  if (runPollTimer) { clearTimeout(runPollTimer); runPollTimer = null; }
   if (statusPollTimer) { clearTimeout(statusPollTimer); statusPollTimer = null; }
   app.innerHTML = "";
   app.append(renderSlate(s));
   // PRIMARY: the single, dominant command-center card (canonical /status).
+  // Read-only overview; its only action is "Open Production Studio".
   app.append(renderCommandCenter(s));
 
-  // SECONDARY: the pipeline checkpoint rail + coarse run controls + manual
-  // handoff, collapsed under an expandable "details" section — never the
-  // primary hierarchy. (Open timeline / Agent Queue / manual prompt live here.)
+  // SECONDARY: the pipeline checkpoint rail, collapsed under an expandable
+  // read-only "details" section — never the primary hierarchy. NO action
+  // buttons live here; clicking a stage opens its artifact JSON (read-only).
   const tech = el("details", { class: "tech-details" });
-  tech.append(el("summary", {}, "Production details, checkpoints & tools"));
+  tech.append(el("summary", {}, "Production details & checkpoints"));
   tech.append(renderRail(s));
-  tech.append(renderRunPanel(s));
   app.append(tech);
 
   const replayBar = renderReplayBar(state);

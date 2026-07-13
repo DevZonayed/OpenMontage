@@ -1,15 +1,16 @@
 """Backlot data layer for the CANONICAL production-status view.
 
-One endpoint, one reconciled view model — consumed by BOTH the board and the
-Remotion Studio so they can never disagree about where the production is or what
-to do next. Mirrors the ``brain_api`` / ``timeline_api`` convention: pure,
-synchronous functions that take a ``project_dir`` and never block; the async
-routes in ``backlot/server.py`` add the guards.
+One endpoint, one reconciled view model — consumed by BOTH the board (as a
+read-only overview) and the Remotion Studio (as the action center) so they can
+never disagree about where the production is or what to do next. Mirrors the
+``brain_api`` / ``timeline_api`` convention: pure, synchronous functions that take
+a ``project_dir`` and never block; the async routes in ``backlot/server.py`` add
+the guards.
 
 The heavy source reads (brain state, board state, run.json, timeline) are cheap
-filesystem reads. The one potentially-network read — the Hermes/Mochlet health
-handshake — is cached with a short TTL so board polling never hammers the local
-service.
+filesystem reads. The one potentially-slow read — the native Hermes Agent
+readiness probe (a bounded local subprocess) — is cached with a short TTL so the
+board's frequent /status polling never re-probes the agent every cycle.
 """
 
 from __future__ import annotations
@@ -20,9 +21,9 @@ from typing import Any, Callable, Optional
 
 from lib.production_status import build_status_view
 
-# Short-lived, process-global cache for the (global, not per-project) Hermes
-# connection status so the board's frequent /status polling doesn't probe the
-# local orchestrator every cycle.
+# Short-lived, process-global cache for the (global, not per-project) Hermes Agent
+# connection status so the board's frequent /status polling doesn't re-probe the
+# local agent every cycle.
 _CONN_TTL_SECONDS = 5.0
 _conn_cache: dict[str, Any] = {"at": 0.0, "value": None}
 
@@ -52,24 +53,26 @@ def _load_timeline_lite(project_dir: Path) -> Optional[dict]:
 
 def connection_view(
     *,
-    transport: Optional[Callable[..., Any]] = None,
+    detector: Optional[Any] = None,
     probe: bool = True,
     use_cache: bool = True,
     now: Optional[Callable[[], float]] = None,
 ) -> dict:
-    """The Hermes connection status (cached). Never raises, never returns a token."""
+    """The native Hermes Agent connection status (cached). Never raises, and never
+    contains an endpoint, token, project, or job."""
     clock = now or time.time
-    if use_cache and transport is None:
+    if use_cache and detector is None:
         ts = clock()
         if _conn_cache["value"] is not None and (ts - _conn_cache["at"]) < _CONN_TTL_SECONDS:
             return _conn_cache["value"]
-    from lib.production_brain.connection import connection_status
+    from lib.production_brain.hermes_agent import agent_status
 
-    value = _safe(lambda: connection_status(transport=transport, probe=probe),
-                  {"status": "unknown", "available": False,
-                   "headline": "Hermes connection status is unavailable.",
-                   "detail": "", "actions": [], "token_configured": False})
-    if use_cache and transport is None:
+    value = _safe(lambda: agent_status(detector=detector, probe=probe),
+                  {"kind": "hermes_agent", "status": "unknown", "available": False,
+                   "server_name": "Hermes Agent",
+                   "headline": "Hermes Agent status is unavailable.",
+                   "detail": "", "actions": [], "installed": False, "ready": False})
+    if use_cache and detector is None:
         _conn_cache["at"] = clock()
         _conn_cache["value"] = value
     return value
@@ -80,7 +83,7 @@ def build_status_payload(
     *,
     demo: bool = False,
     stale: bool = False,
-    connection_transport: Optional[Callable[..., Any]] = None,
+    connection_detector: Optional[Any] = None,
     probe_connection: bool = True,
 ) -> dict:
     """Assemble the canonical status view for one project."""
@@ -92,7 +95,7 @@ def build_status_payload(
     run = _safe(lambda: _load_run(project_dir), None)
     inbox = _safe(lambda: _load_inbox(project_dir), None)
     timeline = _load_timeline_lite(project_dir)
-    connection = connection_view(transport=connection_transport, probe=probe_connection)
+    connection = connection_view(detector=connection_detector, probe=probe_connection)
 
     return build_status_view(
         brain=brain, board=board, run=run, inbox=inbox, timeline=timeline,
@@ -117,41 +120,28 @@ def _load_inbox(project_dir: Path) -> dict:
 
 
 # --------------------------------------------------------------------------- #
-# Guided connection control (invalidates the cache)
+# Native Hermes Agent connection control (invalidates the cache)
 # --------------------------------------------------------------------------- #
-def hermes_connection(*, transport: Optional[Callable[..., Any]] = None) -> dict:
-    return connection_view(transport=transport, use_cache=transport is None)
+def agent_connection(*, detector: Optional[Any] = None) -> dict:
+    return connection_view(detector=detector, use_cache=detector is None)
 
 
-def hermes_connect(body: dict, *, transport: Optional[Callable[..., Any]] = None) -> dict:
-    """Guided connect. Body: {url?, token?, project_id?, kind?}. Never echoes the token.
+def agent_connect(body: dict, *, detector: Optional[Any] = None) -> dict:
+    """Connect (enable) the native Hermes Agent for this workspace.
 
-    Returns a connection-status dict; ``status == "needs_project"`` carries the
-    discovered ``projects`` for the UI to choose from (then re-POST with project_id).
-    """
-    from lib.production_brain.connection import ConnectionError, connect
+    No credentials, endpoint, token, or project — the agent is auto-detected and
+    verified locally. A failed verify does NOT enable (fail closed)."""
+    from lib.production_brain.hermes_agent import connect
 
-    url = body.get("url")
-    token = body.get("token")
-    project_id = body.get("project_id")
-    kind = body.get("kind")
-    for name, val in (("url", url), ("token", token), ("project_id", project_id), ("kind", kind)):
-        if val is not None and not isinstance(val, str):
-            raise StatusApiError(f"{name} must be a string", status=400)
-    try:
-        result = connect(url=url or None, token=token or None,
-                         project_id=project_id or None, kind=kind or None,
-                         transport=transport)
-    except ConnectionError as exc:
-        raise StatusApiError(str(exc), status=exc.status) from exc
+    result = connect(detector=detector)
     _invalidate_conn_cache()
     return result
 
 
-def hermes_disconnect(body: dict) -> dict:
-    from lib.production_brain.connection import disconnect
+def agent_disconnect(body: dict) -> dict:
+    from lib.production_brain.hermes_agent import disconnect
 
-    result = disconnect(wipe_token=bool(body.get("wipe_token")))
+    result = disconnect()
     _invalidate_conn_cache()
     return result
 

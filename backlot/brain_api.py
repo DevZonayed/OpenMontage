@@ -125,12 +125,10 @@ def reject_approval(project_dir: Path, body: dict) -> dict:
 def _client(orchestrator):
     if orchestrator is not None:
         return orchestrator
-    # Control the SAME live orchestrator Start used (env/persisted Mochlet MCP),
-    # not the bare env-only REST client — otherwise cancel/retry/resume could be
-    # dispatched to the WRONG service. build_live_client is itself defensive and
-    # returns a fail-closed client when unconfigured, so we do NOT swap in a
-    # different (env-REST) client on error.
-    from lib.production_brain.connection import build_live_client
+    # Control the SAME native Hermes Agent that Start used. build_live_client is
+    # itself defensive and returns a fail-closed client when the agent is not
+    # configured, so cancel/retry/resume can never be dispatched to a fake path.
+    from lib.production_brain.hermes_agent import build_live_client
 
     return build_live_client()
 
@@ -139,17 +137,18 @@ def _record_successor(store, run_id: str, stage: Optional[str], successor, *,
                       old_job_id: Optional[str] = None) -> None:
     """Record the result of a retry/resume control TRUTHFULLY.
 
-    Fail-closed at the persistence boundary: only a CANONICAL UUID handle is ever
-    written. A same-id control (retry, ``runJob``) logs "Retrying job <id>" and does
-    NOT invent lineage; a new-id control (resume via ``sendChat``) records the
-    successor handle as "Resumed as successor job <new>"."""
-    from lib.production_brain.mochlet import is_uuid
+    Fail-closed at the persistence boundary: only a CANONICAL handle is ever
+    written. A same-id control logs "Retrying job <id>" and does NOT invent
+    lineage; a new-id control records the successor as "Resumed as successor job
+    <new>". The native Hermes Agent returns no successor handle (control returns
+    ``None``), so this is a no-op for the native path."""
+    from lib.production_brain.orchestrator import is_canonical_id
 
     job_id = getattr(successor, "job_id", None)
     session_id = getattr(successor, "session_id", None)
-    if not is_uuid(job_id):
+    if not is_canonical_id(job_id):
         return
-    if not is_uuid(session_id):
+    if not is_canonical_id(session_id):
         session_id = None
     if job_id == old_job_id:
         message = f"Retrying job {job_id}."

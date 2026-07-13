@@ -562,15 +562,15 @@ def _narrative(
 
     if overall == "not_started":
         if conn_ok:
-            primary = action("start", "Start production with Hermes", OWNER_HERMES, kind="start")
+            primary = action("start", "Start production with the Hermes Agent", OWNER_HERMES, kind="start")
             headline = "Ready to start production"
             active_task = "No production run yet."
             owner = OWNER_HERMES
             why = "Nothing has started. Hermes will run research → proposal when you begin."
         else:
-            primary = action("connect_hermes", "Connect Hermes", OWNER_USER, kind="connect")
-            headline = "Connect Hermes to begin"
-            active_task = "Hermes isn't connected yet."
+            primary = action("connect_agent", "Connect the Hermes Agent", OWNER_USER, kind="connect")
+            headline = "Connect the Hermes Agent to begin"
+            active_task = "The Hermes Agent isn't connected yet."
             owner = OWNER_USER
             why = connection.get("headline") or "Hermes production isn't connected on this machine yet."
         return {"headline": headline, "active_task": active_task, "owner": owner,
@@ -591,7 +591,7 @@ def _narrative(
                 "headline": "Your plan is ready to review",
                 "active_task": f"Awaiting your approval on the {stage_label or 'plan'}.",
                 "owner": OWNER_USER,
-                "why_waiting": "Hermes has proposed a plan and is waiting for your go-ahead "
+                "why_waiting": "The Hermes Agent has proposed a plan and is waiting for your go-ahead "
                                "before producing assets.",
                 "primary": primary, "secondary": secondary, "diagnostic": diagnostic}
         # Mid-pipeline review gate — passive, no broken POST.
@@ -606,28 +606,28 @@ def _narrative(
 
     if overall == "ready_to_produce":
         if conn_ok:
-            primary = action("continue_hermes", "Continue production with Hermes",
+            primary = action("continue_hermes", "Continue production with the Hermes Agent",
                              OWNER_HERMES, kind="start")
-            why = ("The plan is approved. Hermes hasn't begun producing "
+            why = ("The plan is approved. The Hermes Agent hasn't begun producing "
                    f"{stage_label.lower() if stage_label else 'the next stage'} yet.")
         else:
-            primary = action("connect_hermes", "Connect Hermes to continue", OWNER_USER,
+            primary = action("connect_agent", "Connect the Hermes Agent to continue", OWNER_USER,
                              kind="connect")
             why = (connection.get("headline")
-                   or "The plan is approved, but Hermes isn't connected to continue production.")
+                   or "The plan is approved, but the Hermes Agent isn't connected to continue production.")
         secondary.append(preview_secondary)
         return {
-            "headline": f"Waiting for Hermes to begin {stage_label.lower() if stage_label else 'production'}",
+            "headline": f"Waiting for the Hermes Agent to begin {stage_label.lower() if stage_label else 'production'}",
             "active_task": "Plan approved — production has not started yet.",
             "owner": OWNER_HERMES if conn_ok else OWNER_USER,
             "why_waiting": why,
             "primary": primary, "secondary": secondary, "diagnostic": diagnostic}
 
     if overall == "producing":
-        primary = action("monitor", f"Hermes is producing {stage_label.lower() if stage_label else 'your video'}",
+        primary = action("monitor", f"The Hermes Agent is producing {stage_label.lower() if stage_label else 'your video'}",
                          OWNER_HERMES, kind="status", advances=False)
         return {
-            "headline": f"Hermes is working on {stage_label or 'production'}",
+            "headline": f"The Hermes Agent is working on {stage_label or 'production'}",
             "active_task": activity or f"Producing {stage_label or 'the video'}.",
             "owner": OWNER_HERMES,
             "why_waiting": None,
@@ -644,10 +644,10 @@ def _narrative(
                                 approval_id=(pending or {}).get("approval_id"),
                                 stage=(pending or {}).get("stage")))
         return {
-            "headline": f"Hermes needs your approval — {stage_label or 'stage'}",
+            "headline": f"The Hermes Agent needs your approval — {stage_label or 'stage'}",
             "active_task": prompt,
             "owner": OWNER_USER,
-            "why_waiting": "Hermes paused here for your review before continuing.",
+            "why_waiting": "The Hermes Agent paused here for your review before continuing.",
             "primary": primary, "secondary": secondary, "diagnostic": diagnostic}
 
     if overall == "blocked":
@@ -656,7 +656,7 @@ def _narrative(
         kind = (blocker or {}).get("kind")
         # Route the single primary action from the blocker kind.
         if kind == "brain_unavailable" or not bool(connection.get("available")):
-            primary = action("connect_hermes", "Connect Hermes", OWNER_USER, kind="connect")
+            primary = action("connect_agent", "Connect the Hermes Agent", OWNER_USER, kind="connect")
             owner = OWNER_USER
         elif kind == "control_unconfirmed":
             primary = action("retry_control", "Retry", OWNER_USER, kind="retry",
@@ -720,10 +720,10 @@ def _narrative(
             "diagnostic": None}
 
     # planning (coarse worker doing preflight before the first artifact)
-    primary = action("planning", "Hermes is preparing your production", OWNER_HERMES,
+    primary = action("planning", "The Hermes Agent is preparing your production", OWNER_HERMES,
                      kind="status", advances=False)
     return {
-        "headline": "Hermes is getting started",
+        "headline": "The Hermes Agent is getting started",
         "active_task": (run or {}).get("activity") or activity or "Running preflight and planning.",
         "owner": OWNER_HERMES, "why_waiting": None,
         "primary": primary, "secondary": secondary, "diagnostic": diagnostic}
@@ -810,9 +810,9 @@ def _render_block(*, overall, brain, brain_run, run, timeline, current_stage) ->
     if renderable:
         reason = None
     elif overall in ("not_started", "planning"):
-        reason = "Hermes hasn't built the timeline yet — nothing to render."
+        reason = "The Hermes Agent hasn't built the timeline yet — nothing to render."
     elif overall in ("awaiting_plan_approval", "ready_to_produce"):
-        reason = "The plan is approved but no assets exist yet. Render unlocks once Hermes builds the timeline."
+        reason = "The plan is approved but no assets exist yet. Render unlocks once the Hermes Agent builds the timeline."
     else:
         reason = "No renderable layers on the timeline yet."
     return {

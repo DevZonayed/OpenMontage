@@ -13,9 +13,23 @@ from lib.production_status import (
     canonical_stage_index,
 )
 
-CONN_OK = {"status": "connected", "available": True, "headline": "Hermes connected"}
-CONN_OFF = {"status": "needs_setup", "available": False,
-            "headline": "Hermes isn't connected on this machine yet."}
+# The native Hermes Agent connection block (agent_status shape): status ∈
+# {not_installed, detected, ready, connected}, available/headline drive the
+# narrative. It NEVER carries an endpoint, token, or project.
+CONN_OK = {"kind": "hermes_agent", "status": "connected", "available": True,
+           "headline": "Hermes Agent connected", "installed": True, "ready": True,
+           "enabled": True}
+CONN_OFF = {"kind": "hermes_agent", "status": "not_installed", "available": False,
+            "headline": "Hermes Agent is not installed", "installed": False,
+            "ready": False, "enabled": False}
+
+
+def test_connection_fixtures_carry_no_endpoint_or_token():
+    # Guard: the presenter's connection input is the native agent_status shape,
+    # never the old Mochlet endpoint/token/project block.
+    for conn in (CONN_OK, CONN_OFF):
+        for forbidden in ("endpoint", "token", "project", "projects", "url"):
+            assert forbidden not in conn
 
 
 # --------------------------------------------------------------------------- #
@@ -62,7 +76,7 @@ def test_not_started_offers_start_when_connected():
 def test_not_started_offers_connect_when_disconnected():
     v = build_status_view(board={"project_id": "p"}, run={"state": "not_started"},
                           connection=CONN_OFF)
-    assert v["primary_action"]["id"] == "connect_hermes"
+    assert v["primary_action"]["id"] == "connect_agent"
     assert v["primary_action"]["owner"] == "user"
 
 
@@ -93,7 +107,7 @@ def test_plan_approved_awaiting_hermes_has_one_primary_continue():
     assert v["owner"] == "hermes"
     # exactly one primary action, and it is Continue with Hermes
     assert v["primary_action"]["id"] == "continue_hermes"
-    assert v["primary_action"]["label"] == "Continue production with Hermes"
+    assert v["primary_action"]["label"] == "Continue production with the Hermes Agent"
     # preview is secondary and does NOT advance production
     prev = [a for a in v["secondary_actions"] if a["id"] == "preview"]
     assert prev and prev[0]["advances_production"] is False
@@ -115,7 +129,7 @@ def test_plan_approved_but_disconnected_routes_to_connect():
         run={"state": "waiting_for_approval", "plan_approved": True},
         connection=CONN_OFF)
     assert v["overall_state"] == "ready_to_produce"
-    assert v["primary_action"]["id"] == "connect_hermes"
+    assert v["primary_action"]["id"] == "connect_agent"
     assert v["owner"] == "user"
 
 
@@ -208,7 +222,7 @@ def test_blocked_brain_unavailable_routes_to_connect():
                        "message": "Hermes went away.", "resolved": False}]
     v = build_status_view(brain=st, connection=CONN_OFF)
     assert v["overall_state"] == "blocked"
-    assert v["primary_action"]["id"] == "connect_hermes"
+    assert v["primary_action"]["id"] == "connect_agent"
     assert v["stop_available"] is True
 
 

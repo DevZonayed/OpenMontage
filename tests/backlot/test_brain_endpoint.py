@@ -164,14 +164,14 @@ class TestControlFlow:
 
 class TestStartFailClosed:
     def test_start_fails_closed_when_orchestrator_unavailable(self, client, monkeypatch):
-        # Production default client is unconfigured on this machine → fail closed.
+        # The native Hermes Agent is not connected on this machine → fail closed.
         import backlot.brain_api as brain_api
         from lib.production_brain.adapter import HermesBrainAdapter
-        from lib.production_brain.orchestrator import ConfiguredHermesOrchestratorClient
+        from lib.production_brain.hermes_agent import _UnavailableAgentClient
 
         monkeypatch.setattr(
             brain_api, "default_adapter",
-            lambda: HermesBrainAdapter(client=ConfiguredHermesOrchestratorClient(url=None)))
+            lambda: HermesBrainAdapter(client=_UnavailableAgentClient()))
         r = _post(client, "/api/project/demo/brain/start", {})
         assert r.status_code == 409
         assert client.get("/api/project/demo/brain").json()["state"] == "not_started"

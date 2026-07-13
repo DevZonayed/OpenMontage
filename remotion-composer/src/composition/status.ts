@@ -51,26 +51,21 @@ export interface StatusAction {
   hint?: string | null;
 }
 
-export interface MochletProject {
-  id: string;
-  name?: string | null;
-  path?: string | null;
-}
-
-export interface ConnectionView {
-  status: string;
+// The NATIVE Hermes Agent connection. Auto-detected — there is deliberately NO
+// endpoint, token, project, or credential surface anywhere. The studio renders
+// its connect / disconnect / re-check UI purely from `status` + `available`.
+export interface AgentConnection {
+  kind: "hermes_agent";
+  status: "not_installed" | "detected" | "ready" | "connected" | "unknown";
   available: boolean;
-  endpoint?: string | null;
-  endpoint_kind?: string;
-  suggested_endpoint?: string;
-  loopback?: boolean;
-  token_configured?: boolean;
-  server_name?: string | null;
-  project?: string | null;
-  projects?: MochletProject[];
-  headline?: string;
-  detail?: string;
-  actions?: Array<{ id: string; label: string }>;
+  server_name: string; // "Hermes Agent"
+  headline: string;
+  detail: string;
+  actions: { id: string; label: string }[];
+  enabled: boolean;
+  installed: boolean;
+  ready: boolean;
+  version: string | null;
 }
 
 export interface StatusDiagnostic {
@@ -134,7 +129,7 @@ export interface StatusView {
   stop_available: boolean;
   render: StatusRender;
   target: StatusTarget;
-  connection: ConnectionView;
+  connection: AgentConnection;
   diagnostics: StatusDiagnostic[];
   sources: {
     brain_state?: string | null;
@@ -207,7 +202,19 @@ export function deterministicStatusView(projectId: string): StatusView {
     stop_available: true,
     render: { renderable: false, active: false, reason: "Demo — no timeline layers yet.", layer_count: 0 },
     target: { available: true, duration_seconds: 150, formatted: "2:30", frames: 4500, fps: 30, source: "requested", is_target: true, label: "target 2:30 · 4500 target frames" },
-    connection: { status: "demo", available: false, headline: "Demo mode" },
+    connection: {
+      kind: "hermes_agent",
+      status: "connected",
+      available: true,
+      server_name: "Hermes Agent",
+      headline: "Hermes Agent connected (demo)",
+      detail: "Demo mode — no live production is running.",
+      actions: [{ id: "disconnect_agent", label: "Disconnect" }],
+      enabled: true,
+      installed: true,
+      ready: true,
+      version: "demo",
+    },
     diagnostics: [],
     sources: { brain_state: "running", brain_run_id: "demo-run" },
     stale: false,

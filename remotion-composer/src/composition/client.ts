@@ -22,7 +22,7 @@ import {
   PreferencesPayload,
 } from "./brain";
 import {
-  ConnectionView,
+  AgentConnection,
   StatusView,
   deterministicStatusView,
 } from "./status";
@@ -252,17 +252,23 @@ export class BacklotClient {
     });
   }
 
-  // ── Hermes / Mochlet connection (guided, secure) ──
-  async getHermesConnection(): Promise<ConnectionView> {
+  // ── Native Hermes Agent connection (auto-detected; NO endpoint/token/project) ──
+  // The agent is discovered on this machine — there are no credential fields. The
+  // studio renders connect / disconnect / re-check purely from `status`+`available`.
+  async getAgentConnection(): Promise<AgentConnection> {
     if (this.forceFixtures) {
       this.usedFixture = true;
-      return { status: "demo", available: false, headline: "Demo mode" };
+      return deterministicStatusView(this.projectId).connection;
     }
-    return this.getJSON<ConnectionView>(`/api/hermes/connection`);
+    return this.getJSON<AgentConnection>(`/api/agent/connection`);
   }
-  async connectHermes(body: { url?: string; token?: string; project_id?: string }): Promise<ConnectionView> {
-    this.assertOnline("connect Hermes");
-    return this.postJSON<ConnectionView>(`/api/hermes/connect`, body);
+  async connectAgent(): Promise<AgentConnection> {
+    this.assertOnline("connect the Hermes Agent");
+    return this.postJSON<AgentConnection>(`/api/agent/connect`, {});
+  }
+  async disconnectAgent(): Promise<AgentConnection> {
+    this.assertOnline("disconnect the Hermes Agent");
+    return this.postJSON<AgentConnection>(`/api/agent/disconnect`, {});
   }
 
   // ── Coarse preflight/planning run control (the plan-approval gate) ──

@@ -433,19 +433,20 @@ class FakeBrain(BrainAdapter):
 
 
 def default_adapter() -> BrainAdapter:
-    """Return the brain adapter to use in production (real Hermes, fail-closed).
+    """Return the production agent adapter to use in production (fail-closed).
 
-    The live orchestrator client is resolved through
-    :mod:`lib.production_brain.connection` (env var → the endpoint persisted by a
-    successful guided Connect), so connecting a local Mochlet actually enables
-    Start/Continue production. Unconfigured on this machine → unavailable → the
-    adapter still fails closed.
+    The live orchestration client is the native **Hermes Agent** (its ACP stdio
+    surface), resolved through :mod:`lib.production_brain.hermes_agent`: a run opens
+    only when the local Hermes Agent is detected, verified ready, and connected for
+    this workspace. Unconfigured on this machine → unavailable → the adapter fails
+    closed with an honest "Hermes Agent integration not configured" blocker (no
+    non-native fallback ever).
     """
     try:
-        from lib.production_brain.connection import build_live_client
+        from lib.production_brain.hermes_agent import build_live_client
 
         return HermesBrainAdapter(client=build_live_client())
     except Exception:
         # Any resolution failure must not crash Start — fall back to the plain
-        # env-var client, which is itself fail-closed when unconfigured.
+        # default client, which is itself fail-closed when unconfigured.
         return HermesBrainAdapter()

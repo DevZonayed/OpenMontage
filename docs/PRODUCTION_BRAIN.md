@@ -198,26 +198,34 @@ orchestration port** — the brain never fabricates identity:
   returns an `OrchestratorHandle{session_id, job_id, engine}` and MUST be
   idempotent on `idempotency_key`; `cancel_job(job_id)` correlates cancellation.
   `kind` is `"live"` or `"fake"`.
-- `ConfiguredHermesOrchestratorClient` — the **production** client. It POSTs to
-  the operator-approved endpoint (`OPENMONTAGE_HERMES_ORCHESTRATOR_URL`) with an
-  optional bearer token read **only** from the OS keyring
-  (`hermes_orchestrator_token`) — never logged, never placed in telemetry.
-  **Transport is hardened** because a token rides the request:
-  - **endpoint policy is fail-closed** (`validate_endpoint`): HTTPS only, with an
-    explicit **loopback-HTTP** exception (`127.0.0.1`/`::1`/`localhost`) for a
-    local Hermes/Mochlet; no embedded credentials, fragments, non-http schemes,
-    ambiguous hosts, or control/whitespace characters. An invalid/absent endpoint
-    ⇒ `available() is False` ⇒ Start Production fails closed.
-  - **redirects are disabled** (`allow_redirects=False`) and **any 3xx is
-    rejected** — the token is never replayed to a redirect target, and no second
-    request is made.
-  - **canonical external ids** (`is_canonical_id`): `session_id`/`job_id` must
-    match a strict bounded ASCII allowlist (no slash/backslash/`..`-traversal/
-    control/whitespace, ≤128 chars) and be real strings (never `str()`-coerced)
-    before they are persisted; the `job_id` path segment is percent-encoded.
-  It also exposes `control_job(job_id, action, idempotency_key)` for typed
-  retry/resume/cancel. **This client is never exercised by the test suite** (an
-  injected transport/fake client is used instead).
+- `NativeHermesAgentClient` (in `lib.production_brain.hermes_agent`) — the
+  **production** client. OpenMontage is operated natively by the local **Hermes
+  Agent** through Hermes's own supported embedding surface, the **ACP stdio
+  adapter** (`hermes-acp` / `python -m acp_adapter`; newline-delimited JSON-RPC:
+  `initialize` → `session/new` → `session/prompt` / `session/cancel`). There is no
+  endpoint, token, project, or job to configure — the agent is auto-detected and
+  needs no pasted credentials. Whatever run engine Hermes uses internally is
+  invisible to OpenMontage. Hardening:
+  - **allowlisted local launch**: the target is the Hermes install under
+    `~/.hermes/hermes-agent`, spawned with an **argv list — never a shell** — so
+    no caller text can be injected as a command; every subprocess is bounded by a
+    timeout and always reaped.
+  - **readiness is verified, not assumed** (`HermesAgentDetector.verify`): Hermes's
+    own side-effect-free `--check`/`--version` probes must pass before
+    `available()` is True. Not installed / not ready / not connected ⇒
+    `available() is False` ⇒ Start Production fails closed with an honest "Hermes
+    Agent integration not configured" blocker (manual editing always remains).
+  - **strict project-path binding**: the ACP session `cwd` is the validated
+    OpenMontage repo root, never caller-supplied text.
+  - **canonical session id** (`is_canonical_id`): the `session_id` Hermes returns
+    must match a strict bounded ASCII allowlist (no slash/backslash/`..`-traversal/
+    control/whitespace, ≤128 chars) before it is persisted; it is Hermes's own id,
+    never fabricated. A durable, non-secret handle under `.backlot/` makes Start
+    idempotent and restart-safe.
+  `control_job(job_id, action)` supports `cancel` (via `session/cancel`); native
+  retry/resume are not ACP concepts and fail closed honestly. **The real ACP
+  transport is not exercised by CI** (an injected `session_factory`/`runner`/
+  `canceller` is used instead); a gated smoke exercises the live binary.
 - `FakeOrchestratorClient` — deterministic, offline, **TEST-ONLY**. Returns
   canonical-shaped ids derived from the run id and records the start/cancel calls
   it receives. Runs backed by it are visibly `orchestration: "fake_driver"`.

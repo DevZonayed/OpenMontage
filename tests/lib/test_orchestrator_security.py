@@ -1,132 +1,78 @@
-"""Transport hardening for the orchestration port (token exfil / URL / IDs).
+"""Security hardening of the orchestration port + the native Hermes Agent adapter.
 
-  * endpoint policy is fail-closed: HTTPS only (loopback-HTTP exception); no
-    userinfo / fragment / non-http / control chars / ambiguous host;
-  * redirects are disabled and any 3xx is rejected — the bearer token is never
-    replayed to a redirect target, and no second request is made;
-  * external ids are validated against a strict bounded allowlist before they are
-    persisted or interpolated into a URL path (which is percent-encoded);
-  * the token never appears in an error/return value.
+The legacy attack surface (HTTPS endpoint policy, bearer-token replay on redirect,
+percent-encoded URL paths) is GONE with Mochlet. The native Hermes Agent surface
+is loopback stdio, spawned with an argv list, reading no credential — so the
+security contract is now:
+
+  * canonical-id enforcement: external ids are validated against a strict, bounded
+    allowlist (no traversal / control / whitespace, length-bounded) before they are
+    ever persisted or used — a non-string is NEVER str()-coerced;
+  * never fabricate identity: the native adapter refuses to open a run unless a
+    real, canonical session id is returned; a non-canonical id fails closed;
+  * fail closed: an unavailable / not-ready agent raises OrchestratorUnavailable
+    rather than inventing a session;
+  * no shell / no user text as a command: the session is opened with the working
+    directory bound to the validated repo root, never to caller-supplied text;
+  * no credential is read anywhere — there is no keyring account for the agent.
 """
 
 from __future__ import annotations
 
 import pytest
 
+from lib.paths import REPO_ROOT
+from lib.production_brain import hermes_agent as HA
+from lib.production_brain.hermes_agent import (
+    HermesAgentDetector,
+    NativeHermesAgentClient,
+)
 from lib.production_brain.orchestrator import (
-    ConfiguredHermesOrchestratorClient,
     OrchestratorHandle,
     OrchestratorUnavailable,
     is_canonical_id,
-    validate_endpoint,
 )
 
 
-class _FakeResp:
-    def __init__(self, status_code=200, body=None):
-        self.status_code = status_code
-        self._body = body if body is not None else {}
+# --------------------------------------------------------------------------- #
+# Fakes (offline; never spawn a process, never touch ~/.hermes)
+# --------------------------------------------------------------------------- #
+def _install(home):
+    agent = home / "hermes-agent"
+    (agent / "venv" / "bin").mkdir(parents=True)
+    (agent / "venv" / "bin" / "python").write_text("")
+    (agent / "acp_adapter").mkdir(parents=True)
+    (agent / "acp_adapter" / "__init__.py").write_text("")
+    return agent
 
-    def json(self):
-        return self._body
+
+def _ready_runner(argv, *, cwd=None, timeout=None):
+    if argv and argv[-1] == "--check":
+        return (0, "", "")
+    if argv and argv[-1] == "--version":
+        return (0, "9.9.9", "")
+    return (0, "", "")
 
 
-class _Transport:
-    """Records every outbound call; NEVER follows redirects (like allow_redirects=False)."""
+def _ready_client(tmp_path, *, factory=None, canceller=None):
+    _install(tmp_path)
+    det = HermesAgentDetector(home=tmp_path, runner=_ready_runner)
+    return NativeHermesAgentClient(detector=det, enabled=True, base_dir=tmp_path,
+                                   session_factory=factory, canceller=canceller)
 
-    def __init__(self, response):
-        self._response = response
+
+class _Factory:
+    def __init__(self, session_id):
+        self._sid = session_id
         self.calls = []
 
-    def __call__(self, url, *, json=None, headers=None, timeout=None):
-        self.calls.append({"url": url, "json": json, "headers": dict(headers or {}), "timeout": timeout})
-        return self._response
+    def __call__(self, cwd, instruction):
+        self.calls.append({"cwd": cwd, "instruction": instruction})
+        return {"sessionId": self._sid}
 
 
 # --------------------------------------------------------------------------- #
-# URL policy
-# --------------------------------------------------------------------------- #
-class TestEndpointPolicy:
-    @pytest.mark.parametrize("url", [
-        "https://hermes.example.com",
-        "https://hermes.example.com/api",
-        "http://127.0.0.1:8900",
-        "http://localhost:8900/hermes",
-        "http://[::1]:8900",
-    ])
-    def test_allowed(self, url):
-        assert validate_endpoint(url) == url
-        assert ConfiguredHermesOrchestratorClient(url=url).available() is True
-
-    @pytest.mark.parametrize("url", [
-        "http://hermes.example.com",          # remote plain HTTP
-        "http://evil.example.com:80/hermes",  # remote plain HTTP
-        "ftp://hermes.example.com",           # non-http scheme
-        "file:///etc/passwd",                 # non-http scheme
-        "https://user:pass@hermes.example.com",  # embedded credentials
-        "https://hermes.example.com#frag",    # fragment
-        "https://",                            # no host
-        "https://hermes.example.com\n",       # control char
-        "https://her mes.example.com",        # whitespace
-        "javascript:alert(1)",                 # bogus scheme
-        "https://example.com:badport",         # non-numeric port
-        "https://example.com:99999",           # out-of-range port
-        "https://example.com:-1",              # negative port
-        "https://[::1",                        # malformed bracketed host
-        "https://[not:an:ip]",                 # malformed bracketed host
-        "",                                    # empty
-        None,                                  # missing
-    ])
-    def test_rejected(self, url):
-        # Fail-closed: every malformed input raises OrchestratorUnavailable (never
-        # a bare ValueError) and reports unavailable.
-        with pytest.raises(OrchestratorUnavailable):
-            validate_endpoint(url)
-        assert ConfiguredHermesOrchestratorClient(url=url).available() is False
-
-
-# --------------------------------------------------------------------------- #
-# Redirect / token safety
-# --------------------------------------------------------------------------- #
-class TestRedirectAndToken:
-    def _client(self, transport, monkeypatch, token="super-secret-token"):
-        from lib import secret_store
-        from lib.production_brain.orchestrator import ORCHESTRATOR_TOKEN_ACCOUNT
-
-        secret_store.set_secret(ORCHESTRATOR_TOKEN_ACCOUNT, token)
-        return ConfiguredHermesOrchestratorClient(url="https://hermes.example.com", transport=transport)
-
-    def test_redirect_is_rejected_and_no_second_request(self, monkeypatch):
-        tr = _Transport(_FakeResp(status_code=302, body={}))
-        c = self._client(tr, monkeypatch)
-        with pytest.raises(OrchestratorUnavailable) as ei:
-            c.create_job(project_id="p", run_id="run_1", requested_duration_seconds=60,
-                         idempotency_key="p:run_1")
-        # Exactly ONE request was made — the redirect was NOT followed.
-        assert len(tr.calls) == 1
-        assert tr.calls[0]["url"] == "https://hermes.example.com/jobs"
-        # The token is never leaked into the error.
-        assert "super-secret-token" not in str(ei.value)
-
-    def test_token_only_sent_to_validated_endpoint(self, monkeypatch):
-        tr = _Transport(_FakeResp(200, {"session_id": "sess-1", "job_id": "job-1"}))
-        c = self._client(tr, monkeypatch, token="tok-123")
-        c.create_job(project_id="p", run_id="run_1", requested_duration_seconds=60,
-                     idempotency_key="p:run_1")
-        assert len(tr.calls) == 1
-        call = tr.calls[0]
-        assert call["url"].startswith("https://hermes.example.com")
-        assert call["headers"].get("Authorization") == "Bearer tok-123"
-
-    def test_4xx_rejected(self, monkeypatch):
-        tr = _Transport(_FakeResp(403, {}))
-        c = self._client(tr, monkeypatch)
-        with pytest.raises(OrchestratorUnavailable):
-            c.create_job(project_id="p", run_id="r", requested_duration_seconds=60, idempotency_key="k")
-
-
-# --------------------------------------------------------------------------- #
-# Canonical id validation + encoding
+# Canonical id validation + handle
 # --------------------------------------------------------------------------- #
 class TestCanonicalIds:
     @pytest.mark.parametrize("val", ["job-1", "sess_ABC.9", "run:123", "a" * 128])
@@ -134,19 +80,8 @@ class TestCanonicalIds:
         assert is_canonical_id(val) is True
 
     @pytest.mark.parametrize("val", [
-        "job/1",          # slash
-        "job\\1",         # backslash
-        "..",             # traversal
-        "a/../b",         # traversal
-        "job..1",         # dot-dot
-        "job%2f1",        # encoded slash literal
-        "job\n1",         # newline
-        "job 1",          # whitespace
-        "a" * 129,        # too long
-        "",               # empty
-        123,              # non-string
-        None,             # non-string
-        {"x": 1},         # non-string object (never str()-coerced)
+        "job/1", "job\\1", "..", "a/../b", "job..1", "job%2f1", "job\n1",
+        "job 1", "a" * 129, "", 123, None, {"x": 1},
     ])
     def test_invalid(self, val):
         assert is_canonical_id(val) is False
@@ -156,29 +91,118 @@ class TestCanonicalIds:
         assert OrchestratorHandle("sess/1", "job-1").is_valid() is False
         assert OrchestratorHandle("sess-1", "job/1").is_valid() is False
 
-    def test_create_job_rejects_non_string_ids(self, monkeypatch):
-        from lib import secret_store
-        from lib.production_brain.orchestrator import ORCHESTRATOR_TOKEN_ACCOUNT
 
-        secret_store.set_secret(ORCHESTRATOR_TOKEN_ACCOUNT, "tok")
-        tr = _Transport(_FakeResp(200, {"session_id": 123, "job_id": {"a": 1}}))
-        c = ConfiguredHermesOrchestratorClient(url="https://h.example.com", transport=tr)
+# --------------------------------------------------------------------------- #
+# Never fabricate identity — the native adapter enforces canonical ids
+# --------------------------------------------------------------------------- #
+class TestNeverFabricateIdentity:
+    @pytest.mark.parametrize("bad", ["../escape", "sess/1", "sess\n1", "sess 1", "", "a" * 200])
+    def test_non_canonical_session_id_fails_closed(self, tmp_path, bad):
+        factory = _Factory(bad)
+        client = _ready_client(tmp_path, factory=factory)
         with pytest.raises(OrchestratorUnavailable):
-            c.create_job(project_id="p", run_id="r", requested_duration_seconds=60, idempotency_key="k")
+            client.create_job(project_id="p", run_id="r",
+                              requested_duration_seconds=60, idempotency_key="k")
 
-    def test_create_job_rejects_traversal_ids(self):
-        tr = _Transport(_FakeResp(200, {"session_id": "ok-1", "job_id": "../escape"}))
-        c = ConfiguredHermesOrchestratorClient(url="https://h.example.com", transport=tr)
-        with pytest.raises(OrchestratorUnavailable):
-            c.create_job(project_id="p", run_id="r", requested_duration_seconds=60, idempotency_key="k")
+    def test_canonical_session_id_is_recorded_verbatim(self, tmp_path):
+        factory = _Factory("hermes-sess-9")
+        client = _ready_client(tmp_path, factory=factory)
+        h = client.create_job(project_id="p", run_id="r",
+                              requested_duration_seconds=60, idempotency_key="k")
+        # The id is exactly what Hermes returned — never minted locally.
+        assert h.session_id == "hermes-sess-9" and h.job_id == "hermes-sess-9"
+        assert h.is_valid()
 
-    def test_control_job_percent_encodes_path_but_rejects_bad_id(self):
-        tr = _Transport(_FakeResp(200, {}))
-        c = ConfiguredHermesOrchestratorClient(url="https://h.example.com", transport=tr)
-        # a valid id is used verbatim (already allowlist-safe)
-        c.control_job(job_id="job-1", action="retry", idempotency_key="k")
-        assert tr.calls[0]["url"] == "https://h.example.com/jobs/job-1/retry"
-        # a non-canonical id is refused BEFORE any request
+    def test_non_string_session_id_is_not_coerced(self, tmp_path):
+        # A misbehaving factory returning a non-string must fail closed, never
+        # str()-coerced into a fabricated id.
+        class _BadFactory:
+            def __call__(self, cwd, instruction):
+                return {"sessionId": 12345}
+
+        client = _ready_client(tmp_path, factory=_BadFactory())
         with pytest.raises(OrchestratorUnavailable):
-            c.control_job(job_id="job/../1", action="cancel", idempotency_key="k")
-        assert len(tr.calls) == 1  # no request for the bad id
+            client.create_job(project_id="p", run_id="r",
+                              requested_duration_seconds=60, idempotency_key="k")
+
+
+# --------------------------------------------------------------------------- #
+# Fail closed when unavailable / not ready
+# --------------------------------------------------------------------------- #
+class TestFailClosed:
+    def test_disabled_agent_refuses_to_open_a_run(self, tmp_path):
+        _install(tmp_path)
+        det = HermesAgentDetector(home=tmp_path, runner=_ready_runner)
+        factory = _Factory("hermes-sess-1")
+        client = NativeHermesAgentClient(detector=det, enabled=False, base_dir=tmp_path,
+                                         session_factory=factory)
+        assert client.available() is False
+        with pytest.raises(OrchestratorUnavailable):
+            client.create_job(project_id="p", run_id="r",
+                              requested_duration_seconds=60, idempotency_key="k")
+        assert factory.calls == []  # the transport was never reached
+
+    def test_not_ready_agent_refuses_to_open_a_run(self, tmp_path):
+        _install(tmp_path)
+
+        def failing(argv, *, cwd=None, timeout=None):
+            return (1, "", "adapter import failed")
+
+        det = HermesAgentDetector(home=tmp_path, runner=failing)
+        factory = _Factory("hermes-sess-1")
+        client = NativeHermesAgentClient(detector=det, enabled=True, base_dir=tmp_path,
+                                         session_factory=factory)
+        assert client.available() is False
+        with pytest.raises(OrchestratorUnavailable):
+            client.create_job(project_id="p", run_id="r",
+                              requested_duration_seconds=60, idempotency_key="k")
+        assert factory.calls == []
+
+
+# --------------------------------------------------------------------------- #
+# Control safety — cancel is canonical-gated; retry/resume are not native
+# --------------------------------------------------------------------------- #
+class TestControlSafety:
+    def test_cancel_rejects_non_canonical_job_id_before_calling(self, tmp_path):
+        seen = []
+        client = _ready_client(tmp_path, canceller=lambda j: seen.append(j))
+        with pytest.raises(OrchestratorUnavailable):
+            client.cancel_job(job_id="job/../1")
+        assert seen == []  # never dispatched a bad id to the transport
+
+    def test_control_non_cancel_fails_closed(self, tmp_path):
+        client = _ready_client(tmp_path, canceller=lambda j: None)
+        for action in ("retry", "resume", "delete"):
+            with pytest.raises(OrchestratorUnavailable):
+                client.control_job(job_id="job-1", action=action, idempotency_key="k")
+
+
+# --------------------------------------------------------------------------- #
+# No shell / no user text as a command; no credential read
+# --------------------------------------------------------------------------- #
+class TestNoShellNoCredentials:
+    def test_cwd_is_bound_to_repo_root_not_caller_input(self, tmp_path):
+        # The session's working directory is the validated repo root, NEVER any
+        # caller-supplied project_id / run_id text (which could carry traversal or
+        # shell metacharacters).
+        factory = _Factory("hermes-sess-1")
+        client = _ready_client(tmp_path, factory=factory)
+        client.create_job(project_id="../../etc", run_id="$(whoami)",
+                          requested_duration_seconds=None, idempotency_key="k")
+        assert factory.calls[0]["cwd"] == str(REPO_ROOT)
+
+    def test_launch_target_is_argv_list_never_a_shell_string(self, tmp_path):
+        agent = _install(tmp_path)
+        det = HermesAgentDetector(home=tmp_path, runner=_ready_runner)
+        argv = det.launch_argv()
+        assert isinstance(argv, list) and all(isinstance(a, str) for a in argv)
+        # It is the install's OWN allowlisted venv python, under the Hermes home —
+        # never an arbitrary PATH entry.
+        assert argv[0] == str(agent / "venv" / "bin" / "python")
+        assert str(tmp_path) in argv[0]
+
+    def test_module_exposes_no_credential_surface(self):
+        # There is no keyring account, token env var, or bearer for the agent.
+        names = [n.lower() for n in dir(HA)]
+        for bad in ("token", "keyring", "account", "bearer", "password"):
+            assert not any(bad in n for n in names), f"unexpected credential symbol: {bad}"

@@ -1,8 +1,13 @@
-"""Canonical /status endpoint + guided Hermes connection routes.
+"""Canonical /status endpoint + native Hermes Agent connection routes.
 
-Covers the single-view-model contract and the guarded connect flow. Uses the
-session-global in-memory keyring (root conftest) — never the OS keychain — and
-never hits a live orchestrator (connection probing is stubbed out where needed).
+Covers the single-view-model contract and the guarded connect flow against the
+NATIVE Hermes Agent surface (Mochlet is gone). The connection block is the
+``agent_status`` shape — {status, available, headline, ...} with NO endpoint,
+token, project, or job. Connection probing is stubbed (a fake ``agent_status`` /
+``connect`` / ``disconnect``) so nothing spawns a real process or touches
+``~/.hermes``. The legacy ``/api/hermes/*`` routes must be 404.
+
+Uses the session-global in-memory keyring (root conftest) — never the OS keychain.
 """
 
 from __future__ import annotations
@@ -14,21 +19,25 @@ from fastapi.testclient import TestClient
 
 from backlot import server as server_mod
 from backlot import status_api
-from lib.production_brain import connection as conn_mod
+from lib.production_brain import hermes_agent as HA
 from lib.production_brain.adapter import FakeBrain
 from lib.production_brain.store import ProductionBrainStore
+
+# The native "not connected" connection block the board renders when the agent is
+# not installed on this machine (no endpoint/token/project — ever).
+_NOT_INSTALLED = {
+    "kind": "hermes_agent", "status": "not_installed", "available": False,
+    "server_name": "Hermes Agent", "headline": "Hermes Agent is not installed",
+    "detail": "", "actions": [{"id": "retry_detect", "label": "Re-check for Hermes"}],
+    "enabled": False, "installed": False, "ready": False, "version": None,
+}
 
 
 @pytest.fixture(autouse=True)
 def _no_conn_probe(monkeypatch):
-    """Default: Hermes not connected, no network probe (deterministic)."""
+    """Default: Hermes Agent not installed, no subprocess probe (deterministic)."""
     status_api._invalidate_conn_cache()
-    monkeypatch.setattr(
-        conn_mod, "connection_status",
-        lambda **kw: {"status": "needs_setup", "available": False,
-                      "headline": "Hermes isn't connected yet", "detail": "",
-                      "actions": [{"id": "connect_hermes", "label": "Connect Hermes"}],
-                      "token_configured": False, "endpoint": None})
+    monkeypatch.setattr(HA, "agent_status", lambda **kw: dict(_NOT_INSTALLED))
     yield
     status_api._invalidate_conn_cache()
 
@@ -100,47 +109,80 @@ def test_status_demo_flag_only_when_requested(client):
     assert demo["is_demo"] is True
 
 
-def test_status_includes_connection_block(client):
+def test_status_includes_native_connection_block(client):
     v = client.get("/api/project/the-electricity-bulb/status").json()
-    assert v["connection"]["status"] == "needs_setup"
-    assert v["connection"]["available"] is False
+    conn = v["connection"]
+    assert conn["kind"] == "hermes_agent"
+    assert conn["status"] == "not_installed"
+    assert conn["available"] is False
+
+
+def test_connection_block_never_contains_endpoint_token_or_project(client):
+    v = client.get("/api/project/the-electricity-bulb/status").json()
+    conn = v["connection"]
+    for forbidden in ("endpoint", "token", "project", "projects", "job", "url"):
+        assert forbidden not in conn
+    blob = json.dumps(v).lower()
+    assert "endpoint" not in blob and "mochlet" not in blob
 
 
 # --------------------------------------------------------------------------- #
 # Direct-API bypass: controls must stay guarded / fail-closed
 # --------------------------------------------------------------------------- #
 def test_brain_start_without_connection_fails_closed(client):
-    # No orchestrator connected → Start must 409, not fabricate a run.
+    # No Hermes Agent connected → Start must 409, not fabricate a run.
     r = _post(client, "/api/project/the-electricity-bulb/brain/start")
     assert r.status_code == 409
 
 
-def test_hermes_connect_requires_csrf(client):
+# --------------------------------------------------------------------------- #
+# Native agent connection routes (auto-detected, no credentials)
+# --------------------------------------------------------------------------- #
+def test_agent_connection_route(client):
+    r = client.get("/api/agent/connection")
+    assert r.status_code == 200
+    body = r.json()
+    assert body["kind"] == "hermes_agent"
+    assert body["status"] == "not_installed"
+    assert body["available"] is False
+
+
+def test_agent_connect_requires_csrf(client):
     # Cross-site POST without the CSRF header is rejected.
-    r = client.post("/api/hermes/connect", json={"url": "http://127.0.0.1:9235"})
+    r = client.post("/api/agent/connect", json={})
     assert r.status_code in (400, 403)
 
 
-def test_hermes_connect_rejects_bad_endpoint(client, monkeypatch):
-    # A non-loopback plain-HTTP endpoint is refused fail-closed (400).
-    r = _post(client, "/api/hermes/connect", {"url": "http://evil.example.com"})
-    assert r.status_code == 400
-
-
-def test_hermes_connection_route(client):
-    r = client.get("/api/hermes/connection")
+def test_agent_connect_fail_closed_when_not_ready(client, monkeypatch):
+    # A not-ready verify does NOT enable — connect returns an unavailable view.
+    monkeypatch.setattr(HA, "connect", lambda **kw: dict(_NOT_INSTALLED))
+    r = _post(client, "/api/agent/connect", {})
     assert r.status_code == 200
-    assert r.json()["status"] == "needs_setup"
+    assert r.json()["available"] is False
 
 
-def test_status_never_leaks_a_token(client, monkeypatch):
-    # Even with a token configured, the payload must not contain its value.
-    monkeypatch.setattr(
-        conn_mod, "connection_status",
-        lambda **kw: {"status": "connected", "available": True,
-                      "headline": "Connected to Hermes", "detail": "",
-                      "actions": [], "token_configured": True, "endpoint": "http://127.0.0.1:9235"})
-    status_api._invalidate_conn_cache()
-    v = client.get("/api/project/the-electricity-bulb/status").json()
-    assert "token" not in json.dumps(v).lower() or "token_configured" in json.dumps(v)
-    assert v["connection"]["available"] is True
+def test_agent_connect_and_disconnect_round_trip(client, monkeypatch):
+    connected = {
+        "kind": "hermes_agent", "status": "connected", "available": True,
+        "server_name": "Hermes Agent", "headline": "Hermes Agent connected",
+        "detail": "", "actions": [{"id": "disconnect_agent", "label": "Disconnect"}],
+        "enabled": True, "installed": True, "ready": True, "version": "1.2.3",
+    }
+    monkeypatch.setattr(HA, "connect", lambda **kw: dict(connected))
+    monkeypatch.setattr(HA, "disconnect", lambda **kw: dict(_NOT_INSTALLED))
+    r = _post(client, "/api/agent/connect", {})
+    assert r.status_code == 200 and r.json()["available"] is True
+    # And the connected view still carries no endpoint/token/project.
+    for forbidden in ("endpoint", "token", "project", "url"):
+        assert forbidden not in r.json()
+    r2 = _post(client, "/api/agent/disconnect", {})
+    assert r2.status_code == 200 and r2.json()["available"] is False
+
+
+# --------------------------------------------------------------------------- #
+# The legacy Mochlet /api/hermes/* routes are GONE
+# --------------------------------------------------------------------------- #
+def test_legacy_hermes_routes_are_gone(client):
+    assert client.get("/api/hermes/connection").status_code == 404
+    assert _post(client, "/api/hermes/connect", {"url": "http://127.0.0.1:9235"}).status_code == 404
+    assert _post(client, "/api/hermes/disconnect", {}).status_code == 404
